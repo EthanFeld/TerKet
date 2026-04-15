@@ -1,0 +1,49 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "TerKet"
+version = "0.1.0"
+description = "Exact strong simulation toolkit and benchmark suite for Clifford+T circuits"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+authors = [
+  {name = "TerKet Contributors"},
+]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: Scientific/Engineering",
+  "Topic :: Scientific/Engineering :: Physics",
+]
+dependencies = [
+  "numpy>=1.26",
+  "psutil",
+  "qiskit",
+  "quimb",
+  "cotengra",
+]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+include-package-data = true
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["terket*"]
+
+[tool.setuptools.package-data]
+terket = [
+  "_schur_native.c",
+  "_schur_native_*.inc",
+  "_schur_native*.pyd",
+  "_schur_native*.so",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

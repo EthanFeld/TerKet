@@ -1,0 +1,5 @@
+numpy
+psutil
+qiskit
+quimb
+cotengra
