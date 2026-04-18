@@ -20,6 +20,8 @@ if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
 from terket import compute_circuit_amplitude, make_circuit
+from terket.head_to_head_cases import build_approximate_qft, build_approximate_qft_logical
+from terket.circuit_spec import from_qiskit
 
 
 def _dependencies_available(*modules: str) -> bool:
@@ -55,6 +57,17 @@ class ApiSmokeTests(unittest.TestCase):
         amplitude, _ = compute_circuit_amplitude(circuit, [0], [0], as_complex=True)
         self.assertAlmostEqual(abs(complex(amplitude)), math.sqrt(0.5), places=12)
 
+    def test_approximate_qft_direct_builder_matches_qiskit_import(self):
+        direct = build_approximate_qft(8)
+        imported = from_qiskit(build_approximate_qft_logical(8), rz_compile_mode="dyadic")
+
+        zero = (0,) * 8
+        direct_amp, _ = compute_circuit_amplitude(direct, zero, zero, as_complex=True)
+        imported_amp, _ = compute_circuit_amplitude(imported, zero, zero, as_complex=True)
+
+        self.assertAlmostEqual(complex(direct_amp).real, complex(imported_amp).real, places=12)
+        self.assertAlmostEqual(complex(direct_amp).imag, complex(imported_amp).imag, places=12)
+
 
 @unittest.skipUnless(
     _dependencies_available("numpy", "psutil", "qiskit", "quimb", "cotengra"),
@@ -67,7 +80,8 @@ class BenchmarkCliSmokeTests(unittest.TestCase):
             _run_command(
                 [
                     PYTHON,
-                    str(BENCHMARKS_ROOT / "quimb_head_to_head.py"),
+                    str(BENCHMARKS_ROOT / "run_benchmarks.py"),
+                    "head-to-head",
                     "--suite",
                     "smoke",
                     "--repeats",
@@ -95,7 +109,8 @@ class BenchmarkCliSmokeTests(unittest.TestCase):
             _run_command(
                 [
                     PYTHON,
-                    str(BENCHMARKS_ROOT / "structured_showcase.py"),
+                    str(BENCHMARKS_ROOT / "run_benchmarks.py"),
+                    "structured-showcase",
                     "--suite",
                     "smoke",
                     "--csv",

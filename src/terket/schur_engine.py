@@ -17,6 +17,7 @@ from .engine import (
     ReductionInfo,
     ScaledAmplitude,
     SchurState,
+    SolverConfig,
     analyze_amplitudes,
     analyze_circuit,
     build_state,
@@ -27,6 +28,12 @@ from .engine import (
     compute_circuit_amplitude_scaled,
     reduce_and_sum,
 )
+from .probability_native import (
+    ProbabilityInfo,
+    ScaledProbability,
+    compute_circuit_probability,
+    compute_circuit_probability_scaled,
+)
 
 __all__ = [
     "BitSequence",
@@ -36,6 +43,7 @@ __all__ = [
     "ReductionInfo",
     "ScaledAmplitude",
     "SchurState",
+    "SolverConfig",
     "_get_cupy_module",
     "_get_quimb_tensor_module",
     "_load_schur_native_module",
@@ -49,5 +57,9 @@ __all__ = [
     "compute_amplitudes",
     "compute_circuit_amplitude",
     "compute_circuit_amplitude_scaled",
+    "compute_circuit_probability",
+    "compute_circuit_probability_scaled",
     "reduce_and_sum",
+    "ProbabilityInfo",
+    "ScaledProbability",
 ]

@@ -9,7 +9,7 @@ from typing import Any, Callable, Sequence
 from qiskit import QuantumCircuit, transpile
 from qiskit.circuit.library import DraperQFTAdder
 
-from .circuits import from_qiskit
+from .circuits import from_qiskit, make_circuit
 
 
 SUPPORTED_BASIS = ["h", "sx", "x", "rz", "cx", "cz"]
@@ -84,7 +84,21 @@ def build_approximate_qft_logical(n_qubits: int) -> QuantumCircuit:
 
 
 def build_approximate_qft(n_qubits: int):
-    return from_qiskit(build_approximate_qft_logical(n_qubits), rz_compile_mode="dyadic")
+    gates = []
+    for target in range(n_qubits):
+        if target + 1 < n_qubits:
+            control = target + 1
+            gates.extend(
+                (
+                    ("t", control),
+                    ("t", target),
+                    ("cnot", control, target),
+                    ("tdg", target),
+                    ("cnot", control, target),
+                )
+            )
+        gates.append(("h", target))
+    return make_circuit(n_qubits, gates, name=f"approximate_qft_{n_qubits}")
 
 
 def _grover_logical_qubits(total_qubits: int) -> int:

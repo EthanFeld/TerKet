@@ -29,7 +29,27 @@ typedef struct {
     Py_ssize_t *scope;
     NativeComplex *table;
     int alive;
+    unsigned char kind;
+    void *aux;
 } NativeFactor;
+
+
+enum {
+    NATIVE_FACTOR_KIND_CONCRETE = 0,
+    NATIVE_FACTOR_KIND_DEFERRED_DOMLOCAL = 1,
+};
+
+
+typedef struct {
+    unsigned char missing_pos;
+    unsigned char dominant_var_pos;
+    unsigned char dominant_arity;
+    unsigned char local_support_arity;
+    signed char *dominant_result_positions;
+    unsigned char local_result_positions[4];
+    NativeComplex local_products[2][16];
+    NativeFactor *dominant_factor;
+} NativeDeferredDominantLocal;
 
 
 typedef struct {
@@ -79,10 +99,13 @@ typedef struct {
     Py_ssize_t bucket_count;
     Py_ssize_t union_arity;
     Py_ssize_t var_pos;
+    uint64_t low_mask;
+    size_t reduced_table_size;
     Py_ssize_t *bucket_slot_ids;
     Py_ssize_t *bucket_arities;
     Py_ssize_t *bucket_pos_offsets;
     Py_ssize_t *bucket_positions;
+    Py_ssize_t *bucket_table_indexes;
     int output_mode;
     Py_ssize_t output_slot;
 } NativeQ3FreePlanStep;
@@ -104,6 +127,45 @@ typedef struct {
 
 
 static const char *q3_free_treewidth_plan_capsule_name = "terket._schur_native.q3_free_treewidth_plan";
+
+typedef struct {
+    Py_ssize_t var;
+    Py_ssize_t bucket_count;
+    Py_ssize_t union_arity;
+    Py_ssize_t var_pos;
+    uint64_t low_mask;
+    size_t reduced_table_size;
+    Py_ssize_t *bucket_slot_ids;
+    Py_ssize_t *bucket_arities;
+    Py_ssize_t *bucket_pos_offsets;
+    Py_ssize_t *bucket_positions;
+    Py_ssize_t *bucket_table_indexes;
+    int output_mode;
+    Py_ssize_t output_slot;
+} NativeLevel3PlanStep;
+
+
+typedef struct {
+    Py_ssize_t nvars;
+    Py_ssize_t initial_slot_count;
+    Py_ssize_t slot_count;
+    Py_ssize_t step_count;
+    Py_ssize_t max_scope;
+    Py_ssize_t *slot_arities;
+    size_t *slot_table_sizes;
+    size_t *slot_workspace_offsets;
+    NativeComplex **initial_tables;
+    NativeLevel3PlanStep *steps;
+    NativeComplex *workspace;
+    size_t workspace_size;
+    NativeComplex *merge_scratch;
+    size_t merge_scratch_size;
+    NativeComplex **slot_views;
+    unsigned char *slot_owned;
+} NativeLevel3TreewidthPlan;
+
+
+static const char *level3_treewidth_plan_capsule_name = "terket._schur_native.level3_treewidth_plan";
 
 
 
@@ -205,10 +267,34 @@ static PyMethodDef module_methods[] = {
         PyDoc_STR("Sum a level-3 cubic kernel by low-width variable elimination."),
     },
     {
+        "build_level3_treewidth_plan",
+        (PyCFunction) build_level3_treewidth_plan_native,
+        METH_VARARGS,
+        PyDoc_STR("Build a reusable native treewidth plan for a fixed level-3 cubic kernel."),
+    },
+    {
+        "sum_level3_treewidth_preplanned",
+        (PyCFunction) sum_level3_treewidth_preplanned_native,
+        METH_VARARGS,
+        PyDoc_STR("Evaluate a fixed level-3 cubic kernel with a reusable native treewidth plan."),
+    },
+    {
         "sum_factor_tables_scaled",
         (PyCFunction) sum_factor_tables_scaled_native,
         METH_VARARGS,
         PyDoc_STR("Sum generic scaled-complex factor tables by exact variable elimination."),
+    },
+    {
+        "build_scaled_factor_treewidth_plan",
+        (PyCFunction) build_scaled_factor_treewidth_plan_native,
+        METH_VARARGS,
+        PyDoc_STR("Build a reusable native treewidth plan for fixed scaled factor tables."),
+    },
+    {
+        "sum_scaled_factor_treewidth_preplanned",
+        (PyCFunction) sum_scaled_factor_treewidth_preplanned_native,
+        METH_VARARGS,
+        PyDoc_STR("Evaluate fixed scaled factor tables with a reusable native treewidth plan."),
     },
     {
         "build_q3_free_treewidth_plan",
@@ -221,6 +307,12 @@ static PyMethodDef module_methods[] = {
         (PyCFunction) sum_q3_free_treewidth_preplanned_batch_scaled_native,
         METH_VARARGS,
         PyDoc_STR("Evaluate a batch of q3-free kernels with a reusable native treewidth plan."),
+    },
+    {
+        "sum_q3_free_treewidth_preplanned_batch_scaled_array",
+        (PyCFunction) sum_q3_free_treewidth_preplanned_batch_scaled_array_native,
+        METH_VARARGS,
+        PyDoc_STR("Evaluate a contiguous int64 q1 batch with a reusable native q3-free treewidth plan."),
     },
     {
         "q3_free_treewidth_dp_work",

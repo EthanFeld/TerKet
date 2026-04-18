@@ -303,6 +303,101 @@ static inline Py_ssize_t project_assignment_bits_u64(uint64_t assignment, const 
 }
 
 
+static inline uint64_t insert_assignment_bit_u64(uint64_t assignment, Py_ssize_t position, int bit)
+{
+    uint64_t low_mask = (
+        position <= 0
+        ? 0ULL
+        : ((((uint64_t) 1) << (size_t) position) - 1ULL)
+    );
+    return (
+        (assignment & low_mask)
+        | (((uint64_t) (bit & 1)) << (size_t) position)
+        | ((assignment & ~low_mask) << 1)
+    );
+}
+
+
+static void free_native_factor(NativeFactor *factor);
+
+
+static NativeComplex native_factor_value_at_index(const NativeFactor *factor, Py_ssize_t assignment_idx)
+{
+    if (factor->kind == NATIVE_FACTOR_KIND_DEFERRED_DOMLOCAL) {
+        const NativeDeferredDominantLocal *deferred = (const NativeDeferredDominantLocal *) factor->aux;
+        Py_ssize_t local_idx = 0;
+        Py_ssize_t dominant_idx0 = 0;
+        Py_ssize_t dominant_idx1 = 0;
+        Py_ssize_t pos;
+        NativeComplex dominant0;
+        NativeComplex dominant1;
+        if (deferred == NULL || deferred->dominant_factor == NULL) {
+            return complex_make(0.0, 0.0);
+        }
+        for (pos = 0; pos < deferred->local_support_arity; ++pos) {
+            if (((size_t) assignment_idx >> deferred->local_result_positions[pos]) & 1U) {
+                local_idx |= ((Py_ssize_t) 1) << pos;
+            }
+        }
+        for (pos = 0; pos < deferred->dominant_arity; ++pos) {
+            int bit;
+            if (pos == deferred->dominant_var_pos) {
+                continue;
+            }
+            bit = (int) ((((size_t) assignment_idx) >> deferred->dominant_result_positions[pos]) & 1U);
+            dominant_idx0 |= ((Py_ssize_t) bit) << pos;
+            dominant_idx1 |= ((Py_ssize_t) bit) << pos;
+        }
+        dominant_idx1 |= ((Py_ssize_t) 1) << deferred->dominant_var_pos;
+        dominant0 = native_factor_value_at_index(deferred->dominant_factor, dominant_idx0);
+        dominant1 = native_factor_value_at_index(deferred->dominant_factor, dominant_idx1);
+        return complex_add(
+            complex_mul(dominant0, deferred->local_products[0][local_idx]),
+            complex_mul(dominant1, deferred->local_products[1][local_idx])
+        );
+    }
+    return factor->table[assignment_idx];
+}
+
+
+static int materialize_native_factor(NativeFactor *factor)
+{
+    NativeComplex *table;
+    size_t table_size;
+    Py_ssize_t idx;
+    if (factor == NULL || factor->kind == NATIVE_FACTOR_KIND_CONCRETE) {
+        return 0;
+    }
+    if (factor->arity < 0 || factor->arity >= (Py_ssize_t) (8 * sizeof(size_t))) {
+        PyErr_SetString(PyExc_OverflowError, "Deferred factor scope too wide to materialize.");
+        return -1;
+    }
+    table_size = ((size_t) 1) << (size_t) factor->arity;
+    table = PyMem_Malloc((table_size > 0 ? table_size : 1) * sizeof(NativeComplex));
+    if (table == NULL) {
+        PyErr_NoMemory();
+        return -1;
+    }
+    for (idx = 0; idx < (Py_ssize_t) table_size; ++idx) {
+        table[idx] = native_factor_value_at_index(factor, idx);
+    }
+    if (factor->aux != NULL) {
+        NativeDeferredDominantLocal *deferred = (NativeDeferredDominantLocal *) factor->aux;
+        if (deferred->dominant_factor != NULL) {
+            free_native_factor(deferred->dominant_factor);
+            PyMem_Free(deferred->dominant_factor);
+            deferred->dominant_factor = NULL;
+        }
+        PyMem_Free(deferred->dominant_result_positions);
+        PyMem_Free(deferred);
+        factor->aux = NULL;
+    }
+    factor->table = table;
+    factor->kind = NATIVE_FACTOR_KIND_CONCRETE;
+    return 0;
+}
+
+
 static inline int scopes_equal(const NativeFactor *factor, const Py_ssize_t *scope, Py_ssize_t arity)
 {
     Py_ssize_t idx;
@@ -338,12 +433,24 @@ static void free_native_factor(NativeFactor *factor)
     if (factor == NULL) {
         return;
     }
+    if (factor->aux != NULL) {
+        NativeDeferredDominantLocal *deferred = (NativeDeferredDominantLocal *) factor->aux;
+        if (deferred->dominant_factor != NULL) {
+            free_native_factor(deferred->dominant_factor);
+            PyMem_Free(deferred->dominant_factor);
+            deferred->dominant_factor = NULL;
+        }
+        PyMem_Free(deferred->dominant_result_positions);
+        PyMem_Free(deferred);
+        factor->aux = NULL;
+    }
     PyMem_Free(factor->scope);
     PyMem_Free(factor->table);
     factor->scope = NULL;
     factor->table = NULL;
     factor->arity = 0;
     factor->alive = 0;
+    factor->kind = NATIVE_FACTOR_KIND_CONCRETE;
 }
 
 
@@ -397,10 +504,12 @@ static void free_q3_free_treewidth_plan_step(NativeQ3FreePlanStep *step)
     PyMem_Free(step->bucket_arities);
     PyMem_Free(step->bucket_pos_offsets);
     PyMem_Free(step->bucket_positions);
+    PyMem_Free(step->bucket_table_indexes);
     step->bucket_slot_ids = NULL;
     step->bucket_arities = NULL;
     step->bucket_pos_offsets = NULL;
     step->bucket_positions = NULL;
+    step->bucket_table_indexes = NULL;
     step->bucket_count = 0;
     step->union_arity = 0;
     step->var_pos = -1;
@@ -445,6 +554,81 @@ static void q3_free_treewidth_plan_capsule_destructor(PyObject *capsule)
     );
     if (plan != NULL) {
         free_q3_free_treewidth_plan(plan);
+    } else {
+        PyErr_Clear();
+    }
+}
+
+
+static void free_level3_treewidth_plan_step(NativeLevel3PlanStep *step)
+{
+    if (step == NULL) {
+        return;
+    }
+    PyMem_Free(step->bucket_slot_ids);
+    PyMem_Free(step->bucket_arities);
+    PyMem_Free(step->bucket_pos_offsets);
+    PyMem_Free(step->bucket_positions);
+    PyMem_Free(step->bucket_table_indexes);
+    step->bucket_slot_ids = NULL;
+    step->bucket_arities = NULL;
+    step->bucket_pos_offsets = NULL;
+    step->bucket_positions = NULL;
+    step->bucket_table_indexes = NULL;
+    step->bucket_count = 0;
+    step->union_arity = 0;
+    step->var_pos = -1;
+    step->output_slot = -1;
+    step->output_mode = 0;
+}
+
+
+static void free_level3_treewidth_plan(NativeLevel3TreewidthPlan *plan)
+{
+    Py_ssize_t idx;
+    if (plan == NULL) {
+        return;
+    }
+    if (plan->initial_tables != NULL) {
+        for (idx = 0; idx < plan->initial_slot_count; ++idx) {
+            PyMem_Free(plan->initial_tables[idx]);
+        }
+    }
+    if (plan->steps != NULL) {
+        for (idx = 0; idx < plan->step_count; ++idx) {
+            free_level3_treewidth_plan_step(&plan->steps[idx]);
+        }
+    }
+    PyMem_Free(plan->slot_arities);
+    PyMem_Free(plan->slot_table_sizes);
+    PyMem_Free(plan->slot_workspace_offsets);
+    PyMem_Free(plan->initial_tables);
+    PyMem_Free(plan->steps);
+    PyMem_Free(plan->workspace);
+    PyMem_Free(plan->merge_scratch);
+    PyMem_Free(plan->slot_views);
+    PyMem_Free(plan->slot_owned);
+    plan->slot_arities = NULL;
+    plan->slot_table_sizes = NULL;
+    plan->slot_workspace_offsets = NULL;
+    plan->initial_tables = NULL;
+    plan->steps = NULL;
+    plan->workspace = NULL;
+    plan->merge_scratch = NULL;
+    plan->slot_views = NULL;
+    plan->slot_owned = NULL;
+    PyMem_Free(plan);
+}
+
+
+static void level3_treewidth_plan_capsule_destructor(PyObject *capsule)
+{
+    NativeLevel3TreewidthPlan *plan = (NativeLevel3TreewidthPlan *) PyCapsule_GetPointer(
+        capsule,
+        level3_treewidth_plan_capsule_name
+    );
+    if (plan != NULL) {
+        free_level3_treewidth_plan(plan);
     } else {
         PyErr_Clear();
     }

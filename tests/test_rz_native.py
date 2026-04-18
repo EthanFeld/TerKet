@@ -102,6 +102,35 @@ class NativeRZCorrectnessTests(unittest.TestCase):
             self.assertAlmostEqual(amplitude.real, expected.real, places=12)
             self.assertAlmostEqual(amplitude.imag, expected.imag, places=12)
 
+    def test_sx_on_entangled_support_matches_qiskit_statevector(self):
+        qc = QuantumCircuit(3)
+        qc.h(0)
+        qc.cx(0, 1)
+        qc.cx(1, 2)
+        qc.sx(2)
+        qc.rz(math.pi / 16.0, 2)
+        qc.cz(0, 2)
+        qc.sx(1)
+        qc.rz(-math.pi / 32.0, 1)
+        qc.cx(2, 0)
+        qc.sx(0)
+        qc.h(2)
+
+        spec = from_qiskit(qc)
+        statevector = Statevector.from_instruction(qc).data
+
+        for bits in (
+            (0, 0, 0),
+            (1, 0, 0),
+            (0, 1, 1),
+            (1, 1, 0),
+            (1, 1, 1),
+        ):
+            amplitude, _info = compute_circuit_amplitude(spec, [0, 0, 0], bits, as_complex=True)
+            expected = complex(statevector[_bits_to_index(bits)])
+            self.assertAlmostEqual(amplitude.real, expected.real, places=12)
+            self.assertAlmostEqual(amplitude.imag, expected.imag, places=12)
+
 
 class NativeRZBenchmarkTranspileTests(unittest.TestCase):
     def test_benchmark_transpile_helpers_preserve_rz_gates(self):

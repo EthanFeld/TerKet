@@ -12,7 +12,10 @@ license = "MIT"
 authors = [
   {name = "TerKet Contributors"},
 ]
+keywords = ["quantum", "simulation", "clifford-t", "qiskit", "benchmarking"]
 classifiers = [
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: OS Independent",
   "Programming Language :: Python :: 3",
   "Programming Language :: Python :: 3 :: Only",
   "Programming Language :: Python :: 3.10",
@@ -28,6 +31,14 @@ dependencies = [
   "quimb",
   "cotengra",
 ]
+
+[project.optional-dependencies]
+dev = [
+  "pytest",
+]
+
+[project.scripts]
+terket-bench = "benchmarks.run_benchmarks:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}

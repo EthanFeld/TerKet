@@ -3,6 +3,10 @@ __pycache__/
 *.py[cod]
 .pytest_cache/
 .mypy_cache/
+.ruff_cache/
+.coverage
+.ipynb_checkpoints/
+.DS_Store
 build/
 dist/
 *.egg-info/

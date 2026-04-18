@@ -17,6 +17,7 @@ Gate = tuple[Any, ...]
 SUPPORTED_GATES = {
     "h",
     "sx",
+    "sxdg",
     "x",
     "t",
     "tdg",
@@ -38,6 +39,7 @@ _QASM_GATE_MAP = {
     "cnot": "cnot",
     "h": "h",
     "sx": "sx",
+    "sxdg": "sxdg",
     "x": "x",
     "t": "t",
     "tdg": "tdg",
@@ -47,7 +49,7 @@ _QASM_GATE_MAP = {
     "cz": "cz",
 }
 _QASM_QUBIT = re.compile(r"([A-Za-z_][A-Za-z0-9_]*)\[(\d+)\]")
-_QASM_SUPPORTED_GATE_SET = "{h, sx, x, t, tdg, s, sdg, z, cnot, cz, rz(theta)}"
+_QASM_SUPPORTED_GATE_SET = "{h, sx, sxdg, x, t, tdg, s, sdg, z, cnot, cz, rz(theta)}"
 _MAX_RZ_TOLERANCE = 1e-5
 _EXACT_DYADIC_TOLERANCE = 1e-12
 _EXACT_DYADIC_MAX_LEVEL = 20
@@ -57,6 +59,8 @@ _TEMP_PHASE_GATE = "phase_angle"
 _RZ_COMPILE_MODE_CLIFFORD_T = "clifford_t"
 _RZ_COMPILE_MODE_DYADIC = "dyadic"
 _RZ_COMPILE_MODES = {_RZ_COMPILE_MODE_CLIFFORD_T, _RZ_COMPILE_MODE_DYADIC}
+_FAST_IMPORT_NATIVE_GATES = frozenset({"h", "t", "tdg", "cnot"})
+_FAST_IMPORT_GATE_COUNT_THRESHOLD = 4096
 
 
 @dataclass(frozen=True)
@@ -316,7 +320,12 @@ def parse_openqasm2(
         else:
             raw_gates.append((gate_name, *operands))
 
-    compiled_gates, compile_stats = _compile_import_gate_sequence(raw_gates, tolerance=rz_tolerance)
+    fast_import = _fast_import_gate_sequence_if_supported(raw_gates)
+    if fast_import is None:
+        compiled_gates, compile_stats = _compile_import_gate_sequence(raw_gates, tolerance=rz_tolerance)
+    else:
+        compiled_gates = fast_import
+        compile_stats = _ImportCompileStats()
     global_phase_radians = _normalize_global_phase_radians(
         global_phase_radians + compile_stats.global_phase_radians
     )
@@ -385,10 +394,11 @@ def from_qiskit(
             source="Unsupported Qiskit circuit global phase",
         )
     )
+    qubit_indices = {qubit: idx for idx, qubit in enumerate(working_circuit.qubits)}
     for instruction in working_circuit.data:
         operation = instruction.operation
         name = _QASM_GATE_MAP.get(operation.name.lower())
-        qubits = [working_circuit.find_bit(qubit).index for qubit in instruction.qubits]
+        qubits = [qubit_indices[qubit] for qubit in instruction.qubits]
         if name is not None:
             raw_gates.append((name, *qubits))
             continue
@@ -438,8 +448,36 @@ def from_qiskit(
             else:
                 raw_gates.append((_TEMP_PHASE_GATE, qubits[0], angle))
             continue
+        if op_name == "rzz":
+            if len(qubits) != 2:
+                raise ValueError(f"Unsupported Qiskit gate arity for {operation.name!r}.")
+            angle = _coerce_finite_radians(
+                operation.params[0],
+                source=f"Unsupported Qiskit rzz angle {operation.params[0]!r}",
+            )
+            if compile_mode == _RZ_COMPILE_MODE_DYADIC:
+                exact = _exact_dyadic_phase_from_angle(angle)
+                if exact is not None:
+                    coeff, precision_level = exact
+                    raw_gates.append(("rzz_dyadic", qubits[0], qubits[1], coeff, precision_level))
+                    global_phase_radians += _normalize_global_phase_radians(-0.5 * angle)
+                    continue
+            raw_gates.extend(
+                (
+                    ("cnot", qubits[0], qubits[1]),
+                    (_TEMP_PHASE_GATE, qubits[1], angle),
+                    ("cnot", qubits[0], qubits[1]),
+                )
+            )
+            global_phase_radians += _normalize_global_phase_radians(-0.5 * angle)
+            continue
         raise ValueError(f"Unsupported Qiskit gate: {operation.name!r}")
-    compiled_gates, compile_stats = _compile_import_gate_sequence(raw_gates, tolerance=rz_tolerance)
+    fast_import = _fast_import_gate_sequence_if_supported(raw_gates)
+    if fast_import is None:
+        compiled_gates, compile_stats = _compile_import_gate_sequence(raw_gates, tolerance=rz_tolerance)
+    else:
+        compiled_gates = fast_import
+        compile_stats = _ImportCompileStats()
     global_phase_radians = _normalize_global_phase_radians(
         global_phase_radians + compile_stats.global_phase_radians
     )
@@ -449,6 +487,20 @@ def from_qiskit(
         name=getattr(working_circuit, "name", None),
         metadata=_metadata_with_global_phase(global_phase_radians),
     )
+
+
+def _fast_import_gate_sequence_if_supported(raw_gates: Sequence[Gate]) -> tuple[Gate, ...] | None:
+    """Bypass the generic import compiler for very large already-native streams."""
+
+    if len(raw_gates) < _FAST_IMPORT_GATE_COUNT_THRESHOLD:
+        return None
+    normalized: list[Gate] = []
+    for raw_gate in raw_gates:
+        gate = _normalize_gate(raw_gate)
+        if gate[0] not in _FAST_IMPORT_NATIVE_GATES:
+            return None
+        normalized.append(gate)
+    return tuple(normalized)
 
 
 def to_qiskit(circuit: Any):
@@ -467,6 +519,8 @@ def to_qiskit(circuit: Any):
             qc.cx(gate[1], gate[2])
         elif name == "sx":
             qc.sx(gate[1])
+        elif name == "sxdg":
+            qc.sxdg(gate[1])
         elif name == "rzz_dyadic":
             qc.cx(gate[1], gate[2])
             qc.p(_dyadic_phase_to_angle(gate[3], gate[4]), gate[2])
@@ -543,6 +597,7 @@ _LEVEL3_PHASE_SEQUENCES = {
 _ONE_QUBIT_IDENTITY = np.eye(2, dtype=complex)
 _ONE_QUBIT_H = np.array([[1.0, 1.0], [1.0, -1.0]], dtype=complex) / math.sqrt(2.0)
 _ONE_QUBIT_SX = np.array([[0.5 + 0.5j, 0.5 - 0.5j], [0.5 - 0.5j, 0.5 + 0.5j]], dtype=complex)
+_ONE_QUBIT_SXDG = np.array([[0.5 - 0.5j, 0.5 + 0.5j], [0.5 + 0.5j, 0.5 - 0.5j]], dtype=complex)
 _ONE_QUBIT_X = np.array([[0.0, 1.0], [1.0, 0.0]], dtype=complex)
 
 
@@ -608,6 +663,18 @@ def _simplify_local_gate_window(rewritten: list[Gate], start: int) -> None:
                 rewritten[idx:idx + 2] = [("x", int(left[1]))]
                 idx = max(0, idx - 2)
                 continue
+            if left[0] == "sxdg" and right == left:
+                rewritten[idx:idx + 2] = [("x", int(left[1]))]
+                idx = max(0, idx - 2)
+                continue
+            if left[0] == "sx" and right[0] == "sxdg" and int(left[1]) == int(right[1]):
+                rewritten[idx:idx + 2] = []
+                idx = max(0, idx - 2)
+                continue
+            if left[0] == "sxdg" and right[0] == "sx" and int(left[1]) == int(right[1]):
+                rewritten[idx:idx + 2] = []
+                idx = max(0, idx - 2)
+                continue
 
         if idx + 2 < len(rewritten):
             first = rewritten[idx]
@@ -621,6 +688,14 @@ def _simplify_local_gate_window(rewritten: list[Gate], start: int) -> None:
                     continue
                 if second[0] == "x":
                     rewritten[idx:idx + 3] = [("z", qubit)]
+                    idx = max(0, idx - 2)
+                    continue
+                if second[0] == "s":
+                    rewritten[idx:idx + 3] = [("sx", qubit)]
+                    idx = max(0, idx - 2)
+                    continue
+                if second[0] == "sdg":
+                    rewritten[idx:idx + 3] = [("sxdg", qubit)]
                     idx = max(0, idx - 2)
                     continue
 
@@ -975,6 +1050,8 @@ def _one_qubit_gate_matrix(gate: Gate) -> np.ndarray:
         return _ONE_QUBIT_H
     if gate[0] == "sx":
         return _ONE_QUBIT_SX
+    if gate[0] == "sxdg":
+        return _ONE_QUBIT_SXDG
     if gate[0] == "x":
         return _ONE_QUBIT_X
     raise ValueError(f"Unsupported one-qubit run gate {gate!r}.")
