@@ -1,3 +1,5 @@
+#include "_schur_native_internal.h"
+
 enum {
     LEVEL3_PEELED_FAST_MAX_BUCKET = 8,
     LEVEL3_PEELED_FAST_MAX_LOCAL_SUPPORT = 4,
@@ -299,7 +301,7 @@ static NativeDeferredDominantLocal *build_level3_dominant_local_deferred(
 }
 
 
-static PyObject *sum_treewidth_dp_level3_native(PyObject *self, PyObject *args)
+PyObject *sum_treewidth_dp_level3_native(PyObject *self, PyObject *args)
 {
     Py_ssize_t nvars;
     PyObject *q1_obj;
@@ -1445,7 +1447,7 @@ static int evaluate_level3_treewidth_plan(
 }
 
 
-static PyObject *build_level3_treewidth_plan_native(PyObject *self, PyObject *args)
+PyObject *build_level3_treewidth_plan_native(PyObject *self, PyObject *args)
 {
     Py_ssize_t nvars;
     PyObject *q1_obj;
@@ -1480,7 +1482,7 @@ static PyObject *build_level3_treewidth_plan_native(PyObject *self, PyObject *ar
 }
 
 
-static PyObject *sum_level3_treewidth_preplanned_native(PyObject *self, PyObject *args)
+PyObject *sum_level3_treewidth_preplanned_native(PyObject *self, PyObject *args)
 {
     PyObject *capsule;
     NativeLevel3TreewidthPlan *plan;
@@ -1516,7 +1518,7 @@ static PyObject *sum_level3_treewidth_preplanned_native(PyObject *self, PyObject
 }
 
 
-static PyObject *sum_factor_tables_scaled_native(PyObject *self, PyObject *args)
+PyObject *sum_factor_tables_scaled_native(PyObject *self, PyObject *args)
 {
     Py_ssize_t nvars;
     PyObject *factors_obj;
@@ -4303,7 +4305,7 @@ error:
     return NULL;
 }
 
-static PyObject *build_q3_free_treewidth_plan_native(PyObject *self, PyObject *args)
+PyObject *build_q3_free_treewidth_plan_native(PyObject *self, PyObject *args)
 {
     Py_ssize_t nvars;
     long level;
@@ -4336,7 +4338,7 @@ static PyObject *build_q3_free_treewidth_plan_native(PyObject *self, PyObject *a
 }
 
 
-static PyObject *build_scaled_factor_treewidth_plan_native(PyObject *self, PyObject *args)
+PyObject *build_scaled_factor_treewidth_plan_native(PyObject *self, PyObject *args)
 {
     Py_ssize_t nvars;
     PyObject *factors_obj;
@@ -4369,7 +4371,7 @@ static PyObject *build_scaled_factor_treewidth_plan_native(PyObject *self, PyObj
 }
 
 
-static PyObject *sum_scaled_factor_treewidth_preplanned_native(PyObject *self, PyObject *args)
+PyObject *sum_scaled_factor_treewidth_preplanned_native(PyObject *self, PyObject *args)
 {
     PyObject *capsule;
     NativeQ3FreeTreewidthPlan *plan;
@@ -4410,7 +4412,7 @@ static PyObject *sum_scaled_factor_treewidth_preplanned_native(PyObject *self, P
 }
 
 
-static PyObject *sum_q3_free_treewidth_preplanned_batch_scaled_native(PyObject *self, PyObject *args)
+PyObject *sum_q3_free_treewidth_preplanned_batch_scaled_native(PyObject *self, PyObject *args)
 {
     PyObject *capsule;
     PyObject *q1_batch_obj;
@@ -4429,7 +4431,7 @@ static PyObject *sum_q3_free_treewidth_preplanned_batch_scaled_native(PyObject *
 }
 
 
-static PyObject *sum_q3_free_treewidth_preplanned_batch_scaled_array_native(PyObject *self, PyObject *args)
+PyObject *sum_q3_free_treewidth_preplanned_batch_scaled_array_native(PyObject *self, PyObject *args)
 {
     PyObject *capsule;
     PyObject *q1_batch_obj;
@@ -4448,7 +4450,7 @@ static PyObject *sum_q3_free_treewidth_preplanned_batch_scaled_array_native(PyOb
 }
 
 
-static PyObject *q3_free_treewidth_dp_work_native(PyObject *self, PyObject *args)
+PyObject *q3_free_treewidth_dp_work_native(PyObject *self, PyObject *args)
 {
     Py_ssize_t nvars;
     long level;
@@ -4676,7 +4678,7 @@ cleanup:
 }
 
 
-static PyObject *sum_q3_free_treewidth_batch_scaled_native(PyObject *self, PyObject *args)
+PyObject *sum_q3_free_treewidth_batch_scaled_native(PyObject *self, PyObject *args)
 {
     Py_ssize_t nvars;
     long level;

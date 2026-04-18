@@ -1,4 +1,8 @@
-static PyObject *evaluate_q_mask_terms_native(PyObject *self, PyObject *args)
+#include "_schur_native_internal.h"
+
+static int load_binary_flags(PyObject *seq_obj, const char *message, unsigned char **out_bits, Py_ssize_t *out_len);
+
+PyObject *evaluate_q_mask_terms_native(PyObject *self, PyObject *args)
 {
     PyObject *q1_obj;
     PyObject *q2;
@@ -453,7 +457,7 @@ error:
 }
 
 
-static PyObject *elim_single_partner_constraint_terms_native(PyObject *self, PyObject *args)
+PyObject *elim_single_partner_constraint_terms_native(PyObject *self, PyObject *args)
 {
     long q0_residue;
     PyObject *q1_obj;
@@ -695,7 +699,7 @@ error:
 }
 
 
-static PyObject *aff_compose_terms_native(PyObject *self, PyObject *args)
+PyObject *aff_compose_terms_native(PyObject *self, PyObject *args)
 {
     PyObject *q1_obj;
     PyObject *q2;
@@ -950,7 +954,7 @@ error:
 }
 
 
-static PyObject *build_classification_data_native(PyObject *self, PyObject *args)
+PyObject *build_classification_data_native(PyObject *self, PyObject *args)
 {
     Py_ssize_t nvars;
     PyObject *q2;
@@ -1077,7 +1081,7 @@ error:
 }
 
 
-static PyObject *classification_structure_key_native(PyObject *self, PyObject *args)
+PyObject *classification_structure_key_native(PyObject *self, PyObject *args)
 {
     Py_ssize_t nvars;
     Py_ssize_t level;
@@ -1245,7 +1249,7 @@ error:
 }
 
 
-static PyObject *build_classification_lookup_native(PyObject *self, PyObject *args)
+PyObject *build_classification_lookup_native(PyObject *self, PyObject *args)
 {
     Py_ssize_t nvars;
     Py_ssize_t level;
@@ -1498,7 +1502,7 @@ static int load_u64_array(PyObject *seq_obj, const char *message, uint64_t **out
 }
 
 
-static PyObject *solve_output_shift_mask_u64_native(PyObject *self, PyObject *args)
+PyObject *solve_output_shift_mask_u64_native(PyObject *self, PyObject *args)
 {
     PyObject *eps0_obj;
     PyObject *pivot_col_obj;
@@ -1579,7 +1583,7 @@ error:
 }
 
 
-static PyObject *solve_output_shift_masks_u64_native(PyObject *self, PyObject *args)
+PyObject *solve_output_shift_masks_u64_native(PyObject *self, PyObject *args)
 {
     PyObject *eps0_obj;
     PyObject *pivot_col_obj;

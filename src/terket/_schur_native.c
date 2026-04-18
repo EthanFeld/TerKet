@@ -1,185 +1,4 @@
-#define PY_SSIZE_T_CLEAN
-#include <Python.h>
-#include <math.h>
-#include <stdlib.h>
-#include <stdint.h>
-#include <string.h>
-
-#define SUPPORT_CACHE_MAX_SIZE 65536
-#define SQRT1_2 0.70710678118654752440
-#define SQRT2 1.41421356237309504880
-#define SCALED_RENORMALIZE_MIN 8.63616855509444462539e-78
-#define SCALED_RENORMALIZE_MAX 1.15792089237316195424e+77
-
-static PyObject *support_tuple_from_mask(PyObject *mask);
-static PyObject *get_support_from_cache(PyObject *cache, PyObject *mask);
-static PyObject *global_support_cache = NULL;
-static PyObject *little_endian_string = NULL;
-static int load_binary_flags(PyObject *seq_obj, const char *message, unsigned char **out_bits, Py_ssize_t *out_len);
-
-
-typedef struct {
-    double real;
-    double imag;
-} NativeComplex;
-
-
-typedef struct {
-    Py_ssize_t arity;
-    Py_ssize_t *scope;
-    NativeComplex *table;
-    int alive;
-    unsigned char kind;
-    void *aux;
-} NativeFactor;
-
-
-enum {
-    NATIVE_FACTOR_KIND_CONCRETE = 0,
-    NATIVE_FACTOR_KIND_DEFERRED_DOMLOCAL = 1,
-};
-
-
-typedef struct {
-    unsigned char missing_pos;
-    unsigned char dominant_var_pos;
-    unsigned char dominant_arity;
-    unsigned char local_support_arity;
-    signed char *dominant_result_positions;
-    unsigned char local_result_positions[4];
-    NativeComplex local_products[2][16];
-    NativeFactor *dominant_factor;
-} NativeDeferredDominantLocal;
-
-
-typedef struct {
-    NativeComplex value;
-    long long half_pow2_exp;
-} NativeScaledComplex;
-
-
-typedef struct {
-    Py_ssize_t arity;
-    Py_ssize_t *scope;
-    NativeScaledComplex *table;
-    int alive;
-} NativeScaledFactor;
-
-
-typedef struct {
-    Py_ssize_t left;
-    Py_ssize_t right;
-    unsigned char flags;
-} ClassificationPairRecord;
-
-
-typedef struct {
-    Py_ssize_t a;
-    Py_ssize_t b;
-    Py_ssize_t c;
-} ClassificationTripleRecord;
-
-
-typedef struct {
-    Py_ssize_t left;
-    Py_ssize_t right;
-    long long shift;
-} Q2PhaseRecord;
-
-
-typedef struct {
-    Py_ssize_t arity;
-    Py_ssize_t *scope;
-    int alive;
-} NativePlanScopeFactor;
-
-
-typedef struct {
-    Py_ssize_t var;
-    Py_ssize_t bucket_count;
-    Py_ssize_t union_arity;
-    Py_ssize_t var_pos;
-    uint64_t low_mask;
-    size_t reduced_table_size;
-    Py_ssize_t *bucket_slot_ids;
-    Py_ssize_t *bucket_arities;
-    Py_ssize_t *bucket_pos_offsets;
-    Py_ssize_t *bucket_positions;
-    Py_ssize_t *bucket_table_indexes;
-    int output_mode;
-    Py_ssize_t output_slot;
-} NativeQ3FreePlanStep;
-
-
-typedef struct {
-    Py_ssize_t nvars;
-    long level;
-    long long mod_q1;
-    Py_ssize_t initial_slot_count;
-    Py_ssize_t slot_count;
-    Py_ssize_t step_count;
-    Py_ssize_t max_scope;
-    Py_ssize_t *slot_arities;
-    size_t *slot_table_sizes;
-    NativeScaledComplex **initial_tables;
-    NativeQ3FreePlanStep *steps;
-} NativeQ3FreeTreewidthPlan;
-
-
-static const char *q3_free_treewidth_plan_capsule_name = "terket._schur_native.q3_free_treewidth_plan";
-
-typedef struct {
-    Py_ssize_t var;
-    Py_ssize_t bucket_count;
-    Py_ssize_t union_arity;
-    Py_ssize_t var_pos;
-    uint64_t low_mask;
-    size_t reduced_table_size;
-    Py_ssize_t *bucket_slot_ids;
-    Py_ssize_t *bucket_arities;
-    Py_ssize_t *bucket_pos_offsets;
-    Py_ssize_t *bucket_positions;
-    Py_ssize_t *bucket_table_indexes;
-    int output_mode;
-    Py_ssize_t output_slot;
-} NativeLevel3PlanStep;
-
-
-typedef struct {
-    Py_ssize_t nvars;
-    Py_ssize_t initial_slot_count;
-    Py_ssize_t slot_count;
-    Py_ssize_t step_count;
-    Py_ssize_t max_scope;
-    Py_ssize_t *slot_arities;
-    size_t *slot_table_sizes;
-    size_t *slot_workspace_offsets;
-    NativeComplex **initial_tables;
-    NativeLevel3PlanStep *steps;
-    NativeComplex *workspace;
-    size_t workspace_size;
-    NativeComplex *merge_scratch;
-    size_t merge_scratch_size;
-    NativeComplex **slot_views;
-    unsigned char *slot_owned;
-} NativeLevel3TreewidthPlan;
-
-
-static const char *level3_treewidth_plan_capsule_name = "terket._schur_native.level3_treewidth_plan";
-
-
-
-/* Low-level support helpers, caches, and scalar utilities. */
-#include "_schur_native_support.inc"
-
-/* Affine composition, classification, and output-shift routines. */
-#include "_schur_native_algebra.inc"
-
-/* Graph order heuristics and width evaluation helpers. */
-#include "_schur_native_graph.inc"
-
-/* Exact treewidth-based DP kernels and reusable q3-free plans. */
-#include "_schur_native_dp.inc"
+#include "_schur_native_internal.h"
 
 static PyMethodDef module_methods[] = {
     {
@@ -329,14 +148,12 @@ static PyMethodDef module_methods[] = {
     {NULL, NULL, 0, NULL},
 };
 
-
 static void module_free(void *module)
 {
     (void) module;
     Py_CLEAR(global_support_cache);
     Py_CLEAR(little_endian_string);
 }
-
 
 static struct PyModuleDef module_def = {
     PyModuleDef_HEAD_INIT,
@@ -349,7 +166,6 @@ static struct PyModuleDef module_def = {
     NULL,
     module_free,
 };
-
 
 PyMODINIT_FUNC PyInit__schur_native(void)
 {

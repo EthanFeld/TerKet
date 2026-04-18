@@ -1,3 +1,10 @@
+#include "_schur_native_internal.h"
+
+PyObject *global_support_cache = NULL;
+PyObject *little_endian_string = NULL;
+const char *q3_free_treewidth_plan_capsule_name = "terket._schur_native.q3_free_treewidth_plan";
+const char *level3_treewidth_plan_capsule_name = "terket._schur_native.level3_treewidth_plan";
+
 static PyObject *ensure_little_endian_string(void)
 {
     if (little_endian_string == NULL) {
@@ -20,7 +27,7 @@ static PyObject *ensure_global_support_cache(void)
 }
 
 
-static inline size_t word_index(Py_ssize_t bit)
+size_t word_index(Py_ssize_t bit)
 {
     return ((size_t) bit) >> 6;
 }
@@ -32,19 +39,19 @@ static inline uint64_t bit_mask(Py_ssize_t bit)
 }
 
 
-static inline void bitset_set(uint64_t *bits, Py_ssize_t bit)
+void bitset_set(uint64_t *bits, Py_ssize_t bit)
 {
     bits[word_index(bit)] |= bit_mask(bit);
 }
 
 
-static inline void bitset_clear(uint64_t *bits, Py_ssize_t bit)
+void bitset_clear(uint64_t *bits, Py_ssize_t bit)
 {
     bits[word_index(bit)] &= ~bit_mask(bit);
 }
 
 
-static inline Py_ssize_t popcount_u64(uint64_t word)
+Py_ssize_t popcount_u64(uint64_t word)
 {
     Py_ssize_t count = 0;
     while (word) {
@@ -55,7 +62,7 @@ static inline Py_ssize_t popcount_u64(uint64_t word)
 }
 
 
-static inline int lowest_bit_index(uint64_t word)
+int lowest_bit_index(uint64_t word)
 {
     int idx = 0;
     while ((word & 1ULL) == 0) {
@@ -66,7 +73,7 @@ static inline int lowest_bit_index(uint64_t word)
 }
 
 
-static inline NativeComplex complex_make(double real, double imag)
+NativeComplex complex_make(double real, double imag)
 {
     NativeComplex value;
     value.real = real;
@@ -75,13 +82,13 @@ static inline NativeComplex complex_make(double real, double imag)
 }
 
 
-static inline NativeComplex complex_add(NativeComplex left, NativeComplex right)
+NativeComplex complex_add(NativeComplex left, NativeComplex right)
 {
     return complex_make(left.real + right.real, left.imag + right.imag);
 }
 
 
-static inline NativeComplex complex_mul(NativeComplex left, NativeComplex right)
+NativeComplex complex_mul(NativeComplex left, NativeComplex right)
 {
     return complex_make(
         left.real * right.real - left.imag * right.imag,
@@ -96,7 +103,7 @@ static inline int scaled_complex_is_zero(NativeScaledComplex value)
 }
 
 
-static inline NativeScaledComplex scaled_complex_make(double real, double imag, long long half_pow2_exp)
+NativeScaledComplex scaled_complex_make(double real, double imag, long long half_pow2_exp)
 {
     NativeScaledComplex value;
     value.value = complex_make(real, imag);
@@ -124,7 +131,7 @@ static NativeScaledComplex normalize_scaled_complex(NativeComplex value, long lo
 }
 
 
-static NativeScaledComplex renormalize_scaled_complex_if_needed(NativeComplex value, long long half_pow2_exp)
+NativeScaledComplex renormalize_scaled_complex_if_needed(NativeComplex value, long long half_pow2_exp)
 {
     double magnitude;
     if (value.real == 0.0 && value.imag == 0.0) {
@@ -163,7 +170,7 @@ static NativeComplex scale_complex_by_half_pow2(NativeComplex value, long long h
 }
 
 
-static NativeScaledComplex add_scaled_complex(NativeScaledComplex left, NativeScaledComplex right)
+NativeScaledComplex add_scaled_complex(NativeScaledComplex left, NativeScaledComplex right)
 {
     NativeComplex aligned_right;
     if (scaled_complex_is_zero(left)) {
@@ -188,7 +195,7 @@ static NativeScaledComplex add_scaled_complex(NativeScaledComplex left, NativeSc
 }
 
 
-static NativeScaledComplex mul_scaled_complex(NativeScaledComplex left, NativeScaledComplex right)
+NativeScaledComplex mul_scaled_complex(NativeScaledComplex left, NativeScaledComplex right)
 {
     return renormalize_scaled_complex_if_needed(
         complex_mul(left.value, right.value),
@@ -197,7 +204,7 @@ static NativeScaledComplex mul_scaled_complex(NativeScaledComplex left, NativeSc
 }
 
 
-static inline int positive_mod(long value, int modulus)
+int positive_mod(long value, int modulus)
 {
     int residue = (int) (value % (long) modulus);
     if (residue < 0) {
@@ -207,7 +214,7 @@ static inline int positive_mod(long value, int modulus)
 }
 
 
-static inline long long positive_mod_ll(long long value, long long modulus)
+long long positive_mod_ll(long long value, long long modulus)
 {
     long long residue = value % modulus;
     if (residue < 0) {
@@ -217,7 +224,7 @@ static inline long long positive_mod_ll(long long value, long long modulus)
 }
 
 
-static void write_u64_le(unsigned char *dest, uint64_t value)
+void write_u64_le(unsigned char *dest, uint64_t value)
 {
     size_t idx;
     for (idx = 0; idx < 8; ++idx) {
@@ -226,7 +233,7 @@ static void write_u64_le(unsigned char *dest, uint64_t value)
 }
 
 
-static int compare_classification_pair_records(const void *left_ptr, const void *right_ptr)
+int compare_classification_pair_records(const void *left_ptr, const void *right_ptr)
 {
     const ClassificationPairRecord *left = (const ClassificationPairRecord *) left_ptr;
     const ClassificationPairRecord *right = (const ClassificationPairRecord *) right_ptr;
@@ -253,7 +260,7 @@ static int compare_classification_pair_records(const void *left_ptr, const void 
 }
 
 
-static int compare_classification_triple_records(const void *left_ptr, const void *right_ptr)
+int compare_classification_triple_records(const void *left_ptr, const void *right_ptr)
 {
     const ClassificationTripleRecord *left = (const ClassificationTripleRecord *) left_ptr;
     const ClassificationTripleRecord *right = (const ClassificationTripleRecord *) right_ptr;
@@ -280,7 +287,7 @@ static int compare_classification_triple_records(const void *left_ptr, const voi
 }
 
 
-static inline int factor_contains_var(const NativeFactor *factor, Py_ssize_t var)
+int factor_contains_var(const NativeFactor *factor, Py_ssize_t var)
 {
     Py_ssize_t idx;
     for (idx = 0; idx < factor->arity; ++idx) {
@@ -292,7 +299,7 @@ static inline int factor_contains_var(const NativeFactor *factor, Py_ssize_t var
 }
 
 
-static inline Py_ssize_t project_assignment_bits_u64(uint64_t assignment, const Py_ssize_t *positions, Py_ssize_t count)
+Py_ssize_t project_assignment_bits_u64(uint64_t assignment, const Py_ssize_t *positions, Py_ssize_t count)
 {
     Py_ssize_t idx = 0;
     Py_ssize_t out_pos;
@@ -318,10 +325,10 @@ static inline uint64_t insert_assignment_bit_u64(uint64_t assignment, Py_ssize_t
 }
 
 
-static void free_native_factor(NativeFactor *factor);
+void free_native_factor(NativeFactor *factor);
 
 
-static NativeComplex native_factor_value_at_index(const NativeFactor *factor, Py_ssize_t assignment_idx)
+NativeComplex native_factor_value_at_index(const NativeFactor *factor, Py_ssize_t assignment_idx)
 {
     if (factor->kind == NATIVE_FACTOR_KIND_DEFERRED_DOMLOCAL) {
         const NativeDeferredDominantLocal *deferred = (const NativeDeferredDominantLocal *) factor->aux;
@@ -360,7 +367,7 @@ static NativeComplex native_factor_value_at_index(const NativeFactor *factor, Py
 }
 
 
-static int materialize_native_factor(NativeFactor *factor)
+int materialize_native_factor(NativeFactor *factor)
 {
     NativeComplex *table;
     size_t table_size;
@@ -398,7 +405,7 @@ static int materialize_native_factor(NativeFactor *factor)
 }
 
 
-static inline int scopes_equal(const NativeFactor *factor, const Py_ssize_t *scope, Py_ssize_t arity)
+int scopes_equal(const NativeFactor *factor, const Py_ssize_t *scope, Py_ssize_t arity)
 {
     Py_ssize_t idx;
     if (!factor->alive || factor->arity != arity) {
@@ -413,7 +420,7 @@ static inline int scopes_equal(const NativeFactor *factor, const Py_ssize_t *sco
 }
 
 
-static inline int scaled_scopes_equal(const NativeScaledFactor *factor, const Py_ssize_t *scope, Py_ssize_t arity)
+int scaled_scopes_equal(const NativeScaledFactor *factor, const Py_ssize_t *scope, Py_ssize_t arity)
 {
     Py_ssize_t idx;
     if (!factor->alive || factor->arity != arity) {
@@ -428,7 +435,7 @@ static inline int scaled_scopes_equal(const NativeScaledFactor *factor, const Py
 }
 
 
-static void free_native_factor(NativeFactor *factor)
+void free_native_factor(NativeFactor *factor)
 {
     if (factor == NULL) {
         return;
@@ -454,7 +461,7 @@ static void free_native_factor(NativeFactor *factor)
 }
 
 
-static void free_native_scaled_factor(NativeScaledFactor *factor)
+void free_native_scaled_factor(NativeScaledFactor *factor)
 {
     if (factor == NULL) {
         return;
@@ -468,7 +475,7 @@ static void free_native_scaled_factor(NativeScaledFactor *factor)
 }
 
 
-static inline int plan_scope_contains_var(const NativePlanScopeFactor *factor, Py_ssize_t var)
+int plan_scope_contains_var(const NativePlanScopeFactor *factor, Py_ssize_t var)
 {
     Py_ssize_t idx;
     for (idx = 0; idx < factor->arity; ++idx) {
@@ -480,7 +487,7 @@ static inline int plan_scope_contains_var(const NativePlanScopeFactor *factor, P
 }
 
 
-static inline int plan_scopes_equal(const NativePlanScopeFactor *factor, const Py_ssize_t *scope, Py_ssize_t arity)
+int plan_scopes_equal(const NativePlanScopeFactor *factor, const Py_ssize_t *scope, Py_ssize_t arity)
 {
     Py_ssize_t idx;
     if (!factor->alive || factor->arity != arity) {
@@ -518,7 +525,7 @@ static void free_q3_free_treewidth_plan_step(NativeQ3FreePlanStep *step)
 }
 
 
-static void free_q3_free_treewidth_plan(NativeQ3FreeTreewidthPlan *plan)
+void free_q3_free_treewidth_plan(NativeQ3FreeTreewidthPlan *plan)
 {
     Py_ssize_t idx;
     if (plan == NULL) {
@@ -546,7 +553,7 @@ static void free_q3_free_treewidth_plan(NativeQ3FreeTreewidthPlan *plan)
 }
 
 
-static void q3_free_treewidth_plan_capsule_destructor(PyObject *capsule)
+void q3_free_treewidth_plan_capsule_destructor(PyObject *capsule)
 {
     NativeQ3FreeTreewidthPlan *plan = (NativeQ3FreeTreewidthPlan *) PyCapsule_GetPointer(
         capsule,
@@ -583,7 +590,7 @@ static void free_level3_treewidth_plan_step(NativeLevel3PlanStep *step)
 }
 
 
-static void free_level3_treewidth_plan(NativeLevel3TreewidthPlan *plan)
+void free_level3_treewidth_plan(NativeLevel3TreewidthPlan *plan)
 {
     Py_ssize_t idx;
     if (plan == NULL) {
@@ -621,7 +628,7 @@ static void free_level3_treewidth_plan(NativeLevel3TreewidthPlan *plan)
 }
 
 
-static void level3_treewidth_plan_capsule_destructor(PyObject *capsule)
+void level3_treewidth_plan_capsule_destructor(PyObject *capsule)
 {
     NativeLevel3TreewidthPlan *plan = (NativeLevel3TreewidthPlan *) PyCapsule_GetPointer(
         capsule,
@@ -635,7 +642,7 @@ static void level3_treewidth_plan_capsule_destructor(PyObject *capsule)
 }
 
 
-static int parse_scaled_complex_entry(PyObject *obj, NativeScaledComplex *out)
+int parse_scaled_complex_entry(PyObject *obj, NativeScaledComplex *out)
 {
     PyObject *entry_seq = NULL;
     PyObject *value_obj;
@@ -675,7 +682,7 @@ static int parse_scaled_complex_entry(PyObject *obj, NativeScaledComplex *out)
 }
 
 
-static NativeComplex omega_level3_value(int residue)
+NativeComplex omega_level3_value(int residue)
 {
     switch (residue & 7) {
         case 0:
@@ -698,7 +705,7 @@ static NativeComplex omega_level3_value(int residue)
 }
 
 
-static NativeComplex omega_dyadic_value(long long residue, long long modulus)
+NativeComplex omega_dyadic_value(long long residue, long long modulus)
 {
     static const double two_pi = 6.28318530717958647692528676655900576839;
     double angle;
@@ -711,7 +718,7 @@ static NativeComplex omega_dyadic_value(long long residue, long long modulus)
 }
 
 
-static Py_ssize_t bitset_count(const uint64_t *bits, Py_ssize_t nwords)
+Py_ssize_t bitset_count(const uint64_t *bits, Py_ssize_t nwords)
 {
     Py_ssize_t count = 0;
     Py_ssize_t idx;
@@ -722,7 +729,7 @@ static Py_ssize_t bitset_count(const uint64_t *bits, Py_ssize_t nwords)
 }
 
 
-static Py_ssize_t bitset_pop_first(uint64_t *bits, Py_ssize_t nwords)
+Py_ssize_t bitset_pop_first(uint64_t *bits, Py_ssize_t nwords)
 {
     Py_ssize_t word_idx;
     for (word_idx = 0; word_idx < nwords; ++word_idx) {
@@ -737,7 +744,7 @@ static Py_ssize_t bitset_pop_first(uint64_t *bits, Py_ssize_t nwords)
 }
 
 
-static int mark_true(PyObject *values, Py_ssize_t index)
+int mark_true(PyObject *values, Py_ssize_t index)
 {
     PyObject *current = PyList_GET_ITEM(values, index);
     if (current == Py_True) {
@@ -750,7 +757,7 @@ static int mark_true(PyObject *values, Py_ssize_t index)
 }
 
 
-static int parse_pair_key(PyObject *key, Py_ssize_t *left, Py_ssize_t *right)
+int parse_pair_key(PyObject *key, Py_ssize_t *left, Py_ssize_t *right)
 {
     if (!PyTuple_Check(key) || PyTuple_GET_SIZE(key) != 2) {
         PyErr_SetString(PyExc_TypeError, "q2 keys must be 2-tuples.");
@@ -768,7 +775,7 @@ static int parse_pair_key(PyObject *key, Py_ssize_t *left, Py_ssize_t *right)
 }
 
 
-static int parse_triple_key(PyObject *key, Py_ssize_t *a, Py_ssize_t *b, Py_ssize_t *c)
+int parse_triple_key(PyObject *key, Py_ssize_t *a, Py_ssize_t *b, Py_ssize_t *c)
 {
     if (!PyTuple_Check(key) || PyTuple_GET_SIZE(key) != 3) {
         PyErr_SetString(PyExc_TypeError, "q3 keys must be 3-tuples.");
@@ -790,7 +797,7 @@ static int parse_triple_key(PyObject *key, Py_ssize_t *a, Py_ssize_t *b, Py_ssiz
 }
 
 
-static PyObject *support_from_mask_native(PyObject *self, PyObject *arg)
+PyObject *support_from_mask_native(PyObject *self, PyObject *arg)
 {
     PyObject *mask = NULL;
     PyObject *tuple = NULL;
@@ -807,7 +814,7 @@ static PyObject *support_from_mask_native(PyObject *self, PyObject *arg)
 }
 
 
-static PyObject *support_tuple_from_mask(PyObject *mask)
+PyObject *support_tuple_from_mask(PyObject *mask)
 {
     PyObject *bit_length_obj = NULL;
     PyObject *little = NULL;
@@ -889,7 +896,7 @@ error:
 }
 
 
-static PyObject *get_support_from_cache(PyObject *cache, PyObject *mask)
+PyObject *get_support_from_cache(PyObject *cache, PyObject *mask)
 {
     PyObject *support = NULL;
     PyObject *global_cache = NULL;
@@ -944,7 +951,7 @@ static PyObject *get_support_from_cache(PyObject *cache, PyObject *mask)
 }
 
 
-static PyObject *clear_support_cache_native(PyObject *self, PyObject *Py_UNUSED(ignored))
+PyObject *clear_support_cache_native(PyObject *self, PyObject *Py_UNUSED(ignored))
 {
     PyObject *cache;
 

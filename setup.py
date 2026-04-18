@@ -64,7 +64,13 @@ if os.environ.get("TERKET_DISABLE_NATIVE") != "1":
     ext_modules.append(
         Extension(
             "terket._schur_native",
-            sources=["src/terket/_schur_native.c"],
+            sources=[
+                "src/terket/_schur_native.c",
+                "src/terket/_schur_native_support.c",
+                "src/terket/_schur_native_algebra.c",
+                "src/terket/_schur_native_graph.c",
+                "src/terket/_schur_native_dp.c",
+            ],
             include_dirs=include_dirs,
         )
     )

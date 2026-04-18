@@ -14,7 +14,6 @@ authors = [
 ]
 keywords = ["quantum", "simulation", "clifford-t", "qiskit", "benchmarking"]
 classifiers = [
-  "License :: OSI Approved :: MIT License",
   "Operating System :: OS Independent",
   "Programming Language :: Python :: 3",
   "Programming Language :: Python :: 3 :: Only",
@@ -48,8 +47,8 @@ include = ["terket*"]
 
 [tool.setuptools.package-data]
 terket = [
-  "_schur_native.c",
-  "_schur_native_*.inc",
+  "_schur_native*.c",
+  "_schur_native*.h",
   "_schur_native*.pyd",
   "_schur_native*.so",
 ]

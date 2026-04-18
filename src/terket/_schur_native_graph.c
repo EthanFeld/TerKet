@@ -1,3 +1,5 @@
+#include "_schur_native_internal.h"
+
 static PyObject *empty_order_and_width_result(void)
 {
     PyObject *empty = PyList_New(0);
@@ -123,7 +125,7 @@ static void eliminate_var_from_graph(
 }
 
 
-static PyObject *min_fill_cubic_order_native(PyObject *self, PyObject *args)
+PyObject *min_fill_cubic_order_native(PyObject *self, PyObject *args)
 {
     Py_ssize_t nvars;
     PyObject *q2;
@@ -280,7 +282,7 @@ error:
 }
 
 
-static PyObject *min_degree_cubic_order_native(PyObject *self, PyObject *args)
+PyObject *min_degree_cubic_order_native(PyObject *self, PyObject *args)
 {
     Py_ssize_t nvars;
     PyObject *q2;
@@ -416,7 +418,7 @@ error:
 }
 
 
-static PyObject *cubic_order_width_native(PyObject *self, PyObject *args)
+PyObject *cubic_order_width_native(PyObject *self, PyObject *args)
 {
     Py_ssize_t nvars;
     PyObject *q2;
