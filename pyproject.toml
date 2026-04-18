@@ -34,11 +34,9 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = [
+  "build",
   "pytest",
 ]
-
-[project.scripts]
-terket-bench = "benchmarks.run_benchmarks:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}

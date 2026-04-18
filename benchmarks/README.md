@@ -6,12 +6,6 @@ TerKet benchmark workflows run through one entrypoint:
 python benchmarks/run_benchmarks.py <family> [family args]
 ```
 
-Installed environments can also use:
-
-```powershell
-terket-bench <family> [family args]
-```
-
 ## Families
 
 - `head-to-head`: compare TerKet amplitude runtime against quimb on named case suites

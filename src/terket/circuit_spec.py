@@ -396,82 +396,14 @@ def from_qiskit(
     )
     qubit_indices = {qubit: idx for idx, qubit in enumerate(working_circuit.qubits)}
     for instruction in working_circuit.data:
-        operation = instruction.operation
-        name = _QASM_GATE_MAP.get(operation.name.lower())
         qubits = [qubit_indices[qubit] for qubit in instruction.qubits]
-        if name is not None:
-            raw_gates.append((name, *qubits))
-            continue
-        op_name = operation.name.lower()
-        if op_name in {"barrier", "delay", "id"}:
-            continue
-        if op_name == "sx":
-            if len(qubits) != 1:
-                raise ValueError(f"Unsupported Qiskit gate arity for {operation.name!r}.")
-            raw_gates.append(("sx", qubits[0]))
-            continue
-        if op_name == "rz":
-            if len(qubits) != 1:
-                raise ValueError(f"Unsupported Qiskit gate arity for {operation.name!r}.")
-            angle = _coerce_finite_radians(
-                operation.params[0],
-                source=f"Unsupported Qiskit rz angle {operation.params[0]!r}",
-            )
-            if compile_mode == _RZ_COMPILE_MODE_DYADIC:
-                phase_gate, exact_angle = _exact_phase_gate_from_angle(
-                    angle,
-                    qubits[0],
-                    source=f"Unsupported Qiskit rz angle {operation.params[0]!r}",
-                )
-                if phase_gate is not None:
-                    raw_gates.append(phase_gate)
-                global_phase_radians += _normalize_global_phase_radians(-0.5 * exact_angle)
-            else:
-                raw_gates.append((_TEMP_PHASE_GATE, qubits[0], angle))
-                global_phase_radians += _normalize_global_phase_radians(-0.5 * angle)
-            continue
-        if op_name in {"p", "u1"}:
-            if len(qubits) != 1:
-                raise ValueError(f"Unsupported Qiskit gate arity for {operation.name!r}.")
-            angle = _coerce_finite_radians(
-                operation.params[0],
-                source=f"Unsupported Qiskit phase angle {operation.params[0]!r}",
-            )
-            if compile_mode == _RZ_COMPILE_MODE_DYADIC:
-                phase_gate, _ = _exact_phase_gate_from_angle(
-                    angle,
-                    qubits[0],
-                    source=f"Unsupported Qiskit phase angle {operation.params[0]!r}",
-                )
-                if phase_gate is not None:
-                    raw_gates.append(phase_gate)
-            else:
-                raw_gates.append((_TEMP_PHASE_GATE, qubits[0], angle))
-            continue
-        if op_name == "rzz":
-            if len(qubits) != 2:
-                raise ValueError(f"Unsupported Qiskit gate arity for {operation.name!r}.")
-            angle = _coerce_finite_radians(
-                operation.params[0],
-                source=f"Unsupported Qiskit rzz angle {operation.params[0]!r}",
-            )
-            if compile_mode == _RZ_COMPILE_MODE_DYADIC:
-                exact = _exact_dyadic_phase_from_angle(angle)
-                if exact is not None:
-                    coeff, precision_level = exact
-                    raw_gates.append(("rzz_dyadic", qubits[0], qubits[1], coeff, precision_level))
-                    global_phase_radians += _normalize_global_phase_radians(-0.5 * angle)
-                    continue
-            raw_gates.extend(
-                (
-                    ("cnot", qubits[0], qubits[1]),
-                    (_TEMP_PHASE_GATE, qubits[1], angle),
-                    ("cnot", qubits[0], qubits[1]),
-                )
-            )
-            global_phase_radians += _normalize_global_phase_radians(-0.5 * angle)
-            continue
-        raise ValueError(f"Unsupported Qiskit gate: {operation.name!r}")
+        op_gates, op_phase = _qiskit_operation_to_raw_gates(
+            instruction.operation,
+            qubits,
+            compile_mode=compile_mode,
+        )
+        raw_gates.extend(op_gates)
+        global_phase_radians = _normalize_global_phase_radians(global_phase_radians + op_phase)
     fast_import = _fast_import_gate_sequence_if_supported(raw_gates)
     if fast_import is None:
         compiled_gates, compile_stats = _compile_import_gate_sequence(raw_gates, tolerance=rz_tolerance)
@@ -487,6 +419,124 @@ def from_qiskit(
         name=getattr(working_circuit, "name", None),
         metadata=_metadata_with_global_phase(global_phase_radians),
     )
+
+
+def _qiskit_operation_to_raw_gates(
+    operation: Any,
+    qubits: Sequence[int],
+    *,
+    compile_mode: str,
+) -> tuple[list[Gate], float]:
+    op_name = operation.name.lower()
+    name = _QASM_GATE_MAP.get(op_name)
+    if name is not None:
+        return [(name, *qubits)], 0.0
+    if op_name in {"barrier", "delay", "id"}:
+        return [], 0.0
+    if op_name == "sx":
+        if len(qubits) != 1:
+            raise ValueError(f"Unsupported Qiskit gate arity for {operation.name!r}.")
+        return [("sx", qubits[0])], 0.0
+    if op_name == "rz":
+        if len(qubits) != 1:
+            raise ValueError(f"Unsupported Qiskit gate arity for {operation.name!r}.")
+        angle = _coerce_finite_radians(
+            operation.params[0],
+            source=f"Unsupported Qiskit rz angle {operation.params[0]!r}",
+        )
+        if compile_mode == _RZ_COMPILE_MODE_DYADIC:
+            phase_gate, exact_angle = _exact_phase_gate_from_angle(
+                angle,
+                qubits[0],
+                source=f"Unsupported Qiskit rz angle {operation.params[0]!r}",
+            )
+            return ([] if phase_gate is None else [phase_gate]), _normalize_global_phase_radians(-0.5 * exact_angle)
+        return [(_TEMP_PHASE_GATE, qubits[0], angle)], _normalize_global_phase_radians(-0.5 * angle)
+    if op_name in {"p", "u1"}:
+        if len(qubits) != 1:
+            raise ValueError(f"Unsupported Qiskit gate arity for {operation.name!r}.")
+        angle = _coerce_finite_radians(
+            operation.params[0],
+            source=f"Unsupported Qiskit phase angle {operation.params[0]!r}",
+        )
+        if compile_mode == _RZ_COMPILE_MODE_DYADIC:
+            phase_gate, _ = _exact_phase_gate_from_angle(
+                angle,
+                qubits[0],
+                source=f"Unsupported Qiskit phase angle {operation.params[0]!r}",
+            )
+            return ([] if phase_gate is None else [phase_gate]), 0.0
+        return [(_TEMP_PHASE_GATE, qubits[0], angle)], 0.0
+    if op_name == "rzz":
+        if len(qubits) != 2:
+            raise ValueError(f"Unsupported Qiskit gate arity for {operation.name!r}.")
+        angle = _coerce_finite_radians(
+            operation.params[0],
+            source=f"Unsupported Qiskit rzz angle {operation.params[0]!r}",
+        )
+        phase = _normalize_global_phase_radians(-0.5 * angle)
+        if compile_mode == _RZ_COMPILE_MODE_DYADIC:
+            exact = _exact_dyadic_phase_from_angle(angle)
+            if exact is not None:
+                coeff, precision_level = exact
+                return [("rzz_dyadic", qubits[0], qubits[1], coeff, precision_level)], phase
+        return [
+            ("cnot", qubits[0], qubits[1]),
+            (_TEMP_PHASE_GATE, qubits[1], angle),
+            ("cnot", qubits[0], qubits[1]),
+        ], phase
+
+    definition = getattr(operation, "definition", None)
+    if definition is not None:
+        return _qiskit_circuit_to_raw_gates(definition, qubits=qubits, compile_mode=compile_mode)
+
+    synthesized = _synthesize_qiskit_operation(operation, len(qubits))
+    return _qiskit_circuit_to_raw_gates(synthesized, qubits=qubits, compile_mode=compile_mode)
+
+
+def _qiskit_circuit_to_raw_gates(
+    circuit: Any,
+    *,
+    qubits: Sequence[int],
+    compile_mode: str,
+) -> tuple[list[Gate], float]:
+    qubit_indices = {qubit: idx for idx, qubit in enumerate(circuit.qubits)}
+    raw_gates: list[Gate] = []
+    global_phase_radians = _normalize_global_phase_radians(
+        _coerce_finite_radians(
+            getattr(circuit, "global_phase", 0.0),
+            source="Unsupported Qiskit circuit global phase",
+        )
+    )
+    for instruction in circuit.data:
+        mapped_qubits = [qubits[qubit_indices[qubit]] for qubit in instruction.qubits]
+        op_gates, op_phase = _qiskit_operation_to_raw_gates(
+            instruction.operation,
+            mapped_qubits,
+            compile_mode=compile_mode,
+        )
+        raw_gates.extend(op_gates)
+        global_phase_radians = _normalize_global_phase_radians(global_phase_radians + op_phase)
+    return raw_gates, global_phase_radians
+
+
+def _synthesize_qiskit_operation(operation: Any, n_qubits: int):
+    try:
+        from qiskit import QuantumCircuit
+        from qiskit.compiler import transpile
+    except ImportError as exc:  # pragma: no cover - depends on optional qiskit install
+        raise RuntimeError("Qiskit is required to synthesize unsupported operations.") from exc
+
+    circuit = QuantumCircuit(n_qubits)
+    circuit.append(operation, range(n_qubits))
+    try:
+        return transpile(
+            circuit,
+            basis_gates=["rz", "sx", "x", "cx", "cz"],
+            optimization_level=0,
+        )
+    except Exception as exc:
+        raise ValueError(f"Unsupported Qiskit gate: {operation.name!r}") from exc
 
 
 def _fast_import_gate_sequence_if_supported(raw_gates: Sequence[Gate]) -> tuple[Gate, ...] | None:

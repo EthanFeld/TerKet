@@ -49,12 +49,6 @@ python benchmarks/run_benchmarks.py structured-showcase
 python benchmarks/run_benchmarks.py probability-native-rcs --case smoke --cycles 2
 ```
 
-Installed console script:
-
-```powershell
-terket-bench head-to-head --suite smoke --repeats 1
-```
-
 Benchmark families and usage notes live in [benchmarks/README.md](benchmarks/README.md).
 
 ## Notebook
@@ -74,7 +68,3 @@ Interactive repo walkthrough lives in [notebooks/terket_demo.ipynb](notebooks/te
 - `tests/`: smoke and regression coverage
 - `results/`: generated CSV outputs, created on demand
 - `tools/`: profiling and local investigation scripts
-
-## Development
-
-Contribution guidance lives in [CONTRIBUTING.md](CONTRIBUTING.md).
