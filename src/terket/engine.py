@@ -3798,6 +3798,36 @@ def _build_q1_cluster_plan(q) -> _HalfPhaseClusterPlan | None:
     return _build_generic_q1_cluster_plan(q)
 
 
+def _fold_phase_shifted_q1_batch(
+    q1_batch: np.ndarray,
+) -> tuple[np.ndarray, list[int]]:
+    """Deduplicate identical phase-shifted q1 rows while preserving encounter order."""
+    batch = np.ascontiguousarray(np.asarray(q1_batch, dtype=np.int64))
+    if batch.ndim != 2:
+        raise ValueError("Expected q1_batch to have shape (batch, n_vars).")
+    if len(batch) == 0:
+        return np.zeros((0, batch.shape[1]), dtype=np.int64), []
+
+    row_map: dict[tuple[int, ...], int] = {}
+    unique_rows: list[np.ndarray] = []
+    inverse: list[int] = []
+    for row in batch:
+        key = tuple(int(value) for value in row.tolist())
+        existing = row_map.get(key)
+        if existing is None:
+            existing = len(unique_rows)
+            row_map[key] = existing
+            unique_rows.append(row.copy())
+        inverse.append(existing)
+
+    unique_batch = (
+        np.vstack(unique_rows)
+        if unique_rows
+        else np.zeros((0, batch.shape[1]), dtype=np.int64)
+    )
+    return unique_batch, inverse
+
+
 def _evaluate_half_phase_cluster_plan_scaled(
     cluster_plan: _HalfPhaseClusterPlan,
     q1_local: Sequence[int],
@@ -3854,22 +3884,27 @@ def _evaluate_half_phase_cluster_plan_scaled(
             )
 
     for spec in cluster_plan.clusters:
-        base_cluster_q1 = [int(q1_local[var]) % mod_q1 for var in spec.cluster_vars]
-        table: list[ScaledComplex] = []
-        for boundary_assignment in range(1 << len(spec.boundary_vars)):
-            cluster_q1 = list(base_cluster_q1)
-            for cluster_idx, boundary_idx, coeff in spec.boundary_couplings:
-                if (boundary_assignment >> boundary_idx) & 1:
-                    cluster_q1[cluster_idx] = (cluster_q1[cluster_idx] + (q2_lift * int(coeff))) % mod_q1
-            cluster_q = _phase_function_from_parts(
-                len(spec.cluster_vars),
-                level=cluster_plan.level,
-                q0=Fraction(0),
-                q1=cluster_q1,
-                q2=spec.internal_q2,
-                q3={},
-            )
-            table.append(_make_scaled_complex(_bruteforce_q3_free_sum(cluster_q)))
+        base_cluster_q1 = np.asarray(
+            [int(q1_local[var]) % mod_q1 for var in spec.cluster_vars],
+            dtype=np.int64,
+        )
+        boundary_count = 1 << len(spec.boundary_vars)
+        expanded_batch = np.broadcast_to(
+            base_cluster_q1[None, :],
+            (boundary_count, len(spec.cluster_vars)),
+        ).copy()
+        if spec.boundary_shift_table is not None and spec.boundary_shift_table.size:
+            expanded_batch = (expanded_batch + spec.boundary_shift_table) % mod_q1
+        folded_batch, folded_inverse = _fold_phase_shifted_q1_batch(expanded_batch)
+        folded_totals = _sum_q3_free_treewidth_dp_scaled_batch(
+            n_vars=len(spec.cluster_vars),
+            level=cluster_plan.level,
+            q1_batch=folded_batch,
+            q2=spec.internal_q2,
+            order=spec.cluster_order,
+            native_plan=spec.native_treewidth_plan,
+        )
+        table = [folded_totals[idx] for idx in folded_inverse]
         scalar = _mul_scaled_complex(
             scalar,
             _combine_factor_scaled(factors, spec.boundary_vars, table),
@@ -4134,19 +4169,19 @@ def _evaluate_half_phase_cluster_plan_scaled_batch(
         ).copy()
         if spec.boundary_shift_table is not None and spec.boundary_shift_table.size:
             expanded_batch = (expanded_batch + spec.boundary_shift_table[None, :, :]) % mod_q1
-        cluster_totals = _sum_q3_free_treewidth_dp_scaled_batch(
+        folded_batch, folded_inverse = _fold_phase_shifted_q1_batch(
+            expanded_batch.reshape(len(batch) * boundary_count, len(spec.cluster_vars))
+        )
+        folded_totals = _sum_q3_free_treewidth_dp_scaled_batch(
             n_vars=len(spec.cluster_vars),
             level=cluster_plan.level,
-            q1_batch=np.ascontiguousarray(
-                expanded_batch.reshape(len(batch) * boundary_count, len(spec.cluster_vars)),
-                dtype=np.int64,
-            ),
+            q1_batch=folded_batch,
             q2=spec.internal_q2,
             order=spec.cluster_order,
             native_plan=spec.native_treewidth_plan,
         )
         table_values, table_exponents = _scaled_list_to_arrays(
-            cluster_totals,
+            [folded_totals[idx] for idx in folded_inverse],
             (len(batch), boundary_count),
         )
         factor_values, factor_exponents = _combine_factor_scaled_batch(

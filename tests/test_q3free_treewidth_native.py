@@ -422,6 +422,83 @@ class Q3FreeTreewidthNativeTests(unittest.TestCase):
         self.assertIsNotNone(spec.native_treewidth_plan)
         self.assertIsNotNone(spec.boundary_shift_table)
 
+    def test_cluster_plan_single_row_phase_folding_deduplicates_boundary_shifts(self):
+        q = engine._phase_function_from_parts(
+            3,
+            level=3,
+            q0=0,
+            q1=[1, 0, 0],
+            q2={
+                (0, 1): 2,
+                (0, 2): 2,
+            },
+            q3={},
+        )
+        plan = engine._build_half_phase_cluster_plan(q)
+        self.assertIsNotNone(plan)
+        assert plan is not None
+
+        captured_batches: list[np.ndarray] = []
+
+        def fake_treewidth_batch(*, n_vars, level, q1_batch, q2, order, native_plan=None):
+            del n_vars, level, q2, order, native_plan
+            captured_batches.append(np.asarray(q1_batch, dtype=np.int64).copy())
+            return [((idx + 1) + 0.0j, 0) for idx in range(len(q1_batch))]
+
+        with mock.patch.object(
+            engine,
+            "_sum_q3_free_treewidth_dp_scaled_batch",
+            side_effect=fake_treewidth_batch,
+        ):
+            total = engine._evaluate_half_phase_cluster_plan_scaled(plan, [1, 0, 0])
+
+        self.assertEqual(len(captured_batches), 1)
+        np.testing.assert_array_equal(
+            captured_batches[0],
+            np.asarray([[1], [5]], dtype=np.int64),
+        )
+        self.assertIsInstance(total, tuple)
+
+    def test_cluster_plan_batch_phase_folding_deduplicates_boundary_shifts(self):
+        q = engine._phase_function_from_parts(
+            3,
+            level=3,
+            q0=0,
+            q1=[1, 0, 0],
+            q2={
+                (0, 1): 2,
+                (0, 2): 2,
+            },
+            q3={},
+        )
+        plan = engine._build_half_phase_cluster_plan(q)
+        self.assertIsNotNone(plan)
+        assert plan is not None
+
+        captured_batches: list[np.ndarray] = []
+
+        def fake_treewidth_batch(*, n_vars, level, q1_batch, q2, order, native_plan=None):
+            del n_vars, level, q2, order, native_plan
+            captured_batches.append(np.asarray(q1_batch, dtype=np.int64).copy())
+            return [((idx + 1) + 0.0j, 0) for idx in range(len(q1_batch))]
+
+        with mock.patch.object(
+            engine,
+            "_sum_q3_free_treewidth_dp_scaled_batch",
+            side_effect=fake_treewidth_batch,
+        ):
+            totals = engine._evaluate_half_phase_cluster_plan_scaled_batch(
+                plan,
+                np.asarray([[1, 0, 0]], dtype=np.int64),
+            )
+
+        self.assertEqual(len(captured_batches), 1)
+        np.testing.assert_array_equal(
+            captured_batches[0],
+            np.asarray([[1], [5]], dtype=np.int64),
+        )
+        self.assertEqual(len(totals), 1)
+
     def test_cached_peeled_treewidth_factor_plan_is_reused(self):
         q = engine._phase_function_from_parts(
             4,
