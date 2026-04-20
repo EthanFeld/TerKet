@@ -1071,6 +1071,64 @@ def _build_arbitrary_phase_branch_plan(
     )
 
 
+def _arbitrary_phase_terms_are_unary(
+    terms: Sequence[_ArbitraryPhaseTerm],
+) -> bool:
+    """Return whether every deferred arbitrary phase depends on one variable."""
+    for term in terms:
+        row_mask = int(term.row_mask)
+        if row_mask == 0 or (row_mask & (row_mask - 1)) != 0:
+            return False
+    return True
+
+
+def _sum_q3_free_with_unary_arbitrary_phases_scaled(
+    q: PhaseFunction,
+    terms: Sequence[_ArbitraryPhaseTerm],
+) -> ScaledComplex:
+    """Exactly sum a q3-free kernel with additional unary arbitrary-angle factors."""
+    assert not q.q3, "Unary arbitrary-phase summation requires a q3-free kernel."
+    scalar, factors = _build_cubic_factors_scaled(q)
+
+    for term in terms:
+        row_mask = int(term.row_mask)
+        if row_mask == 0 or (row_mask & (row_mask - 1)) != 0:
+            raise ValueError("Expected only unary arbitrary-phase terms.")
+        var = row_mask.bit_length() - 1
+        phase = _make_scaled_complex(cmath.exp(1j * float(term.angle)))
+        table = [phase, _ONE_SCALED] if (int(term.offset) & 1) else [_ONE_SCALED, phase]
+        scalar = _mul_scaled_complex(
+            scalar,
+            _combine_factor_scaled(factors, (var,), table),
+        )
+
+    if q.n == 0:
+        return scalar
+
+    if q.q2:
+        adjacency, edges = _q3_free_graph(q)
+        max_degree = max((len(neighbors) for neighbors in adjacency), default=0)
+        depth, chords = _q3_free_spanning_data(adjacency, edges)
+        feedback_vars = _select_feedback_vertices(q.n, chords, depth)
+        order = _q3_free_treewidth_order(
+            q,
+            len(feedback_vars),
+            max_degree=max_degree,
+        )
+        if order is None:
+            order, _width = _factor_scope_order(q.n, tuple(factors))
+    else:
+        order = list(range(q.n))
+
+    total, _max_scope = _sum_factor_tables_scaled(
+        q.n,
+        factors,
+        order,
+        scalar=scalar,
+    )
+    return total
+
+
 # ==================================================================
 # Schur-state construction and output constraint solving
 # ==================================================================
@@ -1704,93 +1762,111 @@ class SchurState:
         arbitrary_scalar, arbitrary_terms = self._transform_arbitrary_phases(shift_mask, gamma)
 
         if arbitrary_terms:
-            branch_plan = _build_arbitrary_phase_branch_plan(arbitrary_terms)
-            branch_cache = _prepare_affine_constraint_cache(
-                len(branch_plan.basis_masks),
-                k,
-                branch_plan.basis_masks,
-            )
-            result = _make_scaled_complex(0j)
-            quad_eliminated = 0
-            constraint_eliminated = 0
-            max_remaining = 0
-            max_structural = 0
-            max_gauss = 0
-            max_cost_r = 0
-            max_branched = 0
-            phase_states = 0
-            phase_splits = 0
-            phase3_backend: str | None = None
-            phase3_backend_cost_r = -1
-
-            for assignment_mask in range(1 << len(branch_plan.basis_masks)):
-                branch_phase = 1.0 + 0.0j
-
-                for dependency_mask, offset, angle in zip(
-                    branch_plan.term_dependency_masks,
-                    branch_plan.term_offsets,
-                    branch_plan.term_angles,
-                ):
-                    if _parity(dependency_mask & assignment_mask) ^ offset:
-                        branch_phase *= cmath.exp(1j * angle)
-
-                extra_shift_mask = _solve_echelon_rhs(branch_cache, assignment_mask)
-                if extra_shift_mask is None:
-                    continue
-
-                q_branch = _aff_compose_cached(
+            if not q_free.q3 and _arbitrary_phase_terms_are_unary(arbitrary_terms):
+                result = _sum_q3_free_with_unary_arbitrary_phases_scaled(
                     q_free,
-                    extra_shift_mask,
-                    branch_cache.gamma_masks,
-                    branch_cache.n_free,
-                    context=context,
+                    arbitrary_terms,
                 )
-                branch_result, branch_info = _reduce_and_sum_scaled(q_branch, context=context)
-                result = _add_scaled_complex(
-                    result,
-                    _mul_scaled_complex(_make_scaled_complex(branch_phase), branch_result),
+                elim_info = {
+                    'quad': 0,
+                    'constraint': 0,
+                    'branched': 0,
+                    'remaining': 0,
+                    'structural_obstruction': 0,
+                    'gauss_obstruction': _gauss_obstruction(q_free, 0),
+                    'cost_r': 0,
+                    'phase_states': 0,
+                    'phase_splits': 0,
+                    'phase3_backend': _q3_free_phase3_backend_name(q_free),
+                }
+            else:
+                branch_plan = _build_arbitrary_phase_branch_plan(arbitrary_terms)
+                branch_cache = _prepare_affine_constraint_cache(
+                    len(branch_plan.basis_masks),
+                    k,
+                    branch_plan.basis_masks,
                 )
+                result = _make_scaled_complex(0j)
+                quad_eliminated = 0
+                constraint_eliminated = 0
+                max_remaining = 0
+                max_structural = 0
+                max_gauss = 0
+                max_cost_r = 0
+                max_branched = 0
+                phase_states = 0
+                phase_splits = 0
+                phase3_backend: str | None = None
+                phase3_backend_cost_r = -1
 
-                quad_eliminated += branch_info['quad']
-                constraint_eliminated += branch_info['constraint']
-                max_branched = max(max_branched, branch_info['branched'])
-                max_remaining = max(max_remaining, branch_info['remaining'])
-                max_structural = max(
-                    max_structural,
-                    branch_info.get('structural_obstruction', branch_info['remaining']),
-                )
-                max_gauss = max(
-                    max_gauss,
-                    branch_info.get(
-                        'gauss_obstruction',
+                for assignment_mask in range(1 << len(branch_plan.basis_masks)):
+                    branch_phase = 1.0 + 0.0j
+
+                    for dependency_mask, offset, angle in zip(
+                        branch_plan.term_dependency_masks,
+                        branch_plan.term_offsets,
+                        branch_plan.term_angles,
+                    ):
+                        if _parity(dependency_mask & assignment_mask) ^ offset:
+                            branch_phase *= cmath.exp(1j * angle)
+
+                    extra_shift_mask = _solve_echelon_rhs(branch_cache, assignment_mask)
+                    if extra_shift_mask is None:
+                        continue
+
+                    q_branch = _aff_compose_cached(
+                        q_free,
+                        extra_shift_mask,
+                        branch_cache.gamma_masks,
+                        branch_cache.n_free,
+                        context=context,
+                    )
+                    branch_result, branch_info = _reduce_and_sum_scaled(q_branch, context=context)
+                    result = _add_scaled_complex(
+                        result,
+                        _mul_scaled_complex(_make_scaled_complex(branch_phase), branch_result),
+                    )
+
+                    quad_eliminated += branch_info['quad']
+                    constraint_eliminated += branch_info['constraint']
+                    max_branched = max(max_branched, branch_info['branched'])
+                    max_remaining = max(max_remaining, branch_info['remaining'])
+                    max_structural = max(
+                        max_structural,
                         branch_info.get('structural_obstruction', branch_info['remaining']),
-                    ),
-                )
-                branch_cost_r = branch_info.get('cost_r', branch_info['remaining'])
-                max_cost_r = max(max_cost_r, branch_cost_r)
-                phase_states += branch_info.get('phase_states', 0)
-                phase_splits += branch_info.get('phase_splits', 0)
+                    )
+                    max_gauss = max(
+                        max_gauss,
+                        branch_info.get(
+                            'gauss_obstruction',
+                            branch_info.get('structural_obstruction', branch_info['remaining']),
+                        ),
+                    )
+                    branch_cost_r = branch_info.get('cost_r', branch_info['remaining'])
+                    max_cost_r = max(max_cost_r, branch_cost_r)
+                    phase_states += branch_info.get('phase_states', 0)
+                    phase_splits += branch_info.get('phase_splits', 0)
 
-                branch_phase3_backend = branch_info.get('phase3_backend')
-                if branch_phase3_backend is not None:
-                    if branch_cost_r > phase3_backend_cost_r:
-                        phase3_backend = branch_phase3_backend
-                        phase3_backend_cost_r = branch_cost_r
-                    elif branch_cost_r == phase3_backend_cost_r and phase3_backend is None:
-                        phase3_backend = branch_phase3_backend
+                    branch_phase3_backend = branch_info.get('phase3_backend')
+                    if branch_phase3_backend is not None:
+                        if branch_cost_r > phase3_backend_cost_r:
+                            phase3_backend = branch_phase3_backend
+                            phase3_backend_cost_r = branch_cost_r
+                        elif branch_cost_r == phase3_backend_cost_r and phase3_backend is None:
+                            phase3_backend = branch_phase3_backend
 
-            elim_info = {
-                'quad': quad_eliminated,
-                'constraint': constraint_eliminated,
-                'branched': len(branch_plan.basis_masks) + max_branched,
-                'remaining': max_remaining,
-                'structural_obstruction': max_structural,
-                'gauss_obstruction': max_gauss,
-                'cost_r': max_cost_r,
-                'phase_states': phase_states,
-                'phase_splits': phase_splits,
-                'phase3_backend': phase3_backend,
-            }
+                elim_info = {
+                    'quad': quad_eliminated,
+                    'constraint': constraint_eliminated,
+                    'branched': len(branch_plan.basis_masks) + max_branched,
+                    'remaining': max_remaining,
+                    'structural_obstruction': max_structural,
+                    'gauss_obstruction': max_gauss,
+                    'cost_r': max_cost_r,
+                    'phase_states': phase_states,
+                    'phase_splits': phase_splits,
+                    'phase3_backend': phase3_backend,
+                }
         else:
             result, elim_info = _reduce_and_sum_scaled(q_free, context=context)
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import cmath
 import math
 from pathlib import Path
 import sys
@@ -17,6 +18,8 @@ from qiskit.quantum_info import Statevector
 
 from terket import compute_circuit_amplitude
 from terket.circuit_spec import from_qiskit, parse_openqasm2
+from terket.cubic_arithmetic import PhaseFunction
+from terket import engine
 from terket.head_to_head_cases import (
     SUPPORTED_BASIS as HEAD_TO_HEAD_SUPPORTED_BASIS,
     transpile_to_supported_basis as transpile_head_to_head,
@@ -101,6 +104,41 @@ class NativeRZCorrectnessTests(unittest.TestCase):
             expected = complex(statevector[_bits_to_index(bits)])
             self.assertAlmostEqual(amplitude.real, expected.real, places=12)
             self.assertAlmostEqual(amplitude.imag, expected.imag, places=12)
+
+    def test_q3_free_unary_arbitrary_phase_helper_matches_bruteforce(self):
+        q = PhaseFunction(
+            4,
+            level=3,
+            q0=0,
+            q1=[1, 4, 7, 2],
+            q2={
+                (0, 1): 1,
+                (1, 2): 2,
+                (2, 3): 1,
+            },
+            q3={},
+        )
+        terms = (
+            engine._ArbitraryPhaseTerm(1 << 0, 0, math.pi / 7.0),
+            engine._ArbitraryPhaseTerm(1 << 1, 1, -math.pi / 5.0),
+            engine._ArbitraryPhaseTerm(1 << 3, 0, 0.37),
+        )
+
+        expected = 0j
+        for assignment in range(1 << q.n):
+            bits = tuple((assignment >> idx) & 1 for idx in range(q.n))
+            weight = cmath.exp(2j * math.pi * float(q.evaluate(bits)))
+            for term in terms:
+                bit = bits[term.row_mask.bit_length() - 1] ^ int(term.offset)
+                if bit:
+                    weight *= cmath.exp(1j * float(term.angle))
+            expected += weight
+
+        actual = engine._scaled_to_complex(
+            engine._sum_q3_free_with_unary_arbitrary_phases_scaled(q, terms)
+        )
+        self.assertAlmostEqual(actual.real, expected.real, places=12)
+        self.assertAlmostEqual(actual.imag, expected.imag, places=12)
 
     def test_sx_on_entangled_support_matches_qiskit_statevector(self):
         qc = QuantumCircuit(3)
