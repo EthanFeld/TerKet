@@ -199,6 +199,10 @@ _Q3_FREE_ONE_SHOT_CUTSET_MAX_SIZE = 10
 _Q3_FREE_ONE_SHOT_CUTSET_CANDIDATE_POOL = 40
 _Q3_FREE_ONE_SHOT_CUTSET_BEAM_WIDTH = 6
 _Q3_FREE_ONE_SHOT_CUTSET_BRANCHES_PER_STATE = 4
+_Q3_FREE_ONE_SHOT_DIRECT_MIN_VARS = 88
+_Q3_FREE_ONE_SHOT_DIRECT_MIN_WIDTH = 24
+_Q3_FREE_ONE_SHOT_DIRECT_MAX_REMAINING_WIDTH = 16
+_Q3_FREE_ONE_SHOT_DIRECT_MIN_Q2_PER_VAR = 3.0
 _Q2_SEPARATOR_ORDER_MIN_VARS = 48
 _Q2_SEPARATOR_ORDER_BASE_CASE = 24
 _Q2_SEPARATOR_ORDER_MAX_LAYER_SPAN = 2
@@ -225,6 +229,9 @@ _Q3_VERTEX_COVER_EXACT_SIZE_CUTOFF = 20
 # Dense q3 hypergraphs can defeat the exact cover search before size alone
 # does, so cap the edge count separately.
 _Q3_VERTEX_COVER_EXACT_EDGE_CUTOFF = 256
+# The exact cover fallback keeps a failed-state table. Random dense cores can
+# otherwise spend gigabytes proving a marginally smaller cover does not exist.
+_Q3_VERTEX_COVER_EXACT_FAILED_STATE_CUTOFF = 200_000
 # Exact XOR basis simplification is only worth probing on moderate cubic cores.
 _Q3_BASIS_SIMPLIFY_MAX_VARS = 40
 _Q3_BASIS_SIMPLIFY_MAX_ACTIVE_VARS = 12
@@ -361,15 +368,6 @@ def _quimb_import_reason() -> str:
     return "quimb is not installed."
 
 
-def _gpu_import_enabled() -> bool:
-    """Return whether optional GPU paths are enabled in this process."""
-    if _env_flag_enabled("TERKET_DISABLE_GPU"):
-        return False
-    if "TERKET_ENABLE_GPU" in os.environ:
-        return _env_flag_enabled("TERKET_ENABLE_GPU")
-    return True
-
-
 def _import_quimb_tensor_module():
     """Import ``quimb.tensor`` while avoiding Python's slow Windows WMI probe."""
     if sys.platform != "win32" or not hasattr(platform, "_wmi_query"):
@@ -485,65 +483,6 @@ def _get_quimb_tensor_module():
             _QUIMB_TENSOR_IMPORT_ERROR = None
             _QUIMB_TENSOR_MODULE = qtn
     return None if _QUIMB_TENSOR_MODULE is False else _QUIMB_TENSOR_MODULE
-
-
-def _cupy_import_reason() -> str:
-    """Explain why optional CuPy-backed paths are unavailable."""
-    if not _gpu_import_enabled():
-        return "GPU support is disabled by TERKET_DISABLE_GPU."
-    if _CUPY_IMPORT_ERROR is not None:
-        return f"cupy import failed: {_CUPY_IMPORT_ERROR}"
-    return "cupy is not installed."
-
-
-def _get_cupy_module():
-    """Return ``cupy`` when GPU acceleration is enabled and available."""
-    global _CUPY_IMPORT_ERROR, _CUPY_MODULE
-    if not _gpu_import_enabled():
-        return None
-    if _CUPY_MODULE is False:
-        return None
-    if _CUPY_MODULE is None:
-        try:
-            import cupy as cp
-        except Exception as exc:
-            _CUPY_IMPORT_ERROR = exc
-            _CUPY_MODULE = False
-        else:
-            _CUPY_IMPORT_ERROR = None
-            _CUPY_MODULE = cp
-    return None if _CUPY_MODULE is False else _CUPY_MODULE
-
-
-def _cupy_available() -> bool:
-    return _get_cupy_module() is not None
-
-
-def _gpu_memory_limit_bytes() -> int | None:
-    raw_limit = os.environ.get("TERKET_GPU_MEMORY_LIMIT_MB")
-    if raw_limit is None or not raw_limit.strip():
-        return None
-    try:
-        limit_mb = float(raw_limit)
-    except ValueError:
-        return None
-    if limit_mb <= 0:
-        return None
-    return int(limit_mb * 1024 * 1024)
-
-
-def _gpu_memory_budget_bytes(cp=None) -> int | None:
-    if cp is None:
-        cp = _get_cupy_module()
-    if cp is None:
-        return _gpu_memory_limit_bytes()
-
-    limit = _gpu_memory_limit_bytes()
-    try:
-        free_bytes, _ = cp.cuda.Device().mem_info
-    except Exception:
-        return limit
-    return free_bytes if limit is None else min(int(free_bytes), limit)
 
 
 def _normalize_extended_reductions(mode: ExtendedReductionMode | str | None) -> ExtendedReductionMode:
@@ -893,6 +832,58 @@ class ScaledAmplitude:
         return math.log2(abs(self.mantissa)) + self.half_pow2_exp / 2.0
 
 
+class ProbabilityInfo(ReductionInfo, total=False):
+    """Public metadata returned by exact probability queries."""
+
+    method: str
+
+
+@dataclass(frozen=True)
+class ScaledProbability:
+    """Probability represented as ``mantissa * 2 ** (half_pow2_exp / 2)``."""
+
+    mantissa: complex
+    half_pow2_exp: int = 0
+
+    def __post_init__(self) -> None:
+        value, half_pow2_exp = _normalize_scaled_complex(self.mantissa, self.half_pow2_exp)
+        object.__setattr__(self, "mantissa", value)
+        object.__setattr__(self, "half_pow2_exp", half_pow2_exp)
+
+    @classmethod
+    def from_tuple(cls, scaled: ScaledComplex) -> "ScaledProbability":
+        value, half_pow2_exp = scaled
+        return cls(value, half_pow2_exp)
+
+    def as_tuple(self) -> ScaledComplex:
+        return self.mantissa, self.half_pow2_exp
+
+    def to_complex(self) -> complex:
+        return _scaled_to_complex(self.as_tuple())
+
+    def to_float(self, *, atol: float = 1e-12) -> float:
+        value = self.to_complex()
+        scale = max(1.0, abs(value))
+        if abs(value.imag) > atol * scale:
+            raise ValueError(
+                "Probability result retained a non-negligible imaginary part: "
+                f"{value.imag!r}."
+            )
+        real = float(value.real)
+        if real < 0.0 and abs(real) <= atol * scale:
+            return 0.0
+        return real
+
+    def log2(self) -> float:
+        if self.mantissa == 0j:
+            return -math.inf
+        return math.log2(abs(self.mantissa)) + self.half_pow2_exp / 2.0
+
+
+def _probability_from_scaled_amplitude(amplitude: ScaledAmplitude) -> ScaledProbability:
+    return ScaledProbability(complex(abs(amplitude.mantissa) ** 2, 0.0), 2 * amplitude.half_pow2_exp)
+
+
 def _apply_affine_bit_in_place(q, row_mask, offset, alpha):
     """Add alpha/mod_q1 * (offset xor parity(row_mask*f)) minus the constant term."""
     alpha %= q.mod_q1
@@ -1082,13 +1073,12 @@ def _arbitrary_phase_terms_are_unary(
     return True
 
 
-def _sum_q3_free_with_unary_arbitrary_phases_scaled(
-    q: PhaseFunction,
+def _build_unary_arbitrary_factor_tables(
+    n_vars: int,
     terms: Sequence[_ArbitraryPhaseTerm],
-) -> ScaledComplex:
-    """Exactly sum a q3-free kernel with additional unary arbitrary-angle factors."""
-    assert not q.q3, "Unary arbitrary-phase summation requires a q3-free kernel."
-    scalar, factors = _build_cubic_factors_scaled(q)
+) -> tuple[tuple[ScaledComplex, ScaledComplex], ...]:
+    """Return per-variable [x=0, x=1] factors for unary arbitrary phases."""
+    tables = [[_ONE_SCALED, _ONE_SCALED] for _ in range(int(n_vars))]
 
     for term in terms:
         row_mask = int(term.row_mask)
@@ -1097,29 +1087,31 @@ def _sum_q3_free_with_unary_arbitrary_phases_scaled(
         var = row_mask.bit_length() - 1
         phase = _make_scaled_complex(cmath.exp(1j * float(term.angle)))
         table = [phase, _ONE_SCALED] if (int(term.offset) & 1) else [_ONE_SCALED, phase]
+        tables[var][0] = _mul_scaled_complex(tables[var][0], table[0])
+        tables[var][1] = _mul_scaled_complex(tables[var][1], table[1])
+
+    return tuple((table[0], table[1]) for table in tables)
+
+
+def _restrict_unary_arbitrary_factor_tables(
+    unary_tables: Sequence[tuple[ScaledComplex, ScaledComplex]],
+    variables: Sequence[int],
+) -> tuple[tuple[ScaledComplex, ScaledComplex], ...]:
+    return tuple(unary_tables[int(var)] for var in variables)
+
+
+def _sum_q3_free_with_unary_factor_tables_for_order_scaled(
+    q: PhaseFunction,
+    unary_tables: Sequence[tuple[ScaledComplex, ScaledComplex]],
+    order: Sequence[int],
+) -> ScaledComplex:
+    """Sum a q3-free kernel by exact factor elimination along ``order``."""
+    scalar, factors = _build_cubic_factors_scaled(q)
+    for var, table in enumerate(unary_tables):
         scalar = _mul_scaled_complex(
             scalar,
-            _combine_factor_scaled(factors, (var,), table),
+            _combine_factor_scaled(factors, (var,), [table[0], table[1]]),
         )
-
-    if q.n == 0:
-        return scalar
-
-    if q.q2:
-        adjacency, edges = _q3_free_graph(q)
-        max_degree = max((len(neighbors) for neighbors in adjacency), default=0)
-        depth, chords = _q3_free_spanning_data(adjacency, edges)
-        feedback_vars = _select_feedback_vertices(q.n, chords, depth)
-        order = _q3_free_treewidth_order(
-            q,
-            len(feedback_vars),
-            max_degree=max_degree,
-        )
-        if order is None:
-            order, _width = _factor_scope_order(q.n, tuple(factors))
-    else:
-        order = list(range(q.n))
-
     total, _max_scope = _sum_factor_tables_scaled(
         q.n,
         factors,
@@ -1127,6 +1119,220 @@ def _sum_q3_free_with_unary_arbitrary_phases_scaled(
         scalar=scalar,
     )
     return total
+
+
+def _evaluate_q3_free_remaining_with_unary_factor_tables_scaled(
+    *,
+    level: int,
+    q1: Sequence[int],
+    unary_tables: Sequence[tuple[ScaledComplex, ScaledComplex]],
+    backend: str,
+    q2: dict[tuple[int, int], int],
+    order: Sequence[int],
+    isolated_vars: Sequence[int] = (),
+    components: Sequence["_Q3FreeConstraintComponentPlan"] = (),
+    native_treewidth_plan: object | None = None,
+) -> ScaledComplex:
+    """Evaluate one cutset-conditioned remainder with unary arbitrary factors."""
+    n_vars = len(q1)
+    if n_vars == 0:
+        return _ONE_SCALED
+
+    if backend == "product":
+        total = _ONE_SCALED
+        omega_scaled = _omega_scaled_table(level)
+        modulus = 1 << int(level)
+        for var in range(n_vars):
+            unary_zero, unary_one = unary_tables[var]
+            total = _mul_scaled_complex(
+                total,
+                _add_scaled_complex(
+                    unary_zero,
+                    _mul_scaled_complex(omega_scaled[int(q1[var]) % modulus], unary_one),
+                ),
+            )
+        return total
+
+    if backend == "treewidth":
+        q_local = _phase_function_from_parts(
+            n_vars,
+            level=level,
+            q0=Fraction(0),
+            q1=list(q1),
+            q2=q2,
+            q3={},
+        )
+        if native_treewidth_plan is not None and _schur_native is not None:
+            scalar, factors = _build_cubic_factors_scaled(q_local)
+            for var, table in enumerate(unary_tables):
+                scalar = _mul_scaled_complex(
+                    scalar,
+                    _combine_factor_scaled(factors, (var,), [table[0], table[1]]),
+                )
+            try:
+                core_total, _max_scope = _schur_native.sum_scaled_factor_treewidth_preplanned(
+                    native_treewidth_plan,
+                    scalar,
+                    dict(factors),
+                )
+                return tuple(core_total)
+            except Exception:
+                pass
+        return _sum_q3_free_with_unary_factor_tables_for_order_scaled(q_local, unary_tables, order)
+
+    total = _ONE_SCALED
+    if isolated_vars:
+        iso_q1 = [q1[int(var)] for var in isolated_vars]
+        iso_tables = _restrict_unary_arbitrary_factor_tables(unary_tables, isolated_vars)
+        total = _mul_scaled_complex(
+            total,
+            _evaluate_q3_free_remaining_with_unary_factor_tables_scaled(
+                level=level,
+                q1=iso_q1,
+                unary_tables=iso_tables,
+                backend="product",
+                q2={},
+                order=(),
+            ),
+        )
+
+    for component_plan in components:
+        q1_local = [q1[int(var)] for var in component_plan.variables]
+        unary_local = _restrict_unary_arbitrary_factor_tables(unary_tables, component_plan.variables)
+        component_q = _phase_function_from_parts(
+            len(component_plan.variables),
+            level=level,
+            q0=Fraction(0),
+            q1=q1_local,
+            q2=component_plan.q2,
+            q3={},
+        )
+        total = _mul_scaled_complex(
+            total,
+            _sum_q3_free_with_unary_factor_tables_scaled(component_q, unary_local),
+        )
+
+    return total
+
+
+def _evaluate_q3_free_cutset_conditioning_plan_with_unary_factor_tables_scaled(
+    q: PhaseFunction,
+    plan: _Q3FreeCutsetConditioningPlan,
+    unary_tables: Sequence[tuple[ScaledComplex, ScaledComplex]],
+) -> ScaledComplex:
+    """Evaluate a q3-free cutset plan with extra unary arbitrary factors."""
+    plan = _attach_q3_free_cutset_runtime_cache(plan)
+    branch_bits = np.asarray(plan.branch_bits, dtype=np.int64)
+    branch_pair_residue = np.asarray(plan.branch_pair_residue, dtype=np.int64)
+    branch_remaining_shift = np.asarray(plan.branch_remaining_shift, dtype=np.int64)
+    cutset_size = len(plan.cutset_vars)
+    branch_count = 1 << cutset_size
+    omega_scaled = _omega_scaled_table(q.level)
+    mod_q1 = 1 << int(q.level)
+
+    q0_eff = np.full(branch_count, _phase_fraction_to_residue(q.q0, q.mod_q1), dtype=np.int64)
+    if plan.cutset_vars:
+        cutset_q1 = np.asarray([q.q1[var] % q.mod_q1 for var in plan.cutset_vars], dtype=np.int64)
+        q0_eff = (q0_eff + branch_bits @ cutset_q1) % q.mod_q1
+    if branch_pair_residue.size:
+        q0_eff = (q0_eff + branch_pair_residue) % q.mod_q1
+
+    remaining_unary = _restrict_unary_arbitrary_factor_tables(unary_tables, plan.remaining_vars)
+    base_remaining_q1 = np.asarray([q.q1[var] % q.mod_q1 for var in plan.remaining_vars], dtype=np.int64)
+    total = _ZERO_SCALED
+
+    for branch_idx in range(branch_count):
+        branch_total = omega_scaled[int(q0_eff[branch_idx]) % mod_q1]
+        for local_idx, var in enumerate(plan.cutset_vars):
+            branch_total = _mul_scaled_complex(
+                branch_total,
+                unary_tables[int(var)][int(branch_bits[branch_idx, local_idx])],
+            )
+
+        if plan.remaining_vars:
+            if branch_remaining_shift.size:
+                remaining_q1 = (
+                    base_remaining_q1 + branch_remaining_shift[branch_idx]
+                ) % mod_q1
+            else:
+                remaining_q1 = base_remaining_q1
+            branch_total = _mul_scaled_complex(
+                branch_total,
+                _evaluate_q3_free_remaining_with_unary_factor_tables_scaled(
+                    level=q.level,
+                    q1=remaining_q1.tolist(),
+                    unary_tables=remaining_unary,
+                    backend=plan.remaining_backend,
+                    q2=plan.remaining_q2,
+                    order=plan.remaining_order,
+                    isolated_vars=plan.remaining_isolated_vars,
+                    components=plan.remaining_components,
+                    native_treewidth_plan=plan.native_treewidth_plan,
+                ),
+            )
+
+        total = _add_scaled_complex(total, branch_total)
+
+    return total
+
+
+def _sum_q3_free_with_unary_factor_tables_scaled(
+    q: PhaseFunction,
+    unary_tables: Sequence[tuple[ScaledComplex, ScaledComplex]],
+) -> ScaledComplex:
+    """Exactly sum a q3-free kernel with additional unary factors."""
+    assert not q.q3, "Unary arbitrary-phase summation requires a q3-free kernel."
+    if q.n == 0:
+        return _make_scaled_complex(cmath.exp(2j * cmath.pi * float(q.q0)))
+
+    if not q.q2:
+        return _mul_scaled_complex(
+            _make_scaled_complex(cmath.exp(2j * cmath.pi * float(q.q0))),
+            _evaluate_q3_free_remaining_with_unary_factor_tables_scaled(
+                level=q.level,
+                q1=q.q1,
+                unary_tables=unary_tables,
+                backend="product",
+                q2={},
+                order=(),
+            ),
+        )
+
+    adjacency, edges = _q3_free_graph(q)
+    max_degree = max((len(neighbors) for neighbors in adjacency), default=0)
+    depth, chords = _q3_free_spanning_data(adjacency, edges)
+    feedback_vars = _select_feedback_vertices(q.n, chords, depth)
+    order = _q3_free_treewidth_order(
+        q,
+        len(feedback_vars),
+        max_degree=max_degree,
+    )
+    if order is not None:
+        return _sum_q3_free_with_unary_factor_tables_for_order_scaled(q, unary_tables, order)
+
+    plan = None
+    try:
+        plan = _q3_free_one_shot_cutset_conditioning_plan(q)
+    except MemoryError:
+        plan = None
+    if plan is not None:
+        return _evaluate_q3_free_cutset_conditioning_plan_with_unary_factor_tables_scaled(
+            q,
+            plan,
+            unary_tables,
+        )
+
+    fallback_order, _width = _factor_scope_order(q.n, tuple(_build_cubic_factors_scaled(q)[1]))
+    return _sum_q3_free_with_unary_factor_tables_for_order_scaled(q, unary_tables, fallback_order)
+
+
+def _sum_q3_free_with_unary_arbitrary_phases_scaled(
+    q: PhaseFunction,
+    terms: Sequence[_ArbitraryPhaseTerm],
+) -> ScaledComplex:
+    """Exactly sum a q3-free kernel with additional unary arbitrary-angle factors."""
+    unary_tables = _build_unary_arbitrary_factor_tables(q.n, terms)
+    return _sum_q3_free_with_unary_factor_tables_scaled(q, unary_tables)
 
 
 # ==================================================================
@@ -1616,10 +1822,10 @@ class SchurState:
         """
         Row-reduce the output constraints without constructing a solution basis.
 
-        The q3-free probability path only needs the reduced rows, pivot map,
-        row-operation witnesses, and the free-variable count. Skipping the
-        explicit ``free_vars`` / ``gamma_masks`` construction avoids repeated
-        O(n * m) work when evaluating a long chain of exact prefix marginals.
+        Some structural analyzers only need reduced rows, pivot map,
+        row-operation witnesses, and free-variable count. Skipping explicit
+        ``free_vars`` / ``gamma_masks`` construction avoids repeated
+        O(n * m) work when evaluating many related output restrictions.
         """
         self._flush_pending_dead_variables()
         rows = self.eps[:]
@@ -1706,44 +1912,6 @@ class SchurState:
             )
             amp = ScaledAmplitude.from_tuple(scaled) if preserve_scale else _scaled_to_complex(scaled)
             return amp, _info(0, 0, 0, 0, 0, zero=not ok)
-
-        # For q3-free states without arbitrary-angle side terms, evaluate the
-        # output constraints directly on the raw rows instead of materializing
-        # an affine-parity substitution. This keeps the one-shot high-precision
-        # path exact without paying the raw-plan slicing search cost.
-        if not self._arbitrary_phases and not self.q.q3:
-            cache = self._prepare_constraint_echelon()
-            plan = _build_q3_free_raw_constraint_plan(
-                self,
-                allow_tensor_contraction=allow_tensor_contraction,
-                prefer_one_shot_slicing=True,
-            )
-            restricted_plan = _restrict_q3_free_raw_constraint_plan(plan, self.n)
-            result = _evaluate_q3_free_raw_constraint_plan_scaled(
-                plan,
-                restricted_plan,
-                output_bits,
-                allow_tensor_contraction=allow_tensor_contraction,
-            )
-            scaled_amp = _normalize_scaled_complex(
-                complex(self.scalar) * result[0],
-                result[1] + self.scalar_half_pow2,
-            )
-            amp = ScaledAmplitude.from_tuple(scaled_amp) if preserve_scale else _scaled_to_complex(scaled_amp)
-            return amp, _info(
-                cache.n_free,
-                0,
-                0,
-                0,
-                0,
-                structural_obstruction=0,
-                gauss_obstruction=_gauss_obstruction(self.q, 0),
-                phase_states=0,
-                phase_splits=0,
-                zero=scaled_amp[0] == 0j,
-                cost_model_r=0,
-                phase3_backend=_q3_free_phase3_backend_name(self.q),
-            )
 
         cache = self._prepare_echelon()
         solved = self._solve_for_output(cache, output_bits)
@@ -3198,6 +3366,115 @@ def _sum_half_phase_q2_unary_expansion_scaled(q) -> ScaledComplex | None:
         level=q.level,
         plan=plan,
     )
+
+
+def _apply_safe_q3_free_parity_substitutions(
+    q: PhaseFunction,
+) -> tuple[PhaseFunction | None, int, bool]:
+    """Apply only q3-free-preserving exact parity substitutions.
+
+    This is the proved-safe high-precision subset:
+    - decoupled constraints
+    - zero constraints
+    - single-partner parity constraints
+    - two-partner parity constraints in q3-free kernels
+
+    Higher-arity parity substitutions are deliberately skipped because the
+    affine recomposition can create q3 or higher terms outside the current
+    backend representation.
+    """
+    assert not q.q3, "safe parity substitutions expect a q3-free kernel."
+
+    reduced_q = q
+    scale_half_pow2 = 0
+    changed = False
+
+    while True:
+        classification_lookup = _classification_lookup(reduced_q)
+        decoupled_constraints = []
+        adjacency = [set() for _ in range(reduced_q.n)]
+        for (left, right), coeff in reduced_q.q2.items():
+            if coeff % reduced_q.mod_q2:
+                adjacency[left].add(right)
+                adjacency[right].add(left)
+
+        best_action = None
+        best_score = None
+        for var in range(reduced_q.n):
+            entry = classification_lookup[var][reduced_q.q1[var] % reduced_q.mod_q1]
+            tag = entry[0]
+            if tag == _CLASS_CONSTRAINT_ZERO:
+                return None, 0, True
+            if tag == _CLASS_CONSTRAINT_DECOUPLED:
+                decoupled_constraints.append(var)
+                continue
+            if tag != _CLASS_CONSTRAINT_PARITY:
+                continue
+            partners = tuple(int(partner) for partner in entry[1])
+            target = 1 if int(entry[2]) % reduced_q.mod_q1 == (reduced_q.mod_q1 // 2) else 0
+            if len(partners) == 1:
+                score = (-1, var)
+                action = ("single", var, partners[0], target)
+            elif len(partners) == 2:
+                left, right = partners
+                fill_left_to_right = len(
+                    [
+                        neighbor
+                        for neighbor in adjacency[left]
+                        if neighbor not in (right, var) and neighbor not in adjacency[right]
+                    ]
+                )
+                fill_right_to_left = len(
+                    [
+                        neighbor
+                        for neighbor in adjacency[right]
+                        if neighbor not in (left, var) and neighbor not in adjacency[left]
+                    ]
+                )
+                if fill_right_to_left <= fill_left_to_right:
+                    keep, remove = left, right
+                    fill_cost = fill_right_to_left
+                else:
+                    keep, remove = right, left
+                    fill_cost = fill_left_to_right
+                score = (fill_cost, len(adjacency[remove]), var)
+                action = ("double", var, keep, remove, target)
+            else:
+                continue
+            if best_score is None or score < best_score:
+                best_score = score
+                best_action = action
+
+        if decoupled_constraints:
+            reduced_q, half_pow2 = _elim_decoupled_constraints_batch(reduced_q, decoupled_constraints)
+            scale_half_pow2 += half_pow2
+            changed = True
+            continue
+
+        if best_action is None:
+            break
+        if best_action[0] == "single":
+            result = _elim_single_partner_constraint(
+                reduced_q,
+                best_action[1],
+                best_action[2],
+                best_action[3],
+            )
+        else:
+            result = _elim_two_partner_constraint_q3_free(
+                reduced_q,
+                best_action[1],
+                best_action[2],
+                best_action[3],
+                best_action[4],
+            )
+        if result is None:
+            break
+        reduced_q, half_pow2 = result
+        scale_half_pow2 += half_pow2
+        changed = True
+
+    return reduced_q, scale_half_pow2, changed
 
 
 def _half_phase_parity_component_reduction(q) -> tuple[object, int] | ScaledComplex | None:
@@ -4836,6 +5113,42 @@ def _q3_free_prefers_one_shot_cutset(
     return False
 
 
+def _q3_free_prefers_dense_one_shot_direct(
+    q: PhaseFunction,
+    *,
+    direct_width: int,
+) -> bool:
+    """Return whether a giant dense q2 core should bypass the generic mediator path."""
+    if q.q3 or not q.q2 or _is_half_phase_q2(q):
+        return False
+    if q.n < _Q3_FREE_ONE_SHOT_DIRECT_MIN_VARS:
+        return False
+    if direct_width < _Q3_FREE_ONE_SHOT_DIRECT_MIN_WIDTH:
+        return False
+    return len(q.q2) >= int(math.ceil(_Q3_FREE_ONE_SHOT_DIRECT_MIN_Q2_PER_VAR * q.n))
+
+
+def _sum_q3_free_via_one_shot_cutset_scaled(q: PhaseFunction) -> ScaledComplex | None:
+    """Directly route giant dense q2 kernels through the one-shot cutset planner."""
+    _order, direct_width = _min_fill_cubic_order(q)
+    if not _q3_free_prefers_dense_one_shot_direct(q, direct_width=direct_width):
+        return None
+
+    plan = _q3_free_one_shot_cutset_conditioning_plan(q)
+    if plan is None or plan.remaining_backend == "generic":
+        return None
+    if plan.remaining_width > _Q3_FREE_ONE_SHOT_DIRECT_MAX_REMAINING_WIDTH:
+        return None
+    if plan.remaining_width >= direct_width:
+        return None
+
+    return _evaluate_q3_free_cutset_conditioning_plan_scaled(
+        plan,
+        q.q1,
+        level=q.level,
+    )
+
+
 def _plan_q3_free_constraint_components(
     base_q: PhaseFunction,
     lambda_offset: int,
@@ -5777,6 +6090,67 @@ def _q3_free_runtime_score_is_good_baseline(
     return generic_penalty == 0 and direct_treewidth_penalty == 0
 
 
+def _rewrite_q3_free_phase_to_normal_form(
+    q: PhaseFunction,
+    *,
+    allow_tensor_contraction: bool,
+    prefer_reusable_decomposition: bool = False,
+    prefer_one_shot_slicing: bool = False,
+    baseline_runtime_score: tuple[int, int, int, int, int] | None = None,
+    context: _ReductionContext | None = None,
+) -> tuple[PhaseFunction | None, int, bool, _Q3FreeExecutionPlan | None, tuple[int, int, int, int, int] | None]:
+    """Apply exact no-branch q3-free rewrites when they improve planned runtime.
+
+    This is the q3-free analogue of the paper's symbolic normal-form phase:
+    repeatedly apply exact eliminations that do not branch, then keep the
+    rewritten kernel only when TerKet's own execution-plan score improves.
+    """
+    assert not q.q3, "q3-free normal-form rewrite expects a q3-free kernel."
+    if q.level > 3:
+        reduced_q, scale_half_pow2, changed = _apply_safe_q3_free_parity_substitutions(q)
+        if reduced_q is None:
+            return None, scale_half_pow2, True, None, None
+        if not changed:
+            return q, 0, False, None, baseline_runtime_score
+    else:
+        reduced_q, scale_half_pow2, _exact_info, _blocked_quadratics = _apply_exact_eliminations(q, context=context)
+
+        if reduced_q is None:
+            return None, scale_half_pow2, True, None, None
+        if reduced_q is q and scale_half_pow2 == 0:
+            return q, 0, False, None, baseline_runtime_score
+
+    candidate_plan: _Q3FreeExecutionPlan | None
+    if reduced_q.n == 0:
+        candidate_plan = None
+        candidate_runtime_score = (0, 0, 0, 0, 0)
+    else:
+        candidate_plan = _build_q3_free_execution_plan(
+            q=reduced_q,
+            allow_tensor_contraction=allow_tensor_contraction,
+            prefer_reusable_decomposition=prefer_reusable_decomposition,
+            prefer_one_shot_slicing=prefer_one_shot_slicing,
+            context=context,
+        )
+        candidate_runtime_score = _q3_free_execution_plan_runtime_score(candidate_plan)
+    if baseline_runtime_score is None:
+        if q.n == 0:
+            baseline_runtime_score = (0, 0, 0, 0, 0)
+        else:
+            baseline_plan = _build_q3_free_execution_plan(
+                q=q,
+                allow_tensor_contraction=allow_tensor_contraction,
+                prefer_reusable_decomposition=prefer_reusable_decomposition,
+                prefer_one_shot_slicing=prefer_one_shot_slicing,
+                context=context,
+            )
+            baseline_runtime_score = _q3_free_execution_plan_runtime_score(baseline_plan)
+
+    if candidate_runtime_score < baseline_runtime_score:
+        return reduced_q, scale_half_pow2, True, candidate_plan, candidate_runtime_score
+    return q, 0, False, None, baseline_runtime_score
+
+
 def _optimize_q3_free_phase(
     q: PhaseFunction,
     *,
@@ -5800,23 +6174,30 @@ def _optimize_q3_free_phase(
     if not changed:
         return q, False
 
-    candidate_plan = _build_q3_free_execution_plan(
-        q=optimized_q,
-        allow_tensor_contraction=allow_tensor_contraction,
-        prefer_reusable_decomposition=prefer_reusable_decomposition,
-        prefer_one_shot_slicing=prefer_one_shot_slicing,
-        context=context,
-    )
     if baseline_runtime_score is None:
-        baseline_plan = _build_q3_free_execution_plan(
-            q=q,
+        if q.n == 0:
+            baseline_runtime_score = (0, 0, 0, 0, 0)
+        else:
+            baseline_plan = _build_q3_free_execution_plan(
+                q=q,
+                allow_tensor_contraction=allow_tensor_contraction,
+                prefer_reusable_decomposition=prefer_reusable_decomposition,
+                prefer_one_shot_slicing=prefer_one_shot_slicing,
+                context=context,
+            )
+            baseline_runtime_score = _q3_free_execution_plan_runtime_score(baseline_plan)
+    if optimized_q.n == 0:
+        candidate_runtime_score = (0, 0, 0, 0, 0)
+    else:
+        candidate_plan = _build_q3_free_execution_plan(
+            q=optimized_q,
             allow_tensor_contraction=allow_tensor_contraction,
             prefer_reusable_decomposition=prefer_reusable_decomposition,
             prefer_one_shot_slicing=prefer_one_shot_slicing,
             context=context,
         )
-        baseline_runtime_score = _q3_free_execution_plan_runtime_score(baseline_plan)
-    if _q3_free_execution_plan_runtime_score(candidate_plan) < baseline_runtime_score:
+        candidate_runtime_score = _q3_free_execution_plan_runtime_score(candidate_plan)
+    if candidate_runtime_score < baseline_runtime_score:
         return optimized_q, True
     return q, False
 
@@ -5896,6 +6277,42 @@ def _evaluate_q3_free_constraint_plan_scaled(
         plan.isolated_vars,
         plan.components,
     )
+    rewritten_q, rewrite_scale_half_pow2, rewrite_changed, rewritten_plan, runtime_score = _rewrite_q3_free_phase_to_normal_form(
+        instantiated_q,
+        allow_tensor_contraction=allow_tensor_contraction,
+        prefer_one_shot_slicing=True,
+        baseline_runtime_score=baseline_runtime_score,
+    )
+    if rewritten_q is None:
+        return _ZERO_SCALED
+    if rewrite_changed:
+        optimized_q, changed = _optimize_q3_free_phase(
+            rewritten_q,
+            allow_tensor_contraction=allow_tensor_contraction,
+            prefer_one_shot_slicing=True,
+            baseline_runtime_score=runtime_score,
+        )
+        if changed:
+            execution_plan = _build_q3_free_execution_plan(
+                q=optimized_q,
+                allow_tensor_contraction=allow_tensor_contraction,
+                prefer_one_shot_slicing=True,
+            )
+        else:
+            execution_plan = (
+                rewritten_plan
+                if rewritten_plan is not None
+                else _build_q3_free_execution_plan(
+                    q=rewritten_q,
+                    allow_tensor_contraction=allow_tensor_contraction,
+                    prefer_one_shot_slicing=True,
+                )
+            )
+        return _evaluate_q3_free_execution_plan_scaled(
+            execution_plan,
+            output_scale_half_pow2=(rewrite_scale_half_pow2 - 2 * plan.rank),
+        )
+
     optimized_q, changed = _optimize_q3_free_phase(
         instantiated_q,
         allow_tensor_contraction=allow_tensor_contraction,
@@ -6304,6 +6721,42 @@ def _evaluate_q3_free_raw_constraint_plan_scaled(
         restricted_plan.isolated_vars,
         restricted_plan.components,
     )
+    rewritten_q, rewrite_scale_half_pow2, rewrite_changed, rewritten_plan, runtime_score = _rewrite_q3_free_phase_to_normal_form(
+        instantiated_q,
+        allow_tensor_contraction=allow_tensor_contraction,
+        prefer_one_shot_slicing=True,
+        baseline_runtime_score=baseline_runtime_score,
+    )
+    if rewritten_q is None:
+        return _ZERO_SCALED
+    if rewrite_changed:
+        optimized_q, changed = _optimize_q3_free_phase(
+            rewritten_q,
+            allow_tensor_contraction=allow_tensor_contraction,
+            prefer_one_shot_slicing=True,
+            baseline_runtime_score=runtime_score,
+        )
+        if changed:
+            execution_plan = _build_q3_free_execution_plan(
+                q=optimized_q,
+                allow_tensor_contraction=allow_tensor_contraction,
+                prefer_one_shot_slicing=True,
+            )
+        else:
+            execution_plan = (
+                rewritten_plan
+                if rewritten_plan is not None
+                else _build_q3_free_execution_plan(
+                    q=rewritten_q,
+                    allow_tensor_contraction=allow_tensor_contraction,
+                    prefer_one_shot_slicing=True,
+                )
+            )
+        return _evaluate_q3_free_execution_plan_scaled(
+            execution_plan,
+            output_scale_half_pow2=(rewrite_scale_half_pow2 - 2 * restricted_plan.active_count),
+        )
+
     optimized_q, changed = _optimize_q3_free_phase(
         instantiated_q,
         allow_tensor_contraction=allow_tensor_contraction,
@@ -7183,6 +7636,10 @@ def _sum_q3_free_via_gauss_reduction_scaled(q):
             q.q1,
         )
 
+    one_shot_cutset_total = _sum_q3_free_via_one_shot_cutset_scaled(q)
+    if one_shot_cutset_total is not None:
+        return one_shot_cutset_total
+
     generic_mediator_plan = _build_generic_q2_mediator_plan(q)
     if generic_mediator_plan is not None:
         return _evaluate_generic_q2_mediator_plan_scaled(
@@ -7344,7 +7801,10 @@ def _cubic_order_width(q, order):
         raise ValueError(f"Expected elimination order of length {q.n}, received {len(order)}.")
     native_cubic_order_width = _native_symbol("cubic_order_width")
     if native_cubic_order_width is not None:
-        return native_cubic_order_width(q.n, q.q2, q.q3, order)
+        try:
+            return native_cubic_order_width(q.n, q.q2, q.q3, order)
+        except MemoryError:
+            pass
 
     adjacency_masks = [0] * q.n
     for i, j in q.q2:
@@ -7887,7 +8347,10 @@ def _min_fill_cubic_order_uncached(q):
         return [], 0
     native_min_fill_cubic_order = _native_symbol("min_fill_cubic_order")
     if native_min_fill_cubic_order is not None:
-        return native_min_fill_cubic_order(q.n, q.q2, q.q3)
+        try:
+            return native_min_fill_cubic_order(q.n, q.q2, q.q3)
+        except MemoryError:
+            pass
 
     adjacency_masks = [0] * q.n
     for i, j in q.q2:
@@ -7948,7 +8411,10 @@ def _min_degree_cubic_order_uncached(q):
         return [], 0
     native_min_degree_cubic_order = _native_symbol("min_degree_cubic_order")
     if native_min_degree_cubic_order is not None:
-        return native_min_degree_cubic_order(q.n, q.q2, q.q3)
+        try:
+            return native_min_degree_cubic_order(q.n, q.q2, q.q3)
+        except MemoryError:
+            pass
 
     adjacency_masks = [0] * q.n
     for i, j in q.q2:
@@ -8893,7 +9359,7 @@ def _attach_q3_free_cutset_runtime_cache(
     cutset_size = len(plan.cutset_vars)
     branch_count = 1 << cutset_size
     branch_masks = np.arange(branch_count, dtype=np.uint64)
-    branch_bits = _branch_assignment_bits(branch_masks, cutset_size, np).astype(np.int64)
+    branch_bits = _branch_assignment_bits(branch_masks, cutset_size).astype(np.int64)
 
     if plan.cutset_cutset_residue.size:
         branch_pair_residue = np.zeros(branch_count, dtype=np.int64)
@@ -9323,7 +9789,7 @@ def _sum_q3_free_via_cutset_conditioning_scaled(q: PhaseFunction) -> ScaledCompl
 
     branch_count = 1 << len(plan.cutset_vars)
     branch_masks = np.arange(branch_count, dtype=np.uint64)
-    branch_bits = _branch_assignment_bits(branch_masks, len(plan.cutset_vars), np)
+    branch_bits = _branch_assignment_bits(branch_masks, len(plan.cutset_vars))
     q0_eff = np.full(branch_count, _phase_fraction_to_residue(q.q0, q.mod_q1), dtype=np.int64)
 
     if plan.cutset_vars:
@@ -10404,11 +10870,8 @@ def _prefer_treewidth_phase3(q, cover, order, width, *, fully_peeled: bool = Fal
 
 
 _CUBIC_CONTRACTION_MAX_WIDTH = 12  # numpy bucket elim beats quimb up to this width
-_Q3_COVER_GPU_MIN_COVER = 9
-_Q3_COVER_GPU_MAX_COVER = 24
-_Q3_COVER_GPU_MAX_REMAINING = 20
-_Q3_COVER_GPU_BRANCH_CHUNK_MAX = 128
-_Q3_COVER_GPU_ASSIGNMENT_CHUNK_LOG2 = 13
+_Q3_COVER_BRANCH_CHUNK_MAX = 128
+_Q3_COVER_ASSIGNMENT_CHUNK_LOG2 = 13
 
 def _prefer_cubic_contraction_phase3(q, cover, order, width, *, fully_peeled: bool = False):
     """Decide whether the specialized cubic contraction should be used.
@@ -10433,11 +10896,6 @@ def _prefer_cubic_contraction_phase3(q, cover, order, width, *, fully_peeled: bo
     if q.n > 60:
         return False
     return True
-
-
-def _prefer_q3_cover_gpu(q, cover) -> bool:
-    del q, cover
-    return False
 
 
 def _prefer_tensor_contraction_phase3(q, cover, order, width, allow_tensor_contraction=True):
@@ -11291,6 +11749,8 @@ def _minimum_vertex_cover_from_edge_masks(
             return ()
         if budget == 0:
             return None
+        if len(failed_states) >= _Q3_VERTEX_COVER_EXACT_FAILED_STATE_CUTOFF:
+            return None
         state = (remaining_edges_mask, budget)
         if state in failed_states:
             return None
@@ -11323,6 +11783,8 @@ def _minimum_vertex_cover_from_edge_masks(
         result = search(all_edges_mask, budget)
         if result is not None:
             return sorted(result)
+        if len(failed_states) >= _Q3_VERTEX_COVER_EXACT_FAILED_STATE_CUTOFF:
+            break
     return greedy_cover
 
 
@@ -11559,17 +12021,17 @@ def _build_q3_free_branch_template(q, cover) -> Q3FreeBranchTemplate:
     )
 
 
-def _branch_assignment_bits(branch_masks: np.ndarray, n_cover: int, xp):
+def _branch_assignment_bits(branch_masks: np.ndarray, n_cover: int):
     if n_cover == 0:
-        return xp.zeros((len(branch_masks), 0), dtype=xp.int64)
-    masks = xp.asarray(branch_masks, dtype=xp.uint64).reshape(-1, 1)
-    shifts = xp.arange(n_cover, dtype=xp.uint64).reshape(1, -1)
-    return ((masks >> shifts) & 1).astype(xp.int64)
+        return np.zeros((len(branch_masks), 0), dtype=np.int64)
+    masks = np.asarray(branch_masks, dtype=np.uint64).reshape(-1, 1)
+    shifts = np.arange(n_cover, dtype=np.uint64).reshape(1, -1)
+    return ((masks >> shifts) & 1).astype(np.int64)
 
 
 def _q3_cover_branch_chunk_size(template: Q3FreeBranchTemplate, budget_bytes: int | None) -> tuple[int, int]:
-    assignment_chunk = 1 << min(template.n_remaining, _Q3_COVER_GPU_ASSIGNMENT_CHUNK_LOG2)
-    branch_chunk = min(_Q3_COVER_GPU_BRANCH_CHUNK_MAX, 1 << template.n_cover)
+    assignment_chunk = 1 << min(template.n_remaining, _Q3_COVER_ASSIGNMENT_CHUNK_LOG2)
+    branch_chunk = min(_Q3_COVER_BRANCH_CHUNK_MAX, 1 << template.n_cover)
     if budget_bytes is None:
         return branch_chunk, assignment_chunk
 
@@ -11585,33 +12047,32 @@ def _evaluate_q3_free_branch_template_batch(
     template: Q3FreeBranchTemplate,
     branch_masks: np.ndarray,
     *,
-    xp=np,
     assignment_chunk_size: int | None = None,
 ) -> np.ndarray:
     if branch_masks.size == 0:
         return np.zeros(0, dtype=np.complex128)
 
     if assignment_chunk_size is None:
-        assignment_chunk_size = 1 << min(template.n_remaining, _Q3_COVER_GPU_ASSIGNMENT_CHUNK_LOG2)
+        assignment_chunk_size = 1 << min(template.n_remaining, _Q3_COVER_ASSIGNMENT_CHUNK_LOG2)
 
-    branch_bits = _branch_assignment_bits(branch_masks, template.n_cover, xp)
+    branch_bits = _branch_assignment_bits(branch_masks, template.n_cover)
     mod_q1 = int(template.mod_q1)
-    omega = xp.asarray(np.asarray(_omega_table(template.level), dtype=np.complex128))
+    omega = np.asarray(_omega_table(template.level), dtype=np.complex128)
 
-    q0_eff = xp.full(branch_bits.shape[0], int(template.base_q0_residue), dtype=xp.int64)
-    q1_eff = xp.broadcast_to(
-        xp.asarray(template.base_q1_residue, dtype=xp.int64),
+    q0_eff = np.full(branch_bits.shape[0], int(template.base_q0_residue), dtype=np.int64)
+    q1_eff = np.broadcast_to(
+        np.asarray(template.base_q1_residue, dtype=np.int64),
         (branch_bits.shape[0], template.n_remaining),
     ).copy()
-    q2_eff = xp.broadcast_to(
-        xp.asarray(template.base_q2_residue, dtype=xp.int64),
+    q2_eff = np.broadcast_to(
+        np.asarray(template.base_q2_residue, dtype=np.int64),
         (branch_bits.shape[0], template.pair_left.size),
     ).copy()
 
     if template.cover_q1_residue.size:
-        q0_eff = (q0_eff + branch_bits @ xp.asarray(template.cover_q1_residue, dtype=xp.int64)) % mod_q1
+        q0_eff = (q0_eff + branch_bits @ np.asarray(template.cover_q1_residue, dtype=np.int64)) % mod_q1
     if template.cover_remaining_q2_residue.size:
-        q1_eff = (q1_eff + branch_bits @ xp.asarray(template.cover_remaining_q2_residue, dtype=xp.int64)) % mod_q1
+        q1_eff = (q1_eff + branch_bits @ np.asarray(template.cover_remaining_q2_residue, dtype=np.int64)) % mod_q1
     if template.cover_cover_residue.size:
         for left, right, residue in zip(
             template.cover_cover_left,
@@ -11654,67 +12115,27 @@ def _evaluate_q3_free_branch_template_batch(
                 * branch_bits[:, int(right)]
             ) % mod_q1
 
-    totals = xp.zeros(branch_bits.shape[0], dtype=xp.complex128)
+    totals = np.zeros(branch_bits.shape[0], dtype=np.complex128)
     n_assignments = 1 << template.n_remaining
 
     for start in range(0, n_assignments, assignment_chunk_size):
         stop = min(n_assignments, start + assignment_chunk_size)
-        assignments = xp.arange(start, stop, dtype=xp.uint64).reshape(-1, 1)
+        assignments = np.arange(start, stop, dtype=np.uint64).reshape(-1, 1)
         if template.n_remaining:
-            shifts = xp.arange(template.n_remaining, dtype=xp.uint64).reshape(1, -1)
-            x = ((assignments >> shifts) & 1).astype(xp.int64)
+            shifts = np.arange(template.n_remaining, dtype=np.uint64).reshape(1, -1)
+            x = ((assignments >> shifts) & 1).astype(np.int64)
             residues = x @ q1_eff.T
             if template.pair_left.size:
-                pair_terms = x[:, xp.asarray(template.pair_left, dtype=xp.int64)] * x[
-                    :, xp.asarray(template.pair_right, dtype=xp.int64)
+                pair_terms = x[:, np.asarray(template.pair_left, dtype=np.int64)] * x[
+                    :, np.asarray(template.pair_right, dtype=np.int64)
                 ]
                 residues = residues + pair_terms @ q2_eff.T
         else:
-            residues = xp.zeros((stop - start, branch_bits.shape[0]), dtype=xp.int64)
+            residues = np.zeros((stop - start, branch_bits.shape[0]), dtype=np.int64)
         residues = (residues + q0_eff.reshape(1, -1)) % mod_q1
         totals = totals + omega[residues].sum(axis=0)
 
-    if xp is np:
-        return np.asarray(totals, dtype=np.complex128)
-    return np.asarray(xp.asnumpy(totals), dtype=np.complex128)
-
-
-def _sum_via_q3_cover_gpu(q, cover, context=None, *, structural_obstruction=None):
-    """GPU-batched exact q3-cover evaluation for moderate cover sizes."""
-    del context
-    cp = _get_cupy_module()
-    if cp is None:
-        raise RuntimeError("GPU q3-cover evaluation requires CuPy.")
-
-    template = _build_q3_free_branch_template(q, cover)
-    budget = _gpu_memory_budget_bytes(cp)
-    branch_chunk_size, assignment_chunk_size = _q3_cover_branch_chunk_size(template, budget)
-    n_branches = 1 << template.n_cover
-    total = 0.0 + 0.0j
-    for start in range(0, n_branches, branch_chunk_size):
-        stop = min(n_branches, start + branch_chunk_size)
-        branch_masks = np.arange(start, stop, dtype=np.uint64)
-        chunk = _evaluate_q3_free_branch_template_batch(
-            template,
-            branch_masks,
-            xp=cp,
-            assignment_chunk_size=assignment_chunk_size,
-        )
-        total += complex(chunk.sum())
-
-    cubic_obstruction = len(cover) if structural_obstruction is None else structural_obstruction
-    return _make_scaled_complex(total), {
-        'quad': 0,
-        'constraint': 0,
-        'branched': len(cover),
-        'remaining': len(cover),
-        'structural_obstruction': cubic_obstruction,
-        'gauss_obstruction': _gauss_obstruction(q, cubic_obstruction),
-        'cost_r': len(cover),
-        'phase_states': 0,
-        'phase_splits': 0,
-        'phase3_backend': 'q3_cover_gpu',
-    }
+    return np.asarray(totals, dtype=np.complex128)
 
 
 def _sum_via_q3_cover(q, context=None, *, structural_obstruction=None):
@@ -11777,7 +12198,6 @@ def _sum_via_q3_cover(q, context=None, *, structural_obstruction=None):
         branch_totals = _evaluate_q3_free_branch_template_batch(
             template,
             branch_masks,
-            xp=np,
             assignment_chunk_size=assignment_chunk_size,
         )
         complex_total += complex(np.asarray(branch_totals, dtype=np.complex128).sum())
@@ -11888,7 +12308,7 @@ def _sum_irreducible_cubic_core(
 
     if backend in {"treewidth_dp", "treewidth_dp_peeled"}:
         return run_treewidth(backend)
-    if backend in {"cubic_contraction_cpu", "cubic_contraction_gpu"}:
+    if backend == "cubic_contraction_cpu":
         return run_cubic_contraction()
     if backend == "q3_cover":
         return _sum_via_q3_cover(q, context=context, structural_obstruction=structural_obstruction)
@@ -12977,6 +13397,88 @@ def compute_circuit_amplitude_scaled(
         extended_reductions=extended_reductions,
         solver_config=solver_config,
     )
+
+
+@overload
+def compute_circuit_probability(
+    circuit: CircuitInput,
+    input_bits: BitSequence,
+    output_bits: BitSequence,
+    *,
+    as_float: Literal[True] = True,
+    allow_tensor_contraction: bool = True,
+    extended_reductions: ExtendedReductionMode | str = "auto",
+    solver_config: SolverConfig | None = None,
+) -> tuple[float, ProbabilityInfo]:
+    ...
+
+
+@overload
+def compute_circuit_probability(
+    circuit: CircuitInput,
+    input_bits: BitSequence,
+    output_bits: BitSequence,
+    *,
+    as_float: Literal[False],
+    allow_tensor_contraction: bool = True,
+    extended_reductions: ExtendedReductionMode | str = "auto",
+    solver_config: SolverConfig | None = None,
+) -> tuple[ScaledProbability, ProbabilityInfo]:
+    ...
+
+
+def compute_circuit_probability(
+    circuit: CircuitInput,
+    input_bits: BitSequence,
+    output_bits: BitSequence,
+    *,
+    as_float: bool = True,
+    allow_tensor_contraction: bool = True,
+    extended_reductions: ExtendedReductionMode | str = "auto",
+    solver_config: SolverConfig | None = None,
+) -> tuple[float | ScaledProbability, ProbabilityInfo]:
+    """
+    Compute an exact output probability through the main amplitude engine.
+
+    This reuses the amplitude solver, then squares the scaled amplitude exactly.
+    Probability queries therefore inherit the full circuit support of amplitude
+    queries instead of maintaining a separate solver path.
+    """
+    amplitude, info = compute_circuit_amplitude_scaled(
+        circuit,
+        input_bits,
+        output_bits,
+        allow_tensor_contraction=allow_tensor_contraction,
+        extended_reductions=extended_reductions,
+        solver_config=solver_config,
+    )
+    probability = _probability_from_scaled_amplitude(amplitude)
+    probability_info: ProbabilityInfo = dict(info)
+    probability_info["method"] = "amplitude_square"
+    probability_info["is_zero"] = probability.mantissa == 0j
+    return (probability.to_float(), probability_info) if as_float else (probability, probability_info)
+
+
+def compute_circuit_probability_scaled(
+    circuit: CircuitInput,
+    input_bits: BitSequence,
+    output_bits: BitSequence,
+    *,
+    allow_tensor_contraction: bool = True,
+    extended_reductions: ExtendedReductionMode | str = "auto",
+    solver_config: SolverConfig | None = None,
+) -> tuple[ScaledProbability, ProbabilityInfo]:
+    """Compute an exact probability in scaled form."""
+    probability, info = compute_circuit_probability(
+        circuit,
+        input_bits,
+        output_bits,
+        as_float=False,
+        allow_tensor_contraction=allow_tensor_contraction,
+        extended_reductions=extended_reductions,
+        solver_config=solver_config,
+    )
+    return probability, info
 
 
 def compute_amplitudes(

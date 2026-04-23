@@ -25,7 +25,7 @@ from terket.benchmarking import (
     warm_up_terket,
     write_rows,
 )
-from terket.head_to_head_cases import CASES, SUITES, resolve_cases
+from terket.benchmarking.head_to_head_cases import CASES, SUITES, resolve_cases
 
 
 def run_case(case, *, repeats: int, quimb_optimize: str) -> HeadToHeadRow:

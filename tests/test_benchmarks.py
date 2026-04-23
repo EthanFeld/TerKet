@@ -20,7 +20,7 @@ if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
 from terket import compute_circuit_amplitude, make_circuit
-from terket.head_to_head_cases import build_approximate_qft, build_approximate_qft_logical
+from terket.benchmarking.head_to_head_cases import build_approximate_qft, build_approximate_qft_logical
 from terket.circuit_spec import from_qiskit
 
 

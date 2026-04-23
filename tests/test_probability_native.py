@@ -12,12 +12,8 @@ if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
 from terket import compute_circuit_amplitude, make_circuit
-from terket.circuits import _circuit_global_phase_radians
-from terket.engine import _factor_scope_order, _sum_factor_tables_scaled, build_state
-from terket.probability_native import (
+from terket.engine import (
     ScaledProbability,
-    _build_half_phase_probability_factors_scaled,
-    _build_raw_output_constrained_q3_free_phase,
     compute_circuit_probability,
     compute_circuit_probability_scaled,
 )
@@ -40,7 +36,7 @@ class ProbabilityNativeTests(unittest.TestCase):
         )
         self.assertAlmostEqual(probability, abs(amplitude) ** 2, places=12)
         self.assertIn("method", info)
-        self.assertIn("transformed_var_count", info)
+        self.assertIn("phase3_backend", info)
 
     def test_probability_matches_amplitude_on_small_q3_free_cases(self):
         cases = [
@@ -71,33 +67,23 @@ class ProbabilityNativeTests(unittest.TestCase):
         )
         self.assertIsInstance(probability, ScaledProbability)
         self.assertAlmostEqual(probability.to_float(), 0.5, places=12)
-        self.assertIn(info["method"], {"half_phase_parity_factors", "q3_free_raw_difference"})
+        self.assertEqual(info["method"], "amplitude_square")
 
-    def test_half_phase_factor_model_matches_probability(self):
-        circuit = make_circuit(2, [("h", 0), ("cnot", 0, 1)])
-        state = build_state(
-            circuit.n_qubits,
-            circuit.gates,
+    def test_scaled_probability_matches_exact_amplitude_square(self):
+        circuit = make_circuit(2, [("h", 0), ("t", 0), ("cnot", 0, 1), ("s", 1)])
+        amplitude, _ = compute_circuit_amplitude(
+            circuit,
             [0, 0],
-            global_phase_radians=_circuit_global_phase_radians(circuit),
+            [1, 1],
+            allow_tensor_contraction=False,
         )
-        raw_q = _build_raw_output_constrained_q3_free_phase(state, [0, 0])
-        factor_model = _build_half_phase_probability_factors_scaled(raw_q)
-        self.assertIsNotNone(factor_model)
-        scalar, factors = factor_model
-        order, _width = _factor_scope_order(raw_q.n, tuple(factors))
-        reduced_total, _max_scope = _sum_factor_tables_scaled(raw_q.n, factors, order, scalar=scalar)
         probability, _info = compute_circuit_probability_scaled(
             circuit,
             [0, 0],
-            [0, 0],
+            [1, 1],
             allow_tensor_contraction=False,
         )
-        reduced_total = (
-            reduced_total[0],
-            reduced_total[1] + (2 * int(state.scalar_half_pow2)) - (4 * circuit.n_qubits),
-        )
-        self.assertAlmostEqual(ScaledProbability.from_tuple(reduced_total).to_float(), probability.to_float(), places=12)
+        self.assertAlmostEqual(probability.to_float(), abs(amplitude.to_complex()) ** 2, places=12)
 
     def test_deterministic_output_probability(self):
         circuit = make_circuit(2, [])
@@ -118,15 +104,23 @@ class ProbabilityNativeTests(unittest.TestCase):
         self.assertFalse(info_ok["is_zero"])
         self.assertTrue(info_bad["is_zero"])
 
-    def test_arbitrary_angle_phase_is_not_supported(self):
+    def test_arbitrary_angle_phase_matches_amplitude(self):
         circuit = make_circuit(1, [("h", 0), ("rz_arbitrary", 0, 0.123), ("h", 0)])
-        with self.assertRaises(NotImplementedError):
-            compute_circuit_probability(
-                circuit,
-                [0],
-                [0],
-                allow_tensor_contraction=False,
-            )
+        amplitude, _ = compute_circuit_amplitude(
+            circuit,
+            [0],
+            [0],
+            as_complex=True,
+            allow_tensor_contraction=False,
+        )
+        probability, info = compute_circuit_probability(
+            circuit,
+            [0],
+            [0],
+            allow_tensor_contraction=False,
+        )
+        self.assertAlmostEqual(probability, abs(amplitude) ** 2, places=12)
+        self.assertEqual(info["method"], "amplitude_square")
 
 
 if __name__ == "__main__":

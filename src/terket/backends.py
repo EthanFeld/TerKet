@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from .engine import (
-    _get_cupy_module,
     _get_quimb_tensor_module,
     _load_schur_native_module,
     _quimb_import_reason,
@@ -11,7 +10,6 @@ from .engine import (
 )
 
 __all__ = [
-    "_get_cupy_module",
     "_get_quimb_tensor_module",
     "_load_schur_native_module",
     "_quimb_import_reason",

@@ -17,14 +17,14 @@ from typing import Callable, Sequence
 
 import psutil
 
-from .circuits import (
+from ..circuits import (
     _circuit_global_phase_radians,
     _dyadic_phase_to_angle,
     bits_to_little_endian_string,
     make_circuit,
     normalize_circuit,
 )
-from .schur_engine import _get_quimb_tensor_module, _quimb_import_reason, compute_circuit_amplitude
+from ..schur_engine import _get_quimb_tensor_module, _quimb_import_reason, compute_circuit_amplitude
 
 
 MB = 1024 * 1024
@@ -153,6 +153,10 @@ def quimb_circuit_from_circuit(circuit, input_bits: Sequence[int]):
             quimb_circuit.x(qubits[0])
         elif name == "sx":
             quimb_circuit.sx(qubits[0])
+        elif name == "sxdg":
+            quimb_circuit.sx(qubits[0])
+            quimb_circuit.sx(qubits[0])
+            quimb_circuit.sx(qubits[0])
         elif name == "t":
             quimb_circuit.t(qubits[0])
         elif name == "tdg":
@@ -177,6 +181,11 @@ def quimb_circuit_from_circuit(circuit, input_bits: Sequence[int]):
             quimb_circuit.phase(_dyadic_phase_to_angle(63, 6), qubits[0])
         elif name == "rz_dyadic":
             quimb_circuit.phase(_dyadic_phase_to_angle(qubits[1], qubits[2]), qubits[0])
+        elif name == "rzz_dyadic":
+            angle = _dyadic_phase_to_angle(qubits[2], qubits[3])
+            quimb_circuit.cx(qubits[0], qubits[1])
+            quimb_circuit.phase(angle, qubits[1])
+            quimb_circuit.cx(qubits[0], qubits[1])
         elif name == "rz_arbitrary":
             quimb_circuit.phase(float(qubits[1]), qubits[0])
         else:

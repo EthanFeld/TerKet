@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from .backends import (
-    _get_cupy_module,
     _get_quimb_tensor_module,
     _load_schur_native_module,
     _quimb_import_reason,
@@ -13,9 +12,11 @@ from .engine import (
     BitSequence,
     CircuitInput,
     ExtendedReductionMode,
+    ProbabilityInfo,
     ReducerInfo,
     ReductionInfo,
     ScaledAmplitude,
+    ScaledProbability,
     SchurState,
     SolverConfig,
     analyze_amplitudes,
@@ -26,13 +27,9 @@ from .engine import (
     compute_amplitudes,
     compute_circuit_amplitude,
     compute_circuit_amplitude_scaled,
-    reduce_and_sum,
-)
-from .probability_native import (
-    ProbabilityInfo,
-    ScaledProbability,
     compute_circuit_probability,
     compute_circuit_probability_scaled,
+    reduce_and_sum,
 )
 
 __all__ = [
@@ -44,7 +41,6 @@ __all__ = [
     "ScaledAmplitude",
     "SchurState",
     "SolverConfig",
-    "_get_cupy_module",
     "_get_quimb_tensor_module",
     "_load_schur_native_module",
     "_quimb_import_reason",

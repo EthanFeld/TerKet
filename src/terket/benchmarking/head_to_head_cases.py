@@ -9,7 +9,7 @@ from typing import Any, Callable, Sequence
 from qiskit import QuantumCircuit, transpile
 from qiskit.circuit.library import DraperQFTAdder
 
-from .circuits import from_qiskit, make_circuit
+from ..circuits import from_qiskit, make_circuit
 
 
 SUPPORTED_BASIS = ["h", "sx", "x", "rz", "cx", "cz"]
@@ -341,17 +341,13 @@ SUITES: dict[str, tuple[str, ...]] = {
 }
 
 
-def normalize_case_name(name: str) -> str:
-    return CASE_ALIASES.get(name, name)
-
-
 def get_case(name: str) -> BenchmarkCase:
-    normalized = normalize_case_name(name)
+    resolved_name = CASE_ALIASES.get(name, name)
     try:
-        return CASES[normalized]
+        return CASES[resolved_name]
     except KeyError as exc:
-        known = ", ".join(sorted(CASES))
-        raise KeyError(f"Unknown head-to-head case {name!r}. Known cases: {known}") from exc
+        known = ", ".join(sorted({*CASES, *CASE_ALIASES}))
+        raise KeyError(f"Unknown benchmark case {name!r}. Known cases: {known}") from exc
 
 
 def resolve_cases(case_names: Sequence[str] | None = None, *, suite: str = "hero") -> list[BenchmarkCase]:
@@ -361,30 +357,33 @@ def resolve_cases(case_names: Sequence[str] | None = None, *, suite: str = "hero
         suite_case_names = SUITES[suite]
     except KeyError as exc:
         known = ", ".join(sorted(SUITES))
-        raise KeyError(f"Unknown head-to-head suite {suite!r}. Known suites: {known}") from exc
+        raise KeyError(f"Unknown benchmark suite {suite!r}. Known suites: {known}") from exc
     return [CASES[name] for name in suite_case_names]
 
 
 __all__ = [
-    "AmplitudeQuery",
-    "BenchmarkCase",
     "CASES",
     "CASE_ALIASES",
     "SUPPORTED_BASIS",
     "SUITES",
+    "AmplitudeQuery",
+    "BenchmarkCase",
+    "_append_multi_controlled_z_ladder",
+    "_grover_logical_qubits",
     "build_approximate_qft",
     "build_approximate_qft_logical",
+    "build_draper_query",
     "build_draper_qft_adder_supported",
     "build_grover_iteration",
     "build_grover_iteration_logical",
+    "build_qaoa_query",
     "build_qaoa_ring",
     "build_qaoa_ring_logical",
     "build_repetition_magic_round",
-    "build_toffoli_chain_logical",
     "build_toffoli_ladder",
+    "build_toffoli_chain_logical",
     "draper_fixed_input_output",
     "get_case",
-    "normalize_case_name",
     "resolve_cases",
     "transpile_to_supported_basis",
 ]

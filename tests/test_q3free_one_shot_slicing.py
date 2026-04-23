@@ -20,28 +20,18 @@ from terket.cubic_arithmetic import PhaseFunction
 
 
 class Q3FreeOneShotSlicingTests(unittest.TestCase):
-    def test_one_shot_amplitude_requests_raw_constraint_slicing(self):
+    def test_amplitude_path_does_not_use_raw_constraint_shortcut(self):
         circuit = make_circuit(1, [("h", 0)])
-        requested: dict[str, object] = {}
-        restricted_plan = engine._Q3FreeRawConstraintRestrictedPlan(
-            active_count=1,
-            isolated_vars=(),
-            components=(),
-        )
-
-        def fake_build(state, **kwargs):
-            del state
-            requested.update(kwargs)
-            return object()
-
         with (
-            patch.object(engine, "_build_q3_free_raw_constraint_plan", side_effect=fake_build),
-            patch.object(engine, "_restrict_q3_free_raw_constraint_plan", return_value=restricted_plan),
-            patch.object(engine, "_evaluate_q3_free_raw_constraint_plan_scaled", return_value=engine._ONE_SCALED),
+            patch.object(engine, "_build_q3_free_raw_constraint_plan") as build_plan,
+            patch.object(engine, "_restrict_q3_free_raw_constraint_plan") as restrict_plan,
+            patch.object(engine, "_evaluate_q3_free_raw_constraint_plan_scaled") as evaluate_plan,
         ):
             compute_circuit_amplitude(circuit, [0], [0], as_complex=True)
 
-        self.assertIs(requested.get("prefer_one_shot_slicing"), True)
+        build_plan.assert_not_called()
+        restrict_plan.assert_not_called()
+        evaluate_plan.assert_not_called()
 
     def test_cutset_plan_finalizer_propagates_nested_one_shot_slicing(self):
         q = PhaseFunction(
@@ -288,6 +278,92 @@ class Q3FreeOneShotSlicingTests(unittest.TestCase):
         self.assertEqual(evaluation.plan.remaining_backend, "generic")
         planner.assert_not_called()
 
+    def test_gauss_reduction_routes_giant_dense_q2_to_one_shot_cutset(self):
+        q2 = {}
+        edge_count = 0
+        for left in range(90):
+            for right in range(left + 1, 90):
+                q2[(left, right)] = 1
+                edge_count += 1
+                if edge_count >= 270:
+                    break
+            if edge_count >= 270:
+                break
+        q = PhaseFunction(90, level=3, q2=q2, q3={})
+        plan = engine._Q3FreeCutsetConditioningPlan(
+            level=3,
+            cutset_vars=(0, 1, 2, 3, 4, 5, 6, 7),
+            remaining_vars=tuple(range(8, 90)),
+            remaining_backend="treewidth",
+            remaining_q2={},
+            remaining_order=tuple(range(82)),
+            cutset_remaining_q2_residue=np.zeros((8, 82), dtype=np.int64),
+            cutset_cutset_left=np.zeros(0, dtype=np.int64),
+            cutset_cutset_right=np.zeros(0, dtype=np.int64),
+            cutset_cutset_residue=np.zeros(0, dtype=np.int64),
+            remaining_width=14,
+            estimated_total_work=1024,
+        )
+
+        with (
+            patch.object(engine, "_min_fill_cubic_order", return_value=(tuple(range(q.n)), 24)),
+            patch.object(engine, "_q3_free_one_shot_cutset_conditioning_plan", return_value=plan),
+            patch.object(
+                engine,
+                "_evaluate_q3_free_cutset_conditioning_plan_scaled",
+                return_value=engine._ONE_SCALED,
+            ) as evaluate_cutset,
+            patch.object(engine, "_build_generic_q2_mediator_plan") as generic_plan,
+        ):
+            total = engine._sum_q3_free_via_gauss_reduction_scaled(q)
+
+        self.assertEqual(total, engine._ONE_SCALED)
+        evaluate_cutset.assert_called_once()
+        generic_plan.assert_not_called()
+
+    def test_gauss_reduction_keeps_generic_path_when_one_shot_cutset_plan_is_too_wide(self):
+        q2 = {}
+        edge_count = 0
+        for left in range(90):
+            for right in range(left + 1, 90):
+                q2[(left, right)] = 1
+                edge_count += 1
+                if edge_count >= 270:
+                    break
+            if edge_count >= 270:
+                break
+        q = PhaseFunction(90, level=3, q2=q2, q3={})
+        plan = engine._Q3FreeCutsetConditioningPlan(
+            level=3,
+            cutset_vars=(0, 1, 2, 3, 4, 5, 6, 7),
+            remaining_vars=tuple(range(8, 90)),
+            remaining_backend="treewidth",
+            remaining_q2={},
+            remaining_order=tuple(range(82)),
+            cutset_remaining_q2_residue=np.zeros((8, 82), dtype=np.int64),
+            cutset_cutset_left=np.zeros(0, dtype=np.int64),
+            cutset_cutset_right=np.zeros(0, dtype=np.int64),
+            cutset_cutset_residue=np.zeros(0, dtype=np.int64),
+            remaining_width=17,
+            estimated_total_work=1024,
+        )
+        mediator_plan = object()
+
+        with (
+            patch.object(engine, "_min_fill_cubic_order", return_value=(tuple(range(q.n)), 24)),
+            patch.object(engine, "_q3_free_one_shot_cutset_conditioning_plan", return_value=plan),
+            patch.object(engine, "_build_generic_q2_mediator_plan", return_value=mediator_plan) as generic_plan,
+            patch.object(
+                engine,
+                "_evaluate_generic_q2_mediator_plan_scaled",
+                return_value=engine._ONE_SCALED,
+            ) as evaluate_generic,
+        ):
+            total = engine._sum_q3_free_via_gauss_reduction_scaled(q)
+
+        self.assertEqual(total, engine._ONE_SCALED)
+        generic_plan.assert_called_once()
+        evaluate_generic.assert_called_once_with(mediator_plan, q.q1)
 
 if __name__ == "__main__":
     unittest.main()

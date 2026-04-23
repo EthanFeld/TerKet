@@ -59,7 +59,7 @@ _TEMP_PHASE_GATE = "phase_angle"
 _RZ_COMPILE_MODE_CLIFFORD_T = "clifford_t"
 _RZ_COMPILE_MODE_DYADIC = "dyadic"
 _RZ_COMPILE_MODES = {_RZ_COMPILE_MODE_CLIFFORD_T, _RZ_COMPILE_MODE_DYADIC}
-_FAST_IMPORT_NATIVE_GATES = frozenset({"h", "t", "tdg", "cnot"})
+_FAST_IMPORT_NATIVE_GATES = frozenset(SUPPORTED_GATES)
 _FAST_IMPORT_GATE_COUNT_THRESHOLD = 4096
 
 
@@ -379,23 +379,17 @@ def from_qiskit(
     dyadic/arbitrary representation instead of being synthesized into
     Clifford+T.
     """
-    working_circuit = circuit
-    if hasattr(circuit, "remove_final_measurements"):
-        removed = circuit.remove_final_measurements(inplace=False)
-        if removed is not None:
-            working_circuit = removed
-
     raw_gates: list[Gate] = []
     rz_tolerance = _validated_rz_tolerance(rz_tolerance)
     compile_mode = _normalize_rz_compile_mode(rz_compile_mode)
     global_phase_radians = _normalize_global_phase_radians(
         _coerce_finite_radians(
-            getattr(working_circuit, "global_phase", 0.0),
+            getattr(circuit, "global_phase", 0.0),
             source="Unsupported Qiskit circuit global phase",
         )
     )
-    qubit_indices = {qubit: idx for idx, qubit in enumerate(working_circuit.qubits)}
-    for instruction in working_circuit.data:
+    qubit_indices = {qubit: idx for idx, qubit in enumerate(circuit.qubits)}
+    for instruction in _qiskit_unitary_data(circuit):
         qubits = [qubit_indices[qubit] for qubit in instruction.qubits]
         op_gates, op_phase = _qiskit_operation_to_raw_gates(
             instruction.operation,
@@ -414,11 +408,212 @@ def from_qiskit(
         global_phase_radians + compile_stats.global_phase_radians
     )
     return make_circuit(
-        working_circuit.num_qubits,
+        circuit.num_qubits,
         compiled_gates,
-        name=getattr(working_circuit, "name", None),
+        name=getattr(circuit, "name", None),
         metadata=_metadata_with_global_phase(global_phase_radians),
     )
+
+
+def _qiskit_unitary_data(circuit: Any) -> Sequence[Any]:
+    data = circuit.data
+    end = len(data)
+    removed_measurement = False
+    while end > 0:
+        name = data[end - 1].operation.name.lower()
+        if name == "measure":
+            removed_measurement = True
+            end -= 1
+            continue
+        if removed_measurement and name == "barrier":
+            end -= 1
+            continue
+        break
+    return data[:end]
+
+
+def _phase_gate_raw_gates(
+    angle: Any,
+    qubit: int,
+    *,
+    compile_mode: str,
+    source: str,
+    rz_global_phase: bool,
+) -> tuple[list[Gate], float]:
+    value = _coerce_finite_radians(angle, source=source)
+    if compile_mode == _RZ_COMPILE_MODE_DYADIC:
+        phase_gate, exact_angle = _exact_phase_gate_from_angle(
+            value,
+            qubit,
+            source=source,
+        )
+        global_phase = -0.5 * exact_angle if rz_global_phase else 0.0
+        return ([] if phase_gate is None else [phase_gate]), _normalize_global_phase_radians(global_phase)
+    global_phase = -0.5 * value if rz_global_phase else 0.0
+    return [(_TEMP_PHASE_GATE, qubit, value)], _normalize_global_phase_radians(global_phase)
+
+
+def _extend_phase_gate(
+    raw_gates: list[Gate],
+    angle: Any,
+    qubit: int,
+    *,
+    compile_mode: str,
+    source: str,
+    rz_global_phase: bool,
+) -> float:
+    gates, phase = _phase_gate_raw_gates(
+        angle,
+        qubit,
+        compile_mode=compile_mode,
+        source=source,
+        rz_global_phase=rz_global_phase,
+    )
+    raw_gates.extend(gates)
+    return phase
+
+
+def _controlled_phase_raw_gates(
+    angle: Any,
+    control: int,
+    target: int,
+    *,
+    compile_mode: str,
+    source: str,
+) -> tuple[list[Gate], float]:
+    value = _coerce_finite_radians(angle, source=source)
+    half = 0.5 * value
+    raw_gates: list[Gate] = []
+    phase = 0.0
+    phase += _extend_phase_gate(
+        raw_gates,
+        half,
+        control,
+        compile_mode=compile_mode,
+        source=source,
+        rz_global_phase=False,
+    )
+    raw_gates.append(("cnot", control, target))
+    phase += _extend_phase_gate(
+        raw_gates,
+        -half,
+        target,
+        compile_mode=compile_mode,
+        source=source,
+        rz_global_phase=False,
+    )
+    raw_gates.append(("cnot", control, target))
+    phase += _extend_phase_gate(
+        raw_gates,
+        half,
+        target,
+        compile_mode=compile_mode,
+        source=source,
+        rz_global_phase=False,
+    )
+    return raw_gates, _normalize_global_phase_radians(phase)
+
+
+def _controlled_rz_raw_gates(
+    angle: Any,
+    control: int,
+    target: int,
+    *,
+    compile_mode: str,
+    source: str,
+) -> tuple[list[Gate], float]:
+    value = _coerce_finite_radians(angle, source=source)
+    half = 0.5 * value
+    raw_gates: list[Gate] = []
+    phase = 0.0
+    phase += _extend_phase_gate(
+        raw_gates,
+        half,
+        target,
+        compile_mode=compile_mode,
+        source=source,
+        rz_global_phase=True,
+    )
+    raw_gates.append(("cnot", control, target))
+    phase += _extend_phase_gate(
+        raw_gates,
+        -half,
+        target,
+        compile_mode=compile_mode,
+        source=source,
+        rz_global_phase=True,
+    )
+    raw_gates.append(("cnot", control, target))
+    return raw_gates, _normalize_global_phase_radians(phase)
+
+
+def _mcphase_2_control_raw_gates(
+    angle: Any,
+    control0: int,
+    control1: int,
+    target: int,
+    *,
+    compile_mode: str,
+    source: str,
+) -> tuple[list[Gate], float]:
+    value = _coerce_finite_radians(angle, source=source)
+    quarter = 0.25 * value
+    raw_gates: list[Gate] = []
+    phase = 0.0
+    raw_gates.append(("cnot", control0, target))
+    phase += _extend_phase_gate(
+        raw_gates,
+        -quarter,
+        target,
+        compile_mode=compile_mode,
+        source=source,
+        rz_global_phase=True,
+    )
+    raw_gates.append(("cnot", control1, target))
+    phase += _extend_phase_gate(
+        raw_gates,
+        quarter,
+        target,
+        compile_mode=compile_mode,
+        source=source,
+        rz_global_phase=True,
+    )
+    raw_gates.append(("cnot", control0, target))
+    phase += _extend_phase_gate(
+        raw_gates,
+        -quarter,
+        target,
+        compile_mode=compile_mode,
+        source=source,
+        rz_global_phase=True,
+    )
+    raw_gates.append(("cnot", control1, target))
+    phase += _extend_phase_gate(
+        raw_gates,
+        quarter,
+        target,
+        compile_mode=compile_mode,
+        source=source,
+        rz_global_phase=True,
+    )
+    crz_gates, crz_phase = _controlled_rz_raw_gates(
+        0.5 * value,
+        control0,
+        control1,
+        compile_mode=compile_mode,
+        source=source,
+    )
+    raw_gates.extend(crz_gates)
+    phase += crz_phase
+    phase += _extend_phase_gate(
+        raw_gates,
+        quarter,
+        control0,
+        compile_mode=compile_mode,
+        source=source,
+        rz_global_phase=False,
+    )
+    return raw_gates, _normalize_global_phase_radians(phase)
 
 
 def _qiskit_operation_to_raw_gates(
@@ -440,33 +635,62 @@ def _qiskit_operation_to_raw_gates(
     if op_name == "rz":
         if len(qubits) != 1:
             raise ValueError(f"Unsupported Qiskit gate arity for {operation.name!r}.")
-        angle = _coerce_finite_radians(
+        return _phase_gate_raw_gates(
             operation.params[0],
+            qubits[0],
+            compile_mode=compile_mode,
             source=f"Unsupported Qiskit rz angle {operation.params[0]!r}",
+            rz_global_phase=True,
         )
-        if compile_mode == _RZ_COMPILE_MODE_DYADIC:
-            phase_gate, exact_angle = _exact_phase_gate_from_angle(
-                angle,
-                qubits[0],
-                source=f"Unsupported Qiskit rz angle {operation.params[0]!r}",
-            )
-            return ([] if phase_gate is None else [phase_gate]), _normalize_global_phase_radians(-0.5 * exact_angle)
-        return [(_TEMP_PHASE_GATE, qubits[0], angle)], _normalize_global_phase_radians(-0.5 * angle)
     if op_name in {"p", "u1"}:
         if len(qubits) != 1:
             raise ValueError(f"Unsupported Qiskit gate arity for {operation.name!r}.")
-        angle = _coerce_finite_radians(
+        return _phase_gate_raw_gates(
             operation.params[0],
+            qubits[0],
+            compile_mode=compile_mode,
             source=f"Unsupported Qiskit phase angle {operation.params[0]!r}",
+            rz_global_phase=False,
         )
-        if compile_mode == _RZ_COMPILE_MODE_DYADIC:
-            phase_gate, _ = _exact_phase_gate_from_angle(
-                angle,
-                qubits[0],
-                source=f"Unsupported Qiskit phase angle {operation.params[0]!r}",
-            )
-            return ([] if phase_gate is None else [phase_gate]), 0.0
-        return [(_TEMP_PHASE_GATE, qubits[0], angle)], 0.0
+    if op_name in {"cp", "cu1"}:
+        if len(qubits) != 2:
+            raise ValueError(f"Unsupported Qiskit gate arity for {operation.name!r}.")
+        return _controlled_phase_raw_gates(
+            operation.params[0],
+            qubits[0],
+            qubits[1],
+            compile_mode=compile_mode,
+            source=f"Unsupported Qiskit controlled-phase angle {operation.params[0]!r}",
+        )
+    if op_name == "crz":
+        if len(qubits) != 2:
+            raise ValueError(f"Unsupported Qiskit gate arity for {operation.name!r}.")
+        return _controlled_rz_raw_gates(
+            operation.params[0],
+            qubits[0],
+            qubits[1],
+            compile_mode=compile_mode,
+            source=f"Unsupported Qiskit crz angle {operation.params[0]!r}",
+        )
+    if op_name in {"swap"}:
+        if len(qubits) != 2:
+            raise ValueError(f"Unsupported Qiskit gate arity for {operation.name!r}.")
+        return [("cnot", qubits[0], qubits[1]), ("cnot", qubits[1], qubits[0]), ("cnot", qubits[0], qubits[1])], 0.0
+    if op_name in {"mcphase", "mcp"} and len(qubits) == 3:
+        return _mcphase_2_control_raw_gates(
+            operation.params[0],
+            qubits[0],
+            qubits[1],
+            qubits[2],
+            compile_mode=compile_mode,
+            source=f"Unsupported Qiskit mcphase angle {operation.params[0]!r}",
+        )
+    if op_name in {"u", "u2", "u3"}:
+        if len(qubits) != 1:
+            raise ValueError(f"Unsupported Qiskit gate arity for {operation.name!r}.")
+        decomposer = _qiskit_one_qubit_psx_decomposer()
+        decomposed = decomposer(operation)
+        return _qiskit_circuit_to_raw_gates(decomposed, qubits=qubits, compile_mode=compile_mode)
     if op_name == "rzz":
         if len(qubits) != 2:
             raise ValueError(f"Unsupported Qiskit gate arity for {operation.name!r}.")
@@ -537,6 +761,16 @@ def _synthesize_qiskit_operation(operation: Any, n_qubits: int):
         )
     except Exception as exc:
         raise ValueError(f"Unsupported Qiskit gate: {operation.name!r}") from exc
+
+
+@lru_cache(maxsize=1)
+def _qiskit_one_qubit_psx_decomposer():
+    try:
+        from qiskit.synthesis.one_qubit.one_qubit_decompose import OneQubitEulerDecomposer
+    except ImportError as exc:  # pragma: no cover - depends on optional qiskit install
+        raise RuntimeError("Qiskit is required to decompose unsupported single-qubit operations.") from exc
+
+    return OneQubitEulerDecomposer("PSX")
 
 
 def _fast_import_gate_sequence_if_supported(raw_gates: Sequence[Gate]) -> tuple[Gate, ...] | None:
@@ -683,13 +917,37 @@ def _diagonal_phase_spec(gate: Gate) -> tuple[int, int, int] | None:
     return None
 
 
+def _diagonal_phase_angle(gate: Gate) -> tuple[int, float] | None:
+    name = gate[0]
+    phase = _phase_angle_from_gate(gate)
+    if phase is not None:
+        return int(gate[1]), _normalize_phase_angle(phase)
+    if name == "rz_arbitrary":
+        return int(gate[1]), _normalize_phase_angle(
+            _coerce_finite_radians(gate[2], source="Unsupported arbitrary phase angle")
+        )
+    return None
+
+
+def _emit_exact_phase_gate(qubit: int, angle: float) -> tuple[Gate, ...]:
+    normalized = _normalize_phase_angle(angle)
+    if normalized == 0.0:
+        return ()
+    gate, _exact_angle = _exact_phase_gate_from_angle(
+        normalized,
+        qubit,
+        source=f"Unsupported exact phase angle {normalized!r}",
+    )
+    return () if gate is None else (gate,)
+
+
 def _gate_can_slide_left_past(previous: Gate, gate: Gate) -> bool:
     previous_qubits = set(_gate_qubits(previous))
     gate_qubits = set(_gate_qubits(gate))
     if gate_qubits.isdisjoint(previous_qubits):
         return True
 
-    diagonal = _diagonal_phase_spec(gate)
+    diagonal = _diagonal_phase_angle(gate)
     if diagonal is not None:
         qubit = diagonal[0]
         if previous[0] == "cz" and qubit in previous_qubits:
@@ -805,12 +1063,11 @@ def _rewrite_gate_sequence(gates: Sequence[Gate]) -> tuple[Gate, ...]:
         while insert_pos > 0 and _gate_can_slide_left_past(rewritten[insert_pos - 1], gate):
             insert_pos -= 1
 
-        diagonal = _diagonal_phase_spec(gate)
+        diagonal = _diagonal_phase_angle(gate)
         if diagonal is not None and insert_pos > 0:
-            previous = _diagonal_phase_spec(rewritten[insert_pos - 1])
+            previous = _diagonal_phase_angle(rewritten[insert_pos - 1])
             if previous is not None and previous[0] == diagonal[0]:
-                combined = _combine_dyadic_phases(previous, diagonal)
-                replacement = list(_emit_dyadic_phase_gate(*combined))
+                replacement = list(_emit_exact_phase_gate(diagonal[0], previous[1] + diagonal[1]))
                 rewritten[insert_pos - 1:insert_pos] = replacement
                 _simplify_local_gate_window(rewritten, insert_pos - 1)
                 continue
@@ -950,6 +1207,7 @@ def _coerce_finite_radians(angle: Any, *, source: str) -> float:
     return value
 
 
+@lru_cache(maxsize=16384)
 def _exact_dyadic_phase_from_angle(angle: float) -> tuple[int, int] | None:
     try:
         coeff, precision_level, _ = dyadic_snap(

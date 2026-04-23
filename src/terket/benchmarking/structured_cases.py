@@ -8,7 +8,7 @@ from typing import Any, Callable, Sequence
 
 from qiskit import QuantumCircuit, transpile
 
-from .circuits import from_qiskit
+from ..circuits import from_qiskit
 
 
 SUPPORTED_BASIS = ["h", "sx", "x", "rz", "cx", "cz"]

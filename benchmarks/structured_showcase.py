@@ -25,7 +25,7 @@ from terket.benchmarking import (
     write_rows,
 )
 from terket.circuits import bits_to_big_endian_string
-from terket.structured_cases import CASES, SUITES, resolve_cases
+from terket.benchmarking.structured_cases import CASES, SUITES, resolve_cases
 
 
 def run_case(case) -> StructuredShowcaseRow:

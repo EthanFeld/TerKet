@@ -20,11 +20,11 @@ from terket import compute_circuit_amplitude
 from terket.circuit_spec import from_qiskit, parse_openqasm2
 from terket.cubic_arithmetic import PhaseFunction
 from terket import engine
-from terket.head_to_head_cases import (
+from terket.benchmarking.head_to_head_cases import (
     SUPPORTED_BASIS as HEAD_TO_HEAD_SUPPORTED_BASIS,
     transpile_to_supported_basis as transpile_head_to_head,
 )
-from terket.structured_cases import (
+from terket.benchmarking.structured_cases import (
     SUPPORTED_BASIS as STRUCTURED_SUPPORTED_BASIS,
     transpile_to_supported_basis as transpile_structured,
 )
