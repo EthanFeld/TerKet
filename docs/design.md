@@ -22,7 +22,7 @@ This document covers:
 
 ### `CircuitSpec`
 
-Defined in [src/terket/circuit_spec.py](/c:/Users/ethan/github/bee/TerKet/src/terket/circuit_spec.py). This is the normalized frontend circuit representation:
+Defined in [src/terket/circuit_spec.py](TerKet/src/terket/circuit_spec.py). This is the normalized frontend circuit representation:
 
 - qubit count
 - normalized gate list
@@ -32,7 +32,7 @@ All public entrypoints normalize to this form first.
 
 ### `SchurState`
 
-Defined in [src/terket/engine.py](/c:/Users/ethan/github/bee/TerKet/src/terket/engine.py). This is the compiled state for one circuit and one input bitstring. It stores:
+Defined in [src/terket/engine.py](TerKet/src/terket/engine.py). This is the compiled state for one circuit and one input bitstring. It stores:
 
 - affine output map `eps, eps0`
 - symbolic phase kernel `q`
@@ -44,7 +44,7 @@ This is the object reused across many output queries.
 
 ### `PhaseFunction`
 
-Defined in [src/terket/cubic_arithmetic.py](/c:/Users/ethan/github/bee/TerKet/src/terket/cubic_arithmetic.py). This is the symbolic phase polynomial used by the reducer:
+Defined in [src/terket/cubic_arithmetic.py](TerKet/src/terket/cubic_arithmetic.py). This is the symbolic phase polynomial used by the reducer:
 
 - `q0`: constant phase
 - `q1`: unary coefficients
@@ -56,7 +56,7 @@ The amplitude problem becomes an exact sum of `omega^q(x)` over binary assignmen
 
 ### `ScaledAmplitude`
 
-Defined in [src/terket/engine.py](/c:/Users/ethan/github/bee/TerKet/src/terket/engine.py). Results are stored as:
+Defined in [src/terket/engine.py](TerKet/src/terket/engine.py). Results are stored as:
 
 `mantissa * 2 ** (half_pow2_exp / 2)`
 
@@ -66,7 +66,7 @@ This preserves tiny exact values that would otherwise underflow in plain `comple
 
 ## 1. Input Normalization
 
-Normalization is implemented primarily in [src/terket/circuit_spec.py](/c:/Users/ethan/github/bee/TerKet/src/terket/circuit_spec.py) and [src/terket/circuit_io.py](/c:/Users/ethan/github/bee/TerKet/src/terket/circuit_io.py). [src/terket/circuits.py](/c:/Users/ethan/github/bee/TerKet/src/terket/circuits.py) is the public facade that re-exports and routes those helpers.
+Normalization is implemented primarily in [src/terket/circuit_spec.py](TerKet/src/terket/circuit_spec.py) and [src/terket/circuit_io.py](TerKet/src/terket/circuit_io.py). [src/terket/circuits.py](TerKet/src/terket/circuits.py) is the public facade that re-exports and routes those helpers.
 
 This stage:
 

@@ -38,7 +38,7 @@ pytest
 
 ## Native Accelerator
 
-TerKet can use bundled native Schur helpers when platform/interpreter match available artifact. If local compiler toolchain is available, `pip install -e .` can rebuild native extension from [src/terket/_schur_native.c](/c:/Users/ethan/github/bee/TerKet/src/terket/_schur_native.c). Set `TERKET_DISABLE_NATIVE=1` to force pure-Python execution.
+TerKet can use bundled native Schur helpers when platform/interpreter match available artifact. If local compiler toolchain is available, `pip install -e .` can rebuild native extension from [src/terket/_schur_native.c](TerKet/src/terket/_schur_native.c). Set `TERKET_DISABLE_NATIVE=1` to force pure-Python execution.
 
 Native code accelerates selected q3-free exact summation kernels. Core algorithm and public behavior stay same with or without it.
 
@@ -105,15 +105,15 @@ python benchmarks/run_benchmarks.py amplitude-post-elimination-tensor-rcs
 python benchmarks/run_benchmarks.py rcs-import-strategy-probe
 ```
 
-More benchmark detail lives in [benchmarks/README.md](/c:/Users/ethan/github/bee/TerKet/benchmarks/README.md).
+More benchmark detail lives in [benchmarks/README.md](TerKet/benchmarks/README.md).
 
 ## Notebook
 
-Interactive walkthrough: [notebooks/terket_demo.ipynb](/c:/Users/ethan/github/bee/TerKet/notebooks/terket_demo.ipynb)
+Interactive walkthrough: [notebooks/terket_demo.ipynb](TerKet/notebooks/terket_demo.ipynb)
 
 ## Design
 
-High-level design and solver pipeline: [docs/design.md](/c:/Users/ethan/github/bee/TerKet/docs/design.md)
+High-level design and solver pipeline: [docs/design.md](TerKet/docs/design.md)
 
 ## Repo Layout
 
