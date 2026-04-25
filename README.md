@@ -93,6 +93,25 @@ Every exact query returns metadata describing work active solver paid for. Most 
 - `phase3_backend`: backend actually used on residual hard core
 - `is_zero`: exact zero detection result
 
+## CLI
+
+Compute the amplitude ⟨x|U|0⟩ for a QASM circuit and an output bit string x:
+
+```powershell
+python scripts/simulate_observable.py <circuit.qasm> <observable>
+```
+
+`<observable>` is a bit string the same length as the circuit's qubit count (little-endian: q0 first). Example:
+
+```powershell
+python scripts/simulate_observable.py grover.qasm 101
+# Circuit:    grover.qasm  (3 qubits, 12 gates)
+# Input:      |000>
+# Output:     |101>
+# <101|U|000> = (-0.7071067811865476+0j)
+# |amplitude|^2 = 0.5
+```
+
 ## Benchmarks
 
 Unified entrypoint:
@@ -121,5 +140,6 @@ High-level design and solver pipeline: [docs/design.md](TerKet/docs/design.md)
 - `benchmarks/`: benchmark families and benchmark CLI
 - `tests/`: regression and smoke coverage
 - `notebooks/`: interactive walkthrough material
+- `scripts/`: simple CLI commands (e.g. `simulate_observable.py`)
 - `tools/`: local profiling and investigation scripts
 - `results/`: generated CSV output, created on demand
