@@ -14,9 +14,7 @@ from .circuits import (
 )
 from .cubic_arithmetic import CubicFunction, PhaseFunction
 from .schur_engine import (
-    ProbabilityInfo,
     ScaledAmplitude,
-    ScaledProbability,
     SchurState,
     SolverConfig,
     analyze_amplitudes,
@@ -27,8 +25,6 @@ from .schur_engine import (
     compute_amplitude_scaled,
     compute_circuit_amplitude,
     compute_circuit_amplitude_scaled,
-    compute_circuit_probability,
-    compute_circuit_probability_scaled,
     reduce_and_sum,
 )
 
@@ -50,13 +46,9 @@ __all__ = [
     "compute_amplitude_scaled",
     "compute_circuit_amplitude",
     "compute_circuit_amplitude_scaled",
-    "compute_circuit_probability",
-    "compute_circuit_probability_scaled",
     "from_qiskit",
     "lift_exact_dyadic_precision",
     "make_circuit",
     "normalize_circuit",
-    "ProbabilityInfo",
     "reduce_and_sum",
-    "ScaledProbability",
 ]

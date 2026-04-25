@@ -54,7 +54,7 @@ Defined in [src/terket/cubic_arithmetic.py](/c:/Users/ethan/github/bee/TerKet/sr
 
 The amplitude problem becomes an exact sum of `omega^q(x)` over binary assignments.
 
-### `ScaledAmplitude` and `ScaledProbability`
+### `ScaledAmplitude`
 
 Defined in [src/terket/engine.py](/c:/Users/ethan/github/bee/TerKet/src/terket/engine.py). Results are stored as:
 
@@ -62,13 +62,11 @@ Defined in [src/terket/engine.py](/c:/Users/ethan/github/bee/TerKet/src/terket/e
 
 This preserves tiny exact values that would otherwise underflow in plain `complex`.
 
-Probability is not a separate solver path. TerKet computes the exact scaled amplitude and squares it exactly.
-
 ## Pipeline
 
 ## 1. Input Normalization
 
-Normalization lives mostly in [src/terket/circuits.py](/c:/Users/ethan/github/bee/TerKet/src/terket/circuits.py) and [src/terket/circuit_spec.py](/c:/Users/ethan/github/bee/TerKet/src/terket/circuit_spec.py).
+Normalization is implemented primarily in [src/terket/circuit_spec.py](/c:/Users/ethan/github/bee/TerKet/src/terket/circuit_spec.py) and [src/terket/circuit_io.py](/c:/Users/ethan/github/bee/TerKet/src/terket/circuit_io.py). [src/terket/circuits.py](/c:/Users/ethan/github/bee/TerKet/src/terket/circuits.py) is the public facade that re-exports and routes those helpers.
 
 This stage:
 
@@ -121,7 +119,19 @@ The reducer alternates between:
 
 If the kernel becomes q3-free, TerKet switches to q3-free exact summation. If genuine cubic structure survives, it enters Phase 3 backend selection.
 
-## 5. Q3-Free Exact Summation
+## 5. Reusable q3-Free Batch Fast Path
+
+When one `SchurState` is queried for many outputs and the restricted problem stays in the q3-free exact path, TerKet can bypass per-output reduction work.
+
+This stage:
+
+- precomputes a reusable raw-constraint plan from the cached output-echelon data
+- evaluates many outputs by plugging only the changing affine right-hand side into that plan
+- falls back to the ordinary per-output reduction path when arbitrary-angle branches or residual cubic structure prevent reuse
+
+This optimization lives in `_batch_query_state(...)` and the `_build_q3_free_raw_constraint_plan(...)` / `_evaluate_q3_free_raw_constraint_plan_scaled_batch(...)` helpers.
+
+## 6. Q3-Free Exact Summation
 
 When `q3` is empty, TerKet:
 
@@ -132,7 +142,7 @@ When `q3` is empty, TerKet:
 
 This is still exact symbolic summation, not approximation.
 
-## 6. Phase-3 Residual Handling
+## 7. Phase-3 Residual Handling
 
 When genuine cubic structure remains, TerKet computes structural diagnostics:
 
@@ -556,7 +566,7 @@ How it works:
 - same dynamic-programming idea as `treewidth_dp`
 - allowed in a somewhat wider regime because peeled cores are easier
 
-## 3. `cubic_contraction_cpu`
+## 3. `cubic_contraction`
 
 Used when:
 
@@ -623,7 +633,7 @@ For genuinely cubic kernels, `_choose_phase3_backend(...)` compares runtime scor
 
 - `treewidth_dp_peeled`
 - `treewidth_dp`
-- `cubic_contraction_cpu`
+- `cubic_contraction`
 - `q3_separator`
 - `q3_cover`
 
@@ -634,13 +644,12 @@ The score depends on:
 - structural obstruction
 - peeled-core status
 - optional separator availability
-- whether tensor-like contraction is allowed
 
 The chosen backend determines `phase3_backend` and the meaning of `cost_model_r`.
 
 ## Whole-Pipeline View
 
-A single amplitude query works like this:
+The end-to-end amplitude service works like this:
 
 1. Normalize the frontend circuit into `CircuitSpec`.
 2. Compile circuit and input basis state into `SchurState`.
@@ -654,14 +663,11 @@ A single amplitude query works like this:
    - q3-free no-branch rewrites
    - structural optimization when it improves the runtime score
 7. If the kernel factorizes, solve components independently and multiply.
-8. If the kernel is q3-free, build and evaluate a q3-free execution plan.
-9. If cubic structure remains, choose a Phase-3 backend and solve the residual core exactly.
-10. Reapply scalar prefactors and `sqrt(2)` scaling.
-11. Return the exact scaled amplitude and solver metadata.
-
-Probability query is the same pipeline through step 10, followed by:
-
-12. square the exact scaled amplitude to form `ScaledProbability`
+8. If many outputs are being queried from one reusable q3-free state, try the raw-constraint batch fast path first.
+9. If the kernel is q3-free, build and evaluate a q3-free execution plan.
+10. If cubic structure remains, choose a Phase-3 backend and solve the residual core exactly.
+11. Reapply scalar prefactors and `sqrt(2)` scaling.
+12. Return the exact scaled amplitude and solver metadata.
 
 ## Reading Metadata
 
@@ -690,5 +696,3 @@ If many outputs are queried for one circuit:
 - build one `SchurState`
 - reuse echelon solves and reduction caches
 - prefer scaled APIs
-
-

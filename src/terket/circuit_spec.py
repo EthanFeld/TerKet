@@ -63,7 +63,7 @@ _FAST_IMPORT_NATIVE_GATES = frozenset(SUPPORTED_GATES)
 _FAST_IMPORT_GATE_COUNT_THRESHOLD = 4096
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class CircuitSpec:
     """Normalized Clifford+T circuit accepted by the TerKet simulator."""
 
@@ -78,7 +78,7 @@ class CircuitSpec:
         _validate_gates(self.n_qubits, self.gates)
 
 
-@dataclass
+@dataclass(slots=True)
 class _ImportCompileStats:
     global_phase_radians: float = 0.0
     exact_dyadic_phase_count: int = 0
@@ -828,7 +828,10 @@ def to_qiskit(circuit: Any):
 
 def bits_to_index(bits: Sequence[int]) -> int:
     """Encode a little-endian bit string as a basis-state index."""
-    return sum((int(bit) & 1) << idx for idx, bit in enumerate(bits))
+    value = 0
+    for idx, bit in enumerate(bits):
+        value |= (int(bit) & 1) << idx
+    return value
 
 
 def bits_to_little_endian_string(bits: Sequence[int]) -> str:

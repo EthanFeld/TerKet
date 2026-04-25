@@ -12,11 +12,9 @@ from .engine import (
     BitSequence,
     CircuitInput,
     ExtendedReductionMode,
-    ProbabilityInfo,
     ReducerInfo,
     ReductionInfo,
     ScaledAmplitude,
-    ScaledProbability,
     SchurState,
     SolverConfig,
     analyze_amplitudes,
@@ -27,8 +25,6 @@ from .engine import (
     compute_amplitudes,
     compute_circuit_amplitude,
     compute_circuit_amplitude_scaled,
-    compute_circuit_probability,
-    compute_circuit_probability_scaled,
     reduce_and_sum,
 )
 
@@ -53,9 +49,5 @@ __all__ = [
     "compute_amplitudes",
     "compute_circuit_amplitude",
     "compute_circuit_amplitude_scaled",
-    "compute_circuit_probability",
-    "compute_circuit_probability_scaled",
     "reduce_and_sum",
-    "ProbabilityInfo",
-    "ScaledProbability",
 ]

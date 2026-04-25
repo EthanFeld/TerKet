@@ -315,6 +315,120 @@ class PhaseStructureOptimizerTests(unittest.TestCase):
 
         optimize.assert_not_called()
 
+    def test_two_partner_constraint_elimination_preserves_sum_for_target_zero(self):
+        q = PhaseFunction(
+            4,
+            level=3,
+            q1=[0, 3, 0, 0],
+            q2={
+                (0, 1): 2,
+                (0, 2): 2,
+                (1, 3): 1,
+            },
+            q3={
+                (1, 2, 3): 1,
+            },
+        )
+
+        reduced_q, half_pow2 = engine._elim_two_partner_constraint(q, 0, 2, 1, 0)
+
+        self.assertIsNotNone(reduced_q)
+        self.assertEqual(half_pow2, 2)
+        self.assertEqual(reduced_q.n, 2)
+        self.assertFalse(reduced_q.q3)
+        self.assertAlmostEqual(
+            abs(_bruteforce_phase_sum(q) - (2 ** (half_pow2 / 2)) * _bruteforce_phase_sum(reduced_q)),
+            0.0,
+            places=12,
+        )
+
+    def test_two_partner_constraint_elimination_preserves_sum_for_target_one(self):
+        q = PhaseFunction(
+            5,
+            level=3,
+            q1=[4, 3, 0, 0, 0],
+            q2={
+                (0, 1): 2,
+                (0, 2): 2,
+                (1, 3): 1,
+            },
+            q3={
+                (1, 3, 4): 1,
+            },
+        )
+
+        reduced_q, half_pow2 = engine._elim_two_partner_constraint(q, 0, 2, 1, 1)
+
+        self.assertIsNotNone(reduced_q)
+        self.assertEqual(half_pow2, 2)
+        self.assertEqual(reduced_q.n, 3)
+        self.assertTrue(reduced_q.q3)
+        self.assertAlmostEqual(
+            abs(_bruteforce_phase_sum(q) - (2 ** (half_pow2 / 2)) * _bruteforce_phase_sum(reduced_q)),
+            0.0,
+            places=12,
+        )
+
+    def test_exact_elimination_uses_direct_two_partner_constraint_path(self):
+        q = PhaseFunction(
+            4,
+            level=3,
+            q1=[0, 3, 0, 0],
+            q2={
+                (0, 1): 2,
+                (0, 2): 2,
+                (1, 3): 1,
+            },
+            q3={
+                (1, 2, 3): 1,
+            },
+        )
+
+        with unittest.mock.patch.object(
+            engine,
+            "_aff_compose_cached",
+            side_effect=AssertionError("two-partner constraints should not route through affine compose"),
+        ):
+            reduced_q, half_pow2, info, blocked = engine._apply_exact_eliminations(q)
+
+        self.assertIsNotNone(reduced_q)
+        self.assertEqual(half_pow2, 2)
+        self.assertEqual(info["constraint"], 1)
+        self.assertFalse(blocked)
+
+    def test_phase3_treewidth_keeps_scaled_totals_without_overflowing(self):
+        q = PhaseFunction(
+            3,
+            level=3,
+            q1=[0, 0, 0],
+            q2={},
+            q3={(0, 1, 2): 1},
+        )
+
+        with unittest.mock.patch.object(
+            engine,
+            "_sum_via_treewidth_dp_peeled",
+            side_effect=AssertionError("treewidth phase3 should stay on scaled totals"),
+        ), unittest.mock.patch.object(
+            engine,
+            "_sum_via_treewidth_dp_peeled_scaled",
+            return_value=((1.0 + 0.0j, 4000), 7),
+        ):
+            total, info = engine._sum_irreducible_cubic_core(
+                q,
+                context=engine._ReductionContext(preserve_scale=False, allow_tensor_contraction=False),
+                cover=[0],
+                order=[0, 1, 2],
+                width=7,
+                structural_obstruction=1,
+                backend="treewidth_dp_peeled",
+                allow_tensor_contraction=False,
+            )
+
+        self.assertEqual(total, (1.0 + 0.0j, 4000))
+        self.assertEqual(info["remaining"], 7)
+        self.assertEqual(info["phase3_backend"], "treewidth_dp_peeled")
+
 
 if __name__ == "__main__":
     unittest.main()

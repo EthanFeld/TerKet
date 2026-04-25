@@ -19,6 +19,26 @@ BENCHMARKS: dict[str, tuple[str, str]] = {
         "benchmarks.curated_benchmark",
         "Curated benchmark with both impressive showcase cases and fair head-to-head cases.",
     ),
+    "head-to-head": (
+        "benchmarks.quimb_head_to_head",
+        "Direct TerKet versus quimb runtime comparison on fixed benchmark suites.",
+    ),
+    "structured-showcase": (
+        "benchmarks.structured_showcase",
+        "Structural showcase cases that surface solver diagnostics and residual width.",
+    ),
+    "depth-scaling": (
+        "benchmarks.targeted.depth_scaling_head_to_head",
+        "Depth-parameter sweeps for representative TerKet versus quimb cases.",
+    ),
+    "amplitude-post-elimination-tensor-rcs": (
+        "benchmarks.targeted.rcs.amplitude_post_elimination_tensor_rcs",
+        "Probe tensor-network viability on post-elimination q3-free RCS residuals.",
+    ),
+    "rcs-import-strategy-probe": (
+        "benchmarks.targeted.rcs.rcs_import_strategy_probe",
+        "Compare structural impact of alternate RCS import strategies.",
+    ),
 }
 
 

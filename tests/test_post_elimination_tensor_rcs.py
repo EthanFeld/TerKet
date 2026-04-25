@@ -10,7 +10,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from benchmarks.amplitude_post_elimination_tensor_rcs import run_case
+from benchmarks.targeted.rcs.amplitude_post_elimination_tensor_rcs import run_case
 
 
 class PostEliminationTensorRcsTests(unittest.TestCase):

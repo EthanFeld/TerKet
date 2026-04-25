@@ -30,7 +30,7 @@ from ..schur_engine import _get_quimb_tensor_module, _quimb_import_reason, compu
 MB = 1024 * 1024
 
 
-@dataclass
+@dataclass(slots=True)
 class HeadToHeadRow:
     case: str
     family: str
@@ -63,7 +63,7 @@ class HeadToHeadRow:
     cotengra_version: str
 
 
-@dataclass
+@dataclass(slots=True)
 class StructuredShowcaseRow:
     case: str
     family: str

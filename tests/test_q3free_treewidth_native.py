@@ -104,6 +104,7 @@ class Q3FreeTreewidthNativeTests(unittest.TestCase):
             q3={(0, 1, 2): 1},
         )
         engine._STRUCTURE_PHASE3_PLAN_CACHE.clear()
+        engine._STRUCTURE_PHASE3_REFINED_ORDER_CACHE.clear()
 
         with mock.patch.object(engine, "_minimum_q3_vertex_cover", return_value=[0, 1, 2]), \
             mock.patch.object(engine, "_min_fill_cubic_order", return_value=([0, 1, 2, 3, 4], 20)), \
@@ -129,6 +130,7 @@ class Q3FreeTreewidthNativeTests(unittest.TestCase):
             q3={(0, 1, 2): 1},
         )
         engine._STRUCTURE_PHASE3_PLAN_CACHE.clear()
+        engine._STRUCTURE_PHASE3_REFINED_ORDER_CACHE.clear()
 
         with mock.patch.object(engine, "_minimum_q3_vertex_cover", return_value=[0, 1, 2]), \
             mock.patch.object(engine, "_min_fill_cubic_order", return_value=([0, 1, 2, 3, 4], 24)), \
@@ -154,6 +156,7 @@ class Q3FreeTreewidthNativeTests(unittest.TestCase):
             q3={(0, 1, 2): 1, (2, 3, 4): 1},
         )
         engine._STRUCTURE_PHASE3_PLAN_CACHE.clear()
+        engine._STRUCTURE_PHASE3_REFINED_ORDER_CACHE.clear()
 
         with mock.patch.object(engine, "_minimum_q3_vertex_cover", return_value=[0, 1, 2, 3]), \
             mock.patch.object(engine, "_min_fill_cubic_order", return_value=([0, 1, 2, 3, 4, 5], 25)), \
@@ -182,6 +185,7 @@ class Q3FreeTreewidthNativeTests(unittest.TestCase):
             q3={(0, 1, 2): 1, (2, 3, 4): 1},
         )
         engine._STRUCTURE_PHASE3_PLAN_CACHE.clear()
+        engine._STRUCTURE_PHASE3_REFINED_ORDER_CACHE.clear()
 
         with mock.patch.object(engine, "_minimum_q3_vertex_cover", return_value=[0, 1, 2]), \
             mock.patch.object(engine, "_min_fill_cubic_order", return_value=([0, 1, 2, 3, 4, 5], 25)), \
@@ -199,6 +203,60 @@ class Q3FreeTreewidthNativeTests(unittest.TestCase):
             )
 
         self.assertEqual(backend, "q3_cover")
+
+    def test_phase3_plan_refines_treewidth_order_before_backend_choice(self):
+        q = engine._phase_function_from_parts(
+            5,
+            level=3,
+            q0=0,
+            q1=[0] * 5,
+            q2={(0, 1): 2},
+            q3={(0, 1, 2): 1},
+        )
+        engine._STRUCTURE_PHASE3_PLAN_CACHE.clear()
+        engine._STRUCTURE_PHASE3_REFINED_ORDER_CACHE.clear()
+        captured: dict[str, object] = {}
+
+        def fake_choose_phase3_backend(
+            _q,
+            cover,
+            order,
+            width,
+            structural_obstruction,
+            **kwargs,
+        ):
+            del _q, cover, kwargs
+            captured["order"] = list(order)
+            captured["width"] = int(width)
+            captured["obstruction"] = int(structural_obstruction)
+            return "treewidth_dp", (0,), None
+
+        with mock.patch.object(engine, "_minimum_q3_vertex_cover", return_value=[0, 1, 2]), \
+            mock.patch.object(engine, "_min_fill_cubic_order", return_value=([0, 1, 2, 3, 4], 26)), \
+            mock.patch.object(engine, "_q3_hypergraph_2core", return_value=({0, 1, 2}, [])), \
+            mock.patch.object(engine, "_q3_core_cover_size", return_value=4), \
+            mock.patch.object(
+                engine,
+                "_finalize_phase3_treewidth_order",
+                return_value=([2, 0, 1, 3, 4], 18),
+            ), \
+            mock.patch.object(
+                engine,
+                "_choose_phase3_backend",
+                side_effect=fake_choose_phase3_backend,
+            ):
+            _cover, order, width, obstruction, backend = engine._phase3_plan(
+                q,
+                allow_tensor_contraction=False,
+            )
+
+        self.assertEqual(order, [2, 0, 1, 3, 4])
+        self.assertEqual(width, 18)
+        self.assertEqual(obstruction, 4)
+        self.assertEqual(backend, "treewidth_dp")
+        self.assertEqual(captured["order"], [2, 0, 1, 3, 4])
+        self.assertEqual(captured["width"], 18)
+        self.assertEqual(captured["obstruction"], 4)
 
     def test_local_refinement_can_reduce_work_without_hurting_width(self):
         q = engine._phase_function_from_parts(
@@ -516,6 +574,116 @@ class Q3FreeTreewidthNativeTests(unittest.TestCase):
         self.assertEqual(scalar0, scalar1)
         self.assertIs(factors0, factors1)
 
+    def test_treewidth_dp_scaled_prefers_preplanned_level3_native_path(self):
+        q = engine._phase_function_from_parts(
+            3,
+            level=3,
+            q0=0,
+            q1=[1, 2, 3],
+            q2={(0, 1): 2},
+            q3={(0, 1, 2): 1},
+        )
+        order = [0, 1, 2]
+        expected = engine._make_scaled_complex(1.25 + 0.5j)
+
+        class FailNative:
+            @staticmethod
+            def sum_treewidth_dp_level3(*args, **kwargs):
+                raise AssertionError("direct native kernel should not run when preplanned path hits")
+
+        with mock.patch.object(engine, "_native_level3_enabled", return_value=True), \
+            mock.patch.object(
+                engine,
+                "_sum_native_level3_phase3_treewidth_preplanned",
+                return_value=(1.25 + 0.5j, 7),
+            ) as planned_sum, \
+            mock.patch.object(engine, "_schur_native", FailNative()):
+            total, width = engine._sum_via_treewidth_dp_scaled(q, order)
+
+        self.assertEqual(total, expected)
+        self.assertEqual(width, 7)
+        planned_sum.assert_called_once_with(q=q, order=order)
+
+    def test_bad_q2_cover_prefers_high_degree_equal_size_cover(self):
+        q = engine._phase_function_from_parts(
+            6,
+            level=3,
+            q0=0,
+            q1=[0] * 6,
+            q2={
+                (0, 1): 1,
+                (1, 2): 1,
+                (2, 3): 1,
+                (3, 0): 1,
+                (1, 4): 2,
+                (1, 5): 2,
+                (3, 4): 2,
+                (3, 5): 2,
+            },
+            q3={},
+        )
+
+        cover = engine._minimum_bad_q2_vertex_cover_uncached(q)
+
+        self.assertEqual(cover, [1, 3])
+
+    def test_q3_cover_template_uses_compact_storage_dtypes(self):
+        q = engine._phase_function_from_parts(
+            4,
+            level=3,
+            q0=0,
+            q1=[1, 2, 3, 4],
+            q2={(0, 2): 1, (1, 3): 1},
+            q3={(0, 1, 2): 1},
+        )
+
+        template = engine._build_q3_free_branch_template(q, [0, 1])
+
+        self.assertEqual(template.base_q1_residue.dtype, np.uint8)
+        self.assertEqual(template.base_q2_residue.dtype, np.uint8)
+        self.assertEqual(template.cover_remaining_q2_residue.dtype, np.uint8)
+        self.assertEqual(template.pair_left.dtype, np.uint8)
+        self.assertEqual(template.cubic_pair_index.dtype, np.uint8)
+
+    def test_q3_free_execution_plan_uses_compact_sequence_storage(self):
+        q = engine._phase_function_from_parts(
+            3,
+            level=3,
+            q0=0,
+            q1=[1, 2, 3],
+            q2={(0, 1): 2},
+            q3={},
+        )
+
+        plan = engine._build_q3_free_execution_plan(
+            q=q,
+            allow_tensor_contraction=True,
+        )
+
+        self.assertIsInstance(plan.q1, np.ndarray)
+        self.assertEqual(plan.q1.dtype, np.uint8)
+        self.assertIsInstance(plan.isolated_vars, np.ndarray)
+        self.assertEqual(list(plan.isolated_vars), [])
+        self.assertIsInstance(plan.components[0].variables, np.ndarray)
+        self.assertEqual(plan.components[0].variables.dtype, np.uint8)
+
+    def test_q3_free_constraint_plan_scaled_handles_array_backed_isolated_vars(self):
+        state = engine.build_state(2, [], [0, 0])
+        cache = state._prepare_constraint_echelon()
+        plan = engine._build_q3_free_constraint_plan(state, cache)
+
+        total = engine._evaluate_q3_free_constraint_plan_scaled(
+            plan,
+            [0, 0],
+            allow_tensor_contraction=True,
+        )
+        batch_total = engine._evaluate_q3_free_constraint_plan_scaled_batch(
+            plan,
+            [[0, 0]],
+        )[0]
+
+        self.assertIsInstance(plan.isolated_vars, np.ndarray)
+        self.assertEqual(total, batch_total)
 
 if __name__ == "__main__":
     unittest.main()

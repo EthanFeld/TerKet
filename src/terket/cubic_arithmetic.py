@@ -41,6 +41,26 @@ class PhaseFunction:
         q3: dict[(k, l, m)] -> int mod 2^(L-2) for k < l < m
     """
 
+    __slots__ = (
+        "n",
+        "level",
+        "mod_q1",
+        "mod_q2",
+        "mod_q3",
+        "q0",
+        "q1",
+        "q2",
+        "q3",
+        "_schur_mutable",
+        "_schur_q_key",
+        "_schur_q_structure_key",
+        "_schur_q_classification_structure_key",
+        "_schur_q_phase3_structure_key",
+        "_schur_q3_support_key",
+        "_schur_q_classification_data",
+        "_schur_q_classification_lookup",
+    )
+
     def __init__(
         self,
         n: int,
@@ -75,6 +95,13 @@ class PhaseFunction:
         # reducer intermediates created through ``_phase_function_from_parts``
         # are treated as immutable and can cache structural digests safely.
         self._schur_mutable = True
+        self._schur_q_key = None
+        self._schur_q_structure_key = None
+        self._schur_q_classification_structure_key = None
+        self._schur_q_phase3_structure_key = None
+        self._schur_q3_support_key = None
+        self._schur_q_classification_data = None
+        self._schur_q_classification_lookup = None
 
     def copy(self) -> PhaseFunction:
         return PhaseFunction(
@@ -115,11 +142,13 @@ class PhaseFunction:
         self.q1 = promoted.q1
         self.q2 = promoted.q2
         self.q3 = promoted.q3
-        self.__dict__.pop("_schur_q_key", None)
-        self.__dict__.pop("_schur_q_structure_key", None)
-        self.__dict__.pop("_schur_q_classification_structure_key", None)
-        self.__dict__.pop("_schur_q_phase3_structure_key", None)
-        self.__dict__.pop("_schur_q3_support_key", None)
+        self._schur_q_key = None
+        self._schur_q_structure_key = None
+        self._schur_q_classification_structure_key = None
+        self._schur_q_phase3_structure_key = None
+        self._schur_q3_support_key = None
+        self._schur_q_classification_data = None
+        self._schur_q_classification_lookup = None
 
     # -- Evaluation ------------------------------------------------
 
@@ -167,19 +196,26 @@ class PhaseFunction:
     # engine. They are still useful for structural checks and remain unchanged.
 
     def M3(self, i: int, j: int, k: int) -> int:
-        s = sorted([i, j, k])
-        if s[0] == s[1] == s[2]:
-            return self.q1[s[0]] % 2
-        if s[0] == s[1]:
-            return self.q2.get((s[0], s[2]), 0) % 2
-        if s[1] == s[2]:
-            return self.q2.get((s[0], s[1]), 0) % 2
-        return self.q3.get(tuple(s), 0) % 2
+        if i > j:
+            i, j = j, i
+        if j > k:
+            j, k = k, j
+            if i > j:
+                i, j = j, i
+        if i == j == k:
+            return self.q1[i] % 2
+        if i == j:
+            return self.q2.get((i, k), 0) % 2
+        if j == k:
+            return self.q2.get((i, j), 0) % 2
+        return self.q3.get((i, j, k), 0) % 2
 
     def M2(self, i: int, j: int) -> int:
         if i == j:
             return (-self.q1[i]) % 4
-        return self.q2.get((min(i, j), max(i, j)), 0) % 4
+        if i > j:
+            i, j = j, i
+        return self.q2.get((i, j), 0) % 4
 
     # -- Composition ----------------------------------------------
 

@@ -1,17 +1,16 @@
 # TerKet
 
-TerKet is exact strong-simulation toolkit for Clifford+T-style quantum circuits. It ingests normalized gate lists, Qiskit circuits, or QASM-like inputs, rewrites them into Schur-state phase functions, and answers exact amplitude or probability queries with explicit solver metadata.
+TerKet is exact strong-simulation toolkit for Clifford+T-style quantum circuits. It ingests normalized gate lists, Qiskit circuits, or QASM-like inputs, rewrites them into Schur-state phase functions, and answers exact amplitude queries with explicit solver metadata.
 
 Repo bundles three things:
 
-- public Python API for exact amplitude/probability queries
+- public Python API for exact amplitude queries
 - native and pure-Python solver backends
 - reproducible benchmark and profiling entrypoints
 
 ## What It Does
 
 - Computes exact amplitudes without collapsing tiny nonzero values to `0j`
-- Computes exact probabilities by squaring exact scaled amplitudes from same solver path
 - Imports practical circuits from Qiskit
 - Reports reduction diagnostics such as `cubic_obstruction`, `gauss_obstruction`, `cost_model_r`, and `phase3_backend`
 - Includes benchmark families for head-to-head runtime studies and structural probes
@@ -48,7 +47,6 @@ Native code accelerates selected q3-free exact summation kernels. Core algorithm
 ```python
 from terket import (
     compute_circuit_amplitude,
-    compute_circuit_probability,
     make_circuit,
 )
 
@@ -60,19 +58,12 @@ amplitude, amp_info = compute_circuit_amplitude(
     [0, 0],
     as_complex=True,
 )
-probability, prob_info = compute_circuit_probability(
-    circuit,
-    [0, 0],
-    [0, 0],
-)
 
 print(amplitude)
-print(probability)
 print(amp_info["phase3_backend"])
-print(prob_info["method"])
 ```
 
-Default amplitude return is `ScaledAmplitude`, not `complex`, so tiny exact values do not silently underflow. Probability API mirrors that with `ScaledProbability` through `compute_circuit_probability_scaled(...)`.
+Default amplitude return is `ScaledAmplitude`, not `complex`, so tiny exact values do not silently underflow. If you need a probability, square the returned amplitude yourself.
 
 ## Public API
 
@@ -80,8 +71,6 @@ Main entrypoints:
 
 - `compute_circuit_amplitude(...)`
 - `compute_circuit_amplitude_scaled(...)`
-- `compute_circuit_probability(...)`
-- `compute_circuit_probability_scaled(...)`
 - `analyze_circuit(...)`
 - `analyze_amplitudes(...)`
 - `make_circuit(...)`
@@ -103,8 +92,6 @@ Every exact query returns metadata describing work active solver paid for. Most 
 - `cost_model_r`: runtime exponent proxy for chosen Phase-3 backend
 - `phase3_backend`: backend actually used on residual hard core
 - `is_zero`: exact zero detection result
-
-Probability queries reuse amplitude metadata and add `method="amplitude_square"`.
 
 ## Benchmarks
 

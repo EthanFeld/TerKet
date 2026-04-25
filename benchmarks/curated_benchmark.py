@@ -53,7 +53,7 @@ DEFAULT_TERKET_FRONTIER_CASES = (
 )
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class MqtFairCase:
     case: str
     family: str
@@ -77,7 +77,7 @@ class MqtFairCase:
         return _SimpleAmplitudeQuery(circuit=spec, input_bits=input_bits, output_bits=output_bits)
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class _SimpleAmplitudeQuery:
     circuit: object
     input_bits: tuple[int, ...]
@@ -128,7 +128,7 @@ def resolve_fair_cases(case_names: list[str]):
     return resolved
 
 
-@dataclass
+@dataclass(slots=True)
 class CuratedBenchmarkRow:
     section: str
     mode: str

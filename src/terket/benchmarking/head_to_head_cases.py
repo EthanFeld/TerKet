@@ -15,7 +15,7 @@ from ..circuits import from_qiskit, make_circuit
 SUPPORTED_BASIS = ["h", "sx", "x", "rz", "cx", "cz"]
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class AmplitudeQuery:
     circuit: object
     input_bits: tuple[int, ...]
@@ -24,7 +24,7 @@ class AmplitudeQuery:
     metadata: dict[str, Any] = field(default_factory=dict)
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class BenchmarkCase:
     name: str
     family: str

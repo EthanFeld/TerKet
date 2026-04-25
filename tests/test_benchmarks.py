@@ -19,7 +19,7 @@ PYTHON = sys.executable
 if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
-from terket import compute_circuit_amplitude, make_circuit
+from terket import bits_to_big_endian_string, compute_circuit_amplitude, make_circuit
 from terket.benchmarking.head_to_head_cases import build_approximate_qft, build_approximate_qft_logical
 from terket.circuit_spec import from_qiskit
 
@@ -52,6 +52,9 @@ def _load_csv_rows(csv_path: Path) -> list[dict[str, str]]:
 
 
 class ApiSmokeTests(unittest.TestCase):
+    def test_bits_to_big_endian_string_accepts_iterables(self):
+        self.assertEqual(bits_to_big_endian_string(iter([1, 0, 1])), "101")
+
     def test_public_api_smoke(self):
         circuit = make_circuit(1, [("h", 0)])
         amplitude, _ = compute_circuit_amplitude(circuit, [0], [0], as_complex=True)
@@ -67,6 +70,63 @@ class ApiSmokeTests(unittest.TestCase):
 
         self.assertAlmostEqual(complex(direct_amp).real, complex(imported_amp).real, places=12)
         self.assertAlmostEqual(complex(direct_amp).imag, complex(imported_amp).imag, places=12)
+
+
+@unittest.skipUnless(_dependencies_available("qiskit"), "qiskit is not installed")
+class QuoblyBuilderTests(unittest.TestCase):
+    def test_uncontrolled_basis_change_rewrite_matches_old_controlled_terms(self):
+        from qiskit import QuantumCircuit
+        from qiskit.quantum_info import Operator
+
+        def old_apply(qc: QuantumCircuit, control: int, q0: int, q1: int, pauli: str, angle: float) -> None:
+            if pauli == "xx":
+                qc.ch(control, q0)
+                qc.ch(control, q1)
+            elif pauli == "yy":
+                qc.crx(math.pi / 2, control, q0)
+                qc.crx(math.pi / 2, control, q1)
+            qc.ccx(control, q0, q1)
+            qc.crz(angle, control, q1)
+            qc.ccx(control, q0, q1)
+            if pauli == "xx":
+                qc.ch(control, q0)
+                qc.ch(control, q1)
+            elif pauli == "yy":
+                qc.crx(-math.pi / 2, control, q0)
+                qc.crx(-math.pi / 2, control, q1)
+
+        def rewritten_apply(qc: QuantumCircuit, control: int, q0: int, q1: int, pauli: str, angle: float) -> None:
+            if pauli == "xx":
+                qc.h(q0)
+                qc.h(q1)
+            elif pauli == "yy":
+                qc.sx(q0)
+                qc.sx(q1)
+            qc.cx(q0, q1)
+            qc.crz(angle, control, q1)
+            qc.cx(q0, q1)
+            if pauli == "xx":
+                qc.h(q0)
+                qc.h(q1)
+            elif pauli == "yy":
+                qc.sxdg(q0)
+                qc.sxdg(q1)
+
+        for pauli in ("xx", "yy", "zz"):
+            old_qc = QuantumCircuit(3)
+            new_qc = QuantumCircuit(3)
+            if pauli == "zz":
+                old_qc.ccx(0, 1, 2)
+                old_qc.crz(math.pi / 8, 0, 2)
+                old_qc.ccx(0, 1, 2)
+                new_qc.cx(1, 2)
+                new_qc.crz(math.pi / 8, 0, 2)
+                new_qc.cx(1, 2)
+            else:
+                old_apply(old_qc, 0, 1, 2, pauli, math.pi / 8)
+                rewritten_apply(new_qc, 0, 1, 2, pauli, math.pi / 8)
+            delta = Operator(old_qc).data - Operator(new_qc).data
+            self.assertLess(abs(delta).max(), 1e-12, msg=pauli)
 
 
 @unittest.skipUnless(

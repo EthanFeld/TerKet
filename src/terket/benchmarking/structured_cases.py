@@ -14,7 +14,7 @@ from ..circuits import from_qiskit
 SUPPORTED_BASIS = ["h", "sx", "x", "rz", "cx", "cz"]
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class StructuredQuery:
     circuit: object
     input_bits: tuple[int, ...]
@@ -23,7 +23,7 @@ class StructuredQuery:
     metadata: dict[str, Any] = field(default_factory=dict)
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class StructuredCase:
     name: str
     family: str

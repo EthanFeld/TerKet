@@ -56,6 +56,12 @@ static PyMethodDef module_methods[] = {
         PyDoc_STR("Eliminate one parity-constraint partner in a level-3 cubic kernel."),
     },
     {
+        "elim_two_partner_constraint_terms",
+        (PyCFunction) elim_two_partner_constraint_terms_native,
+        METH_VARARGS,
+        PyDoc_STR("Eliminate a two-partner parity constraint in a level-3 cubic kernel."),
+    },
+    {
         "clear_support_cache",
         (PyCFunction) clear_support_cache_native,
         METH_NOARGS,
