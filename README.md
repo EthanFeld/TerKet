@@ -2,18 +2,9 @@
 
 TerKet is exact strong-simulation toolkit for Clifford+T-style quantum circuits. It ingests normalized gate lists, Qiskit circuits, or QASM-like inputs, rewrites them into Schur-state phase functions, and answers exact amplitude queries with explicit solver metadata.
 
-Repo bundles three things:
-
-- public Python API for exact amplitude queries
-- native and pure-Python solver backends
-- reproducible benchmark and profiling entrypoints
-
 ## What It Does
 
-- Computes exact amplitudes without collapsing tiny nonzero values to `0j`
-- Imports practical circuits from Qiskit
-- Reports reduction diagnostics such as `cubic_obstruction`, `gauss_obstruction`, `cost_model_r`, and `phase3_backend`
-- Includes benchmark families for head-to-head runtime studies and structural probes
+- Computes exact amplitudes of circuits
 
 ## Install
 
