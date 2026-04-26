@@ -30,5 +30,4 @@ python benchmarks/run_benchmarks.py curated --csv results/curated_benchmark.csv
 Notes:
 
 - CSV files default to `results/`
-- Exploratory one-off benchmark scripts live under `benchmarks/targeted/`
-- `benchmarks/targeted/` is gitignored so targeted experiments do not clutter the maintained benchmark surface
+

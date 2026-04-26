@@ -105,17 +105,7 @@ python scripts/simulate_observable.py grover.qasm 101
 
 ## Benchmarks
 
-Unified entrypoint:
-
-```powershell
-python benchmarks/run_benchmarks.py head-to-head --suite smoke --repeats 1
-python benchmarks/run_benchmarks.py structured-showcase --suite smoke
-python benchmarks/run_benchmarks.py depth-scaling --depths 1 2 4 8
-python benchmarks/run_benchmarks.py amplitude-post-elimination-tensor-rcs
-python benchmarks/run_benchmarks.py rcs-import-strategy-probe
-```
-
-More benchmark detail lives in [benchmarks/README.md](TerKet/benchmarks/README.md).
+Benchmark detail lives in [benchmarks/README.md](TerKet/benchmarks/README.md).
 
 ## Notebook
 
