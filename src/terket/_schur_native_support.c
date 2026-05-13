@@ -543,11 +543,17 @@ void free_q3_free_treewidth_plan(NativeQ3FreeTreewidthPlan *plan)
     }
     PyMem_Free(plan->slot_arities);
     PyMem_Free(plan->slot_table_sizes);
+    PyMem_Free(plan->slot_workspace_offsets);
     PyMem_Free(plan->initial_tables);
+    PyMem_Free(plan->slot_source_kinds);
+    PyMem_Free(plan->slot_source_indexes);
     PyMem_Free(plan->steps);
     plan->slot_arities = NULL;
     plan->slot_table_sizes = NULL;
+    plan->slot_workspace_offsets = NULL;
     plan->initial_tables = NULL;
+    plan->slot_source_kinds = NULL;
+    plan->slot_source_indexes = NULL;
     plan->steps = NULL;
     PyMem_Free(plan);
 }
@@ -610,6 +616,8 @@ void free_level3_treewidth_plan(NativeLevel3TreewidthPlan *plan)
     PyMem_Free(plan->slot_table_sizes);
     PyMem_Free(plan->slot_workspace_offsets);
     PyMem_Free(plan->initial_tables);
+    PyMem_Free(plan->slot_source_kinds);
+    PyMem_Free(plan->slot_source_indexes);
     PyMem_Free(plan->steps);
     PyMem_Free(plan->workspace);
     PyMem_Free(plan->merge_scratch);
@@ -619,6 +627,8 @@ void free_level3_treewidth_plan(NativeLevel3TreewidthPlan *plan)
     plan->slot_table_sizes = NULL;
     plan->slot_workspace_offsets = NULL;
     plan->initial_tables = NULL;
+    plan->slot_source_kinds = NULL;
+    plan->slot_source_indexes = NULL;
     plan->steps = NULL;
     plan->workspace = NULL;
     plan->merge_scratch = NULL;

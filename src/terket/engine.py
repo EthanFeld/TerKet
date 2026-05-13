@@ -28,7 +28,7 @@ from __future__ import annotations
 
 import bisect
 import cmath
-from collections import OrderedDict
+from collections import OrderedDict, deque
 import contextvars
 from dataclasses import dataclass
 from fractions import Fraction
@@ -45,7 +45,7 @@ import platform
 import struct
 import sys
 from types import MappingProxyType
-from typing import Any, Literal, Protocol, Sequence, TypedDict, overload
+from typing import Any, Callable, Literal, Protocol, Sequence, TypedDict, overload
 
 import numpy as np
 
@@ -154,6 +154,15 @@ _Q3_TREEWIDTH_DP_MAX_WIDTH = 18
 # it by the actual DP work estimate instead of width alone.
 _Q3_TREEWIDTH_DP_PEELED_MAX_WIDTH = 24
 _Q3_TREEWIDTH_DP_PEELED_MAX_WORK = 30_000_000_000
+# Some large sparse cubic kernels become much worse after exact eliminations:
+# the eliminator removes many q1/q2-only variables, but densifies the tiny q3
+# support into a small hard core that then falls back to q3-cover recursion.
+# If the original kernel already has a cheap direct treewidth plan, take it.
+_PRE_EXACT_PHASE3_TREEWIDTH_ESCAPE_MIN_VARS = 256
+_PRE_EXACT_PHASE3_TREEWIDTH_ESCAPE_MAX_Q3_TERMS = 256
+_PRE_EXACT_PHASE3_TREEWIDTH_ESCAPE_MAX_COVER = 8
+_PRE_EXACT_PHASE3_TREEWIDTH_ESCAPE_MAX_WORK = 50_000_000
+_PYTHON_TREEWIDTH_BATCH_MAX_WIDTH = 8
 # The exact q3-free summation path otherwise falls back to a feedback-variable
 # transfer solver whose memo table can explode on wide but still tractable q2
 # graphs. Allow one or two extra width units there before giving up on DP.
@@ -180,7 +189,15 @@ _Q3_FREE_BAD_Q2_COVER_DISPATCH_MIN_DENSITY = 0.15
 _Q3_FREE_BAD_Q2_COVER_DISPATCH_MIN_SUPPORT_FACTOR = 3
 _Q3_FREE_HALF_PHASE_CLUSTER_MAX_CLUSTER_SIZE = 8
 _Q3_FREE_HALF_PHASE_CLUSTER_MAX_BOUNDARY = 6
+_Q3_FREE_SMALL_BOUNDARY_REGION_MIN_SIZE = 4
+_Q3_FREE_SMALL_BOUNDARY_REGION_MAX_SIZE = 24
+_Q3_FREE_SMALL_BOUNDARY_REGION_MAX_BOUNDARY = 4
+_Q3_FREE_SMALL_BOUNDARY_REGION_MAX_REGIONS = 16
+_Q3_FREE_ORDER_GUIDED_CUTSET_MAX_PEAKS = 12
 _Q3_FREE_ORDER_HINT_MAX_WIDTH = 12
+_Q3_FREE_CHEAP_ORDER_HINT_MIN_VARS = 128
+_Q3_FREE_SERIES_CORE_RECURSE_MIN_VARS = 128
+_Q3_FREE_SERIES_CORE_RECURSE_MIN_SHRINK = 64
 _Q3_FREE_CUTSET_MAX_SIZE = 6
 _Q3_FREE_CUTSET_CANDIDATE_POOL = 24
 _Q3_FREE_CUTSET_BEAM_WIDTH = 4
@@ -193,12 +210,16 @@ _Q3_FREE_CUTSET_TENSOR_HINT_TARGET_WIDTH = 14
 _Q3_FREE_REUSABLE_CUTSET_MIN_LAMBDA_VARS = 2
 _Q3_FREE_REUSABLE_CUTSET_MIN_TREEWIDTH = 12
 _Q3_FREE_REUSABLE_CUTSET_MAX_LOG2_REUSE = 4
+_Q3_FREE_REUSABLE_EXECUTION_PLAN_MIN_VARS = 24
 _Q3_FREE_ONE_SHOT_CUTSET_MIN_TREEWIDTH = 18
 _Q3_FREE_ONE_SHOT_CUTSET_ACTIVATION_WIDTH = 30
 _Q3_FREE_ONE_SHOT_CUTSET_MAX_SIZE = 10
 _Q3_FREE_ONE_SHOT_CUTSET_CANDIDATE_POOL = 40
 _Q3_FREE_ONE_SHOT_CUTSET_BEAM_WIDTH = 6
 _Q3_FREE_ONE_SHOT_CUTSET_BRANCHES_PER_STATE = 4
+_Q3_FREE_ONE_SHOT_STAGNATION_LIMIT = 2
+_Q3_FREE_ONE_SHOT_LOCAL_SEARCH_PASSES = 2
+_Q3_FREE_ONE_SHOT_LOCAL_SEARCH_TOPK = 8
 _Q3_FREE_ONE_SHOT_DIRECT_MIN_VARS = 88
 _Q3_FREE_ONE_SHOT_DIRECT_MIN_WIDTH = 24
 _Q3_FREE_ONE_SHOT_DIRECT_MAX_REMAINING_WIDTH = 16
@@ -214,6 +235,9 @@ _Q3_FREE_DENSE_PLAN_MIN_DENSITY = 0.20
 # Small dense residual kernels are the only ones where quimb contraction
 # planning is consistently cheaper than branching or pure-Python DP.
 _Q3_TENSOR_CONTRACTION_MAX_VARS = 24
+# Arbitrary-phase branching iterates 2^K branches; beyond this the computation
+# is infeasible regardless of other circuit properties.
+_MAX_ARBITRARY_PHASE_BRANCH_DIMENSION = 30
 _Q3_TENSOR_CONTRACTION_OPTIMIZE = "greedy"
 _Q3_HYBRID_CONTRACTION_MAX_VARS = 60
 _Q3_HYBRID_CONTRACTION_MAX_WIDTH = 25
@@ -259,6 +283,11 @@ _PHASE_STRUCTURE_CUBIC_LOCAL_REGION_MAX_VARS = 32
 _PHASE_STRUCTURE_CUBIC_LOCAL_MAX_CENTERS = 10
 _PHASE_STRUCTURE_CUBIC_LOCAL_MAX_PASSES = 4
 _PHASE_STRUCTURE_CUBIC_LOCAL_CANDIDATE_POOL = 10
+# Very large q3-free kernels can spend minutes in optional structure-scoring
+# and mediator-order planning without changing the eventual exact backend.
+# Past this size, skip those optional rewrites and let the core q3-free planner
+# work directly on the sparse graph.
+_Q3_FREE_OPTIONAL_REWRITE_MAX_VARS = 1024
 # Residual cubic treewidth planning uses a tighter local refinement than the
 # q3-free planner because backend choice depends directly on width/work here.
 _PHASE3_TREEWIDTH_REFINE_MAX_WIDTH = 28
@@ -357,6 +386,10 @@ _SCALED_RENORMALIZE_MAX = math.ldexp(1.0, 256)
 # The optional native affine composer packs q3 indices into 21-bit lanes inside
 # a uint64_t; larger variable indices fall back to the pure-Python path.
 _NATIVE_AFF_COMPOSE_Q3_INDEX_LIMIT = 1 << 21
+# Large Pauli-expectation batches can avoid replaying a long inverse suffix gate
+# by gate once the suffix row trajectory is fixed and calibration matches.
+_DIRECT_POST_REPLAY_MIN_SUFFIX_GATES = 256
+_DIRECT_POST_REPLAY_MIN_OBSERVABLES = 8
 # Keep the direct two-partner parity rewrite on small kernels where Python-side
 # bookkeeping is cheap; large kernels are faster through native aff_compose.
 _DIRECT_TWO_PARTNER_CONSTRAINT_MAX_VARS = 128
@@ -621,6 +654,30 @@ class EchelonCache:
 
 
 @dataclass(frozen=True, slots=True)
+class _DirectPostReplayTemplate:
+    """Precomputed fixed-row replay plan for a long Pauli-expectation suffix."""
+
+    base_rows: tuple[int, ...]
+    final_rows: tuple[int, ...]
+    final_m: int
+    suffix_ops: tuple[tuple[int, ...], ...]
+    scalar_half_pow2_delta: int
+    echelon_cache: EchelonCache
+    z_coeff: int
+    s_coeff: int
+    sdg_coeff: int
+
+
+@dataclass(frozen=True, slots=True)
+class _DirectAffineMaskPattern:
+    """Cached support/pair/triple lists for small fixed affine masks."""
+
+    support: tuple[int, ...]
+    pairs: tuple[tuple[int, int], ...]
+    triples: tuple[tuple[int, int, int], ...]
+
+
+@dataclass(frozen=True, slots=True)
 class _ArbitraryPhaseTerm:
     """Deferred exact phase on an affine Boolean output of the current state."""
 
@@ -745,6 +802,14 @@ class _Q3FreeCutsetConditioningPlan:
 
 
 @dataclass(frozen=True, slots=True)
+class _Q3FreeResidualProjection:
+    """Projected q3-free remainder induced by a candidate cutset."""
+
+    remaining_vars: tuple[int, ...]
+    remaining_q: PhaseFunction
+
+
+@dataclass(frozen=True, slots=True)
 class _Q3FreeCutsetCandidateEvaluation:
     """Search-time summary for a candidate q3-free cutset."""
 
@@ -835,6 +900,15 @@ class _Q3FreeExecutionPlan:
     level: int
     q0: Fraction
     q1: tuple[int, ...]
+    isolated_vars: tuple[int, ...]
+    components: tuple[_Q3FreeConstraintComponentPlan, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class _Q3FreeReusableExecutionPlan:
+    """Q3-free execution topology reusable across q1/q0 shifts of one structure."""
+
+    level: int
     isolated_vars: tuple[int, ...]
     components: tuple[_Q3FreeConstraintComponentPlan, ...]
 
@@ -983,6 +1057,29 @@ def _solve_echelon_rhs(cache: EchelonCache, rhs_mask: int) -> int | None:
         if rhs:
             shift_mask |= 1 << pivot
     return shift_mask
+
+
+def _solve_output_from_echelon(
+    eps0: Sequence[int],
+    cache: EchelonCache,
+    output_bits: BitSequence,
+) -> tuple[int, tuple[int, ...], tuple[int, ...], int] | None:
+    if len(output_bits) != cache.n:
+        raise ValueError(f"Expected {cache.n} output bits, received {len(output_bits)}.")
+
+    native_shift_mask = _native_solve_for_output(eps0, cache, output_bits)
+    if native_shift_mask is not None:
+        return native_shift_mask, cache.free_vars, cache.gamma_masks, cache.n_free
+
+    target_mask = 0
+    for idx, bit in enumerate(output_bits):
+        if (int(bit) ^ int(eps0[idx])) & 1:
+            target_mask |= 1 << idx
+
+    shift_mask = _solve_echelon_rhs(cache, target_mask)
+    if shift_mask is None:
+        return None
+    return shift_mask, cache.free_vars, cache.gamma_masks, cache.n_free
 
 
 def _coalesce_arbitrary_phase_terms(
@@ -1832,27 +1929,7 @@ class SchurState:
         output_bits: BitSequence,
     ) -> tuple[int, tuple[int, ...], tuple[int, ...], int] | None:
         """Solve the output constraints for one output string."""
-        if len(output_bits) != cache.n:
-            raise ValueError(f"Expected {cache.n} output bits, received {len(output_bits)}.")
-
-        native_shift_mask = _native_solve_for_output(self.eps0, cache, output_bits)
-        if native_shift_mask is not None:
-            return native_shift_mask, cache.free_vars, cache.gamma_masks, cache.n_free
-
-        target_mask = 0
-        for idx, bit in enumerate(output_bits):
-            if (int(bit) ^ self.eps0[idx]) & 1:
-                target_mask |= 1 << idx
-
-        shift_mask = 0
-        for row_idx, pivot in enumerate(cache.pivot_col):
-            rhs = _parity(target_mask & cache.row_ops[row_idx])
-            if pivot < 0 and rhs:
-                return None
-            if pivot >= 0 and rhs:
-                shift_mask |= 1 << pivot
-
-        return shift_mask, cache.free_vars, cache.gamma_masks, cache.n_free
+        return _solve_output_from_echelon(self.eps0, cache, output_bits)
 
     def _transform_arbitrary_phases(
         self,
@@ -1933,6 +2010,14 @@ class SchurState:
                 }
             else:
                 branch_plan = _build_arbitrary_phase_branch_plan(arbitrary_terms)
+                _k = len(branch_plan.basis_masks)
+                if _k > _MAX_ARBITRARY_PHASE_BRANCH_DIMENSION:
+                    raise RuntimeError(
+                        f"Cannot compute amplitude: {_k} linearly-independent arbitrary-angle "
+                        f"phase terms require 2^{_k} branches after CZ entanglement. "
+                        "Load the circuit with rz_compile_mode='clifford_t' to synthesize "
+                        "arbitrary angles into Clifford+T gates before running the engine."
+                    )
                 branch_cache = _prepare_affine_constraint_cache(
                     len(branch_plan.basis_masks),
                     k,
@@ -2150,6 +2235,48 @@ class SchurState:
 # Core: recursive reduction and summation
 # ==================================================================
 
+def _pre_exact_phase3_treewidth_escape(
+    q,
+    *,
+    allow_tensor_contraction: bool,
+):
+    """Return a direct Phase-3 treewidth plan worth taking before exact elim."""
+    if not q.q3 or q.n < _PRE_EXACT_PHASE3_TREEWIDTH_ESCAPE_MIN_VARS:
+        return None
+
+    q3_terms = sum(1 for coeff in q.q3.values() if coeff % q.mod_q3)
+    if q3_terms == 0 or q3_terms > _PRE_EXACT_PHASE3_TREEWIDTH_ESCAPE_MAX_Q3_TERMS:
+        return None
+
+    active_q3 = _active_q3_variables(q)
+    if active_q3 and len(active_q3) * 4 > q.n:
+        return None
+
+    cover, order, width, structural_obstruction, fully_peeled = _phase3_support_plan(q)
+    treewidth_work = max(1, int(_estimate_treewidth_dp_work(q, order)))
+    backend = _select_direct_phase3_backend(
+        q,
+        cover,
+        order,
+        width,
+        allow_tensor_contraction=allow_tensor_contraction,
+        fully_peeled=fully_peeled,
+        treewidth_work=treewidth_work,
+    )
+    if backend not in {"treewidth_dp", "treewidth_dp_peeled"}:
+        return None
+    if (
+        len(cover) > _PRE_EXACT_PHASE3_TREEWIDTH_ESCAPE_MAX_COVER
+        or structural_obstruction > _PRE_EXACT_PHASE3_TREEWIDTH_ESCAPE_MAX_COVER
+    ):
+        return None
+
+    if treewidth_work > _PRE_EXACT_PHASE3_TREEWIDTH_ESCAPE_MAX_WORK:
+        return None
+
+    return cover, order, width, structural_obstruction, backend
+
+
 def _reduce_and_sum_scaled(q, context=None):
     """
     Reduce q by eliminating variables, then sum over remainder.
@@ -2169,6 +2296,8 @@ def _reduce_and_sum_scaled(q, context=None):
     cached = context.reduce_cache.get(cache_key)
     if cached is not None:
         return cached[0], dict(cached[1])
+
+    allow_tensor_contraction = context.allow_tensor_contraction
 
     # Above Clifford+T precision, affine parity substitutions can require
     # quartic or higher terms that the current PhaseFunction backend does not
@@ -2203,6 +2332,31 @@ def _reduce_and_sum_scaled(q, context=None):
         }
         context.reduce_cache[cache_key] = (total, dict(info))
         return total, info
+
+    pre_exact_phase3 = _pre_exact_phase3_treewidth_escape(
+        q,
+        allow_tensor_contraction=allow_tensor_contraction,
+    )
+    if pre_exact_phase3 is not None:
+        (
+            phase3_cover,
+            phase3_order,
+            phase3_width,
+            phase3_structural_obstruction,
+            direct_phase3_backend,
+        ) = pre_exact_phase3
+        phase3_total, phase3_info = _sum_irreducible_cubic_core(
+            q,
+            context=context,
+            cover=phase3_cover,
+            order=phase3_order,
+            width=phase3_width,
+            structural_obstruction=phase3_structural_obstruction,
+            backend=direct_phase3_backend,
+            allow_tensor_contraction=allow_tensor_contraction,
+        )
+        context.reduce_cache[cache_key] = (phase3_total, dict(phase3_info))
+        return phase3_total, phase3_info
 
     q, scale_half_pow2, exact_info, blocked_quadratics = _apply_exact_eliminations(q, context=context)
     nq = exact_info['quad']
@@ -2246,8 +2400,6 @@ def _reduce_and_sum_scaled(q, context=None):
         return total, info
 
     enable_extended_q3_reductions = _should_apply_extended_q3_reductions(q, extended_reductions)
-
-    allow_tensor_contraction = True if context is None else context.allow_tensor_contraction
     baseline_phase3_runtime_score = None
     if q.q3 and enable_extended_q3_reductions:
         baseline_phase3_runtime_score = _phase3_execution_plan_runtime_score(
@@ -2378,11 +2530,17 @@ def _reduce_and_sum_scaled(q, context=None):
 
     # Phase 2: if a genuine cubic core remains, try conditional branching.
     if q.n > 0 and not prefer_direct_phase3:
-        classification_lookup = _classification_lookup(q)
+        classification_data = _build_classification_data(q)
+        threshold = max(1, q.mod_q1 // 4)
         # Find best branch variable: odd-q1 var that unlocks most even partners
         best_var, best_unlocks = -1, -1
         for var in range(q.n):
-            if classification_lookup[var][q.q1[var] % q.mod_q1][0] != _CLASS_CUBIC:
+            if _classification_entry(
+                q,
+                var,
+                classification_data=classification_data,
+                threshold=threshold,
+            )[0] != _CLASS_CUBIC:
                 continue
             if q.q1[var] % 2 == 0:
                 continue  # only branch on odd-q1 vars
@@ -2519,6 +2677,245 @@ def _reduce_and_sum_scaled(q, context=None):
 def _reduce_and_sum(q, context=None):
     result, info = _reduce_and_sum_scaled(q, context=context)
     return _scaled_to_complex(result), info
+
+
+def _reduce_and_sum_scaled_batch(
+    q_batch: Sequence[PhaseFunction],
+    *,
+    context: _ReductionContext | None = None,
+) -> list[tuple[ScaledComplex, ReducerInfo]]:
+    """Batch companion to ``_reduce_and_sum_scaled`` for repeated exact queries."""
+    if context is None:
+        context = _ReductionContext()
+    if not q_batch:
+        return []
+
+    results: list[tuple[ScaledComplex, ReducerInfo] | None] = [None] * len(q_batch)
+    direct_groups: dict[
+        tuple[str, tuple[int, ...], int, int, tuple[int, int, bytes]],
+        list[tuple[int, PhaseFunction]],
+    ] = {}
+    support_groups: dict[
+        tuple[int, int, bytes],
+        list[tuple[int, PhaseFunction]],
+    ] = {}
+    fallback: list[tuple[int, PhaseFunction]] = []
+
+    for batch_idx, q in enumerate(q_batch):
+        cache_key = _q_key(q)
+        cached = context.reduce_cache.get(cache_key)
+        if cached is not None:
+            results[batch_idx] = (cached[0], dict(cached[1]))
+            continue
+
+        if not q.q3 or q.n < _PRE_EXACT_PHASE3_TREEWIDTH_ESCAPE_MIN_VARS:
+            fallback.append((batch_idx, q))
+            continue
+        support_groups.setdefault(_q_cubic_treewidth_batch_support_key(q), []).append((batch_idx, q))
+
+    for support_key, group in support_groups.items():
+        if len(group) == 1:
+            fallback.extend(group)
+            continue
+        ref_q = group[0][1]
+        native_level3_batch_ok = (
+            _native_symbol("sum_level3_treewidth_preplanned_batch_array") is not None
+            and _native_level3_enabled(ref_q)
+        )
+        native_generic_batch_ok = (
+            _native_symbol("build_phase_function_treewidth_support_plan") is not None
+            and _native_symbol("sum_phase_function_treewidth_preplanned_batch_scaled_array") is not None
+        )
+        native_batch_ok = native_level3_batch_ok or native_generic_batch_ok
+
+        pre_exact_phase3 = None
+        if native_batch_ok:
+            q3_terms = sum(1 for coeff in ref_q.q3.values() if coeff % ref_q.mod_q3)
+            active_q3 = _active_q3_variables(ref_q)
+            if (
+                q3_terms > 0
+                and q3_terms <= _PRE_EXACT_PHASE3_TREEWIDTH_ESCAPE_MAX_Q3_TERMS
+                and (not active_q3 or len(active_q3) * 4 <= ref_q.n)
+            ):
+                cover, order, width, structural_obstruction, fully_peeled = _phase3_batch_support_plan_fast(ref_q)
+                width_limit = (
+                    _Q3_TREEWIDTH_DP_PEELED_MAX_WIDTH
+                    if fully_peeled
+                    else _Q3_TREEWIDTH_DP_MAX_WIDTH
+                )
+                if (
+                    width <= width_limit
+                    and len(cover) <= _PRE_EXACT_PHASE3_TREEWIDTH_ESCAPE_MAX_COVER
+                    and structural_obstruction <= _PRE_EXACT_PHASE3_TREEWIDTH_ESCAPE_MAX_COVER
+                ):
+                    backend = "treewidth_dp_peeled" if fully_peeled else "treewidth_dp"
+                    pre_exact_phase3 = (
+                        cover,
+                        order,
+                        width,
+                        structural_obstruction,
+                        backend,
+                    )
+        if pre_exact_phase3 is None:
+            pre_exact_phase3 = _pre_exact_phase3_treewidth_escape(
+                ref_q,
+                allow_tensor_contraction=context.allow_tensor_contraction,
+            )
+            if pre_exact_phase3 is None or pre_exact_phase3[4] not in {"treewidth_dp", "treewidth_dp_peeled"}:
+                fallback.extend(group)
+                continue
+
+        cover, order, width, structural_obstruction, backend = pre_exact_phase3
+        del cover
+        group_key = (
+            str(backend),
+            tuple(int(var) for var in order),
+            int(width),
+            int(structural_obstruction),
+            support_key,
+        )
+        direct_groups[group_key] = list(group)
+
+    for (backend, order, _width, structural_obstruction, _support_key), group in direct_groups.items():
+        if len(group) == 1:
+            fallback.extend(group)
+            continue
+        native_level3_batch_ok = (
+            _native_symbol("sum_level3_treewidth_preplanned_batch_array") is not None
+            and _native_level3_enabled(group[0][1])
+        )
+        native_generic_batch_ok = (
+            _native_symbol("build_phase_function_treewidth_support_plan") is not None
+            and _native_symbol("sum_phase_function_treewidth_preplanned_batch_scaled_array") is not None
+        )
+        if (
+            _width > _PYTHON_TREEWIDTH_BATCH_MAX_WIDTH
+            and not native_level3_batch_ok
+            and not native_generic_batch_ok
+        ):
+            fallback.extend(group)
+            continue
+
+        q_group = [q for _batch_idx, q in group]
+        try:
+            totals, actual_width = _sum_via_treewidth_dp_scaled_batch_shared_support(
+                q_group,
+                list(order),
+            )
+        except ValueError:
+            fallback.extend(group)
+            continue
+
+        for (batch_idx, q), total in zip(group, totals):
+            info: ReducerInfo = {
+                'quad': 0,
+                'constraint': 0,
+                'branched': 0,
+                'remaining': int(actual_width),
+                'structural_obstruction': int(structural_obstruction),
+                'gauss_obstruction': _gauss_obstruction(q, int(structural_obstruction)),
+                'cost_r': int(actual_width),
+                'phase_states': 0,
+                'phase_splits': 0,
+                'phase3_backend': backend,
+            }
+            context.reduce_cache[_q_key(q)] = (total, dict(info))
+            results[batch_idx] = (total, info)
+
+    for batch_idx, q in fallback:
+        results[batch_idx] = _reduce_and_sum_scaled(q, context=context)
+
+    assert all(result is not None for result in results)
+    return [result for result in results if result is not None]
+
+
+def _invert_native_gate(gate: Gate) -> Gate:
+    name = gate[0]
+    if name in {"h", "x", "z", "cnot", "cz"}:
+        return gate
+    if name == "sx":
+        return ("sxdg", gate[1])
+    if name == "sxdg":
+        return ("sx", gate[1])
+    if name == "s":
+        return ("sdg", gate[1])
+    if name == "sdg":
+        return ("s", gate[1])
+    if name == "t":
+        return ("tdg", gate[1])
+    if name == "tdg":
+        return ("t", gate[1])
+    if name == "rz_dyadic":
+        return ("rz_dyadic", int(gate[1]), -int(gate[2]), int(gate[3]))
+    if name == "rz_arbitrary":
+        return ("rz_arbitrary", int(gate[1]), -float(gate[2]))
+    if name == "rzz_dyadic":
+        return ("rzz_dyadic", int(gate[1]), int(gate[2]), -int(gate[3]), int(gate[4]))
+    if name == "rz_pi_16":
+        return ("rz_pi_16_dg", int(gate[1]))
+    if name == "rz_pi_16_dg":
+        return ("rz_pi_16", int(gate[1]))
+    if name == "rz_pi_32":
+        return ("rz_pi_32_dg", int(gate[1]))
+    if name == "rz_pi_32_dg":
+        return ("rz_pi_32", int(gate[1]))
+    raise ValueError(f"Unsupported inverse gate: {gate!r}")
+
+
+def _invert_native_gates(gates: Sequence[Gate]) -> tuple[Gate, ...]:
+    return tuple(_invert_native_gate(gate) for gate in reversed(gates))
+
+
+def _fork_state_for_extension(state: SchurState) -> SchurState:
+    """Clone a built state while sharing the phase polynomial until first write."""
+    state._flush_pending_dead_variables()
+    if getattr(state.q, "_schur_mutable", True):
+        state.q._schur_mutable = False
+
+    clone = SchurState(state.n)
+    clone.m = state.m
+    clone.eps = list(state.eps)
+    clone.eps0 = list(state.eps0)
+    clone.q = state.q
+    clone.scalar = complex(state.scalar)
+    clone.scalar_half_pow2 = int(state.scalar_half_pow2)
+    clone.output_refcount = list(state.output_refcount)
+    clone._arbitrary_phases = list(state._arbitrary_phases)
+    clone._pending_dead = set(state._pending_dead)
+    clone._cached_classification_data = state._cached_classification_data
+    clone._cached_classification_q = state._cached_classification_q
+    return clone
+
+
+def _pauli_string_gates(pauli: str) -> tuple[Gate, ...]:
+    gates: list[Gate] = []
+    for qubit, pauli_char in enumerate(pauli):
+        if pauli_char == "I":
+            continue
+        if pauli_char == "X":
+            gates.append(("x", int(qubit)))
+            continue
+        if pauli_char == "Y":
+            gates.extend((("sdg", int(qubit)), ("x", int(qubit)), ("s", int(qubit))))
+            continue
+        if pauli_char == "Z":
+            gates.append(("z", int(qubit)))
+            continue
+        raise ValueError(f"Observable must use only I/X/Y/Z characters, received {pauli!r}.")
+    return tuple(gates)
+
+
+def _validate_pauli_observables(observables: Sequence[str], n_qubits: int) -> tuple[str, ...]:
+    normalized: list[str] = []
+    for observable in observables:
+        if len(observable) != n_qubits:
+            raise ValueError(
+                f"Expected Pauli observable of length {n_qubits}, received length {len(observable)}."
+            )
+        if any(ch not in "IXYZ" for ch in observable):
+            raise ValueError(f"Observable must use only I/X/Y/Z characters, received {observable!r}.")
+        normalized.append(str(observable))
+    return tuple(normalized)
 
 
 def _elim_decoupled_constraints_batch(q, variables):
@@ -3403,7 +3800,8 @@ def _apply_safe_q3_free_parity_substitutions(
     changed = False
 
     while True:
-        classification_lookup = _classification_lookup(reduced_q)
+        classification_data = _build_classification_data(reduced_q)
+        threshold = max(1, reduced_q.mod_q1 // 4)
         decoupled_constraints = []
         adjacency = [set() for _ in range(reduced_q.n)]
         for (left, right), coeff in reduced_q.q2.items():
@@ -3414,7 +3812,12 @@ def _apply_safe_q3_free_parity_substitutions(
         best_action = None
         best_score = None
         for var in range(reduced_q.n):
-            entry = classification_lookup[var][reduced_q.q1[var] % reduced_q.mod_q1]
+            entry = _classification_entry(
+                reduced_q,
+                var,
+                classification_data=classification_data,
+                threshold=threshold,
+            )
             tag = entry[0]
             if tag == _CLASS_CONSTRAINT_ZERO:
                 return None, 0, True
@@ -3507,7 +3910,8 @@ def _half_phase_parity_component_reduction(q) -> tuple[object, int] | ScaledComp
     eliminated = 0
 
     while True:
-        classification_lookup = _classification_lookup(reduced_q)
+        classification_data = _build_classification_data(reduced_q)
+        threshold = max(1, reduced_q.mod_q1 // 4)
         adjacency = [set() for _ in range(reduced_q.n)]
         for (left, right), coeff in reduced_q.q2.items():
             if coeff % reduced_q.mod_q2:
@@ -3517,7 +3921,12 @@ def _half_phase_parity_component_reduction(q) -> tuple[object, int] | ScaledComp
         best_action = None
         best_score = None
         for var in range(reduced_q.n):
-            entry = classification_lookup[var][reduced_q.q1[var] % reduced_q.mod_q1]
+            entry = _classification_entry(
+                reduced_q,
+                var,
+                classification_data=classification_data,
+                threshold=threshold,
+            )
             if entry[0] != _CLASS_CONSTRAINT_PARITY:
                 continue
             partners = tuple(int(partner) for partner in entry[1])
@@ -3614,6 +4023,8 @@ def _build_half_phase_mediator_plan(q) -> _HalfPhaseMediatorPlan | None:
     which can then be closed by the generic factor-graph treewidth DP.
     """
     if not _is_half_phase_q2(q):
+        return None
+    if q.n > _Q3_FREE_OPTIONAL_REWRITE_MAX_VARS:
         return None
 
     threshold = max(1, q.mod_q1 // 4)
@@ -3867,6 +4278,700 @@ def _build_cluster_boundary_shift_table(
             shift_table[active_assignments, int(cluster_idx)] + (q2_lift * int(coeff))
         ) % mod_q1
     return shift_table
+
+
+def _build_q2_adjacency(q: PhaseFunction) -> list[set[int]]:
+    adjacency = [set() for _ in range(q.n)]
+    for (left, right), coeff in q.q2.items():
+        if coeff % q.mod_q2:
+            adjacency[left].add(right)
+            adjacency[right].add(left)
+    return adjacency
+
+
+def _build_selected_boundary_region_plan(
+    q: PhaseFunction,
+    *,
+    adjacency: Sequence[set[int]] | None = None,
+    candidate_regions: Sequence[Sequence[int]],
+) -> _HalfPhaseClusterPlan | None:
+    if q.q3 or not q.q2:
+        return None
+    adjacency = _build_q2_adjacency(q) if adjacency is None else [set(neighbors) for neighbors in adjacency]
+
+    selected_regions: list[
+        tuple[
+            tuple[int, ...],
+            tuple[int, ...],
+            dict[tuple[int, int], int],
+            tuple[tuple[int, int, int], ...],
+        ]
+    ] = []
+    selected_cluster_vars: set[int] = set()
+
+    scored_regions: list[tuple[tuple[int, int, int], tuple[int, ...]]] = []
+    for region in candidate_regions:
+        region_vars = tuple(sorted({int(var) for var in region}))
+        if not region_vars:
+            continue
+        boundary_vars = tuple(
+            sorted(
+                {
+                    int(neighbor)
+                    for var in region_vars
+                    for neighbor in adjacency[var]
+                    if neighbor not in region_vars
+                }
+            )
+        )
+        if not boundary_vars:
+            continue
+        scored_regions.append(
+            ((len(region_vars), -len(boundary_vars), -region_vars[0]), region_vars)
+        )
+    scored_regions.sort(reverse=True)
+
+    for _score, region_vars in scored_regions:
+        cluster_set = set(region_vars)
+        if cluster_set & selected_cluster_vars:
+            continue
+        boundary_vars = tuple(
+            sorted(
+                {
+                    int(neighbor)
+                    for var in region_vars
+                    for neighbor in adjacency[var]
+                    if neighbor not in cluster_set
+                }
+            )
+        )
+        if (
+            not boundary_vars
+            or set(boundary_vars) & selected_cluster_vars
+        ):
+            continue
+        cluster_remap = {var: idx for idx, var in enumerate(region_vars)}
+        boundary_remap = {var: idx for idx, var in enumerate(boundary_vars)}
+        boundary_set = set(boundary_vars)
+        internal_q2 = {
+            (cluster_remap[i], cluster_remap[j]): coeff
+            for (i, j), coeff in q.q2.items()
+            if i in cluster_set and j in cluster_set
+        }
+        boundary_couplings: list[tuple[int, int, int]] = []
+        for (left, right), coeff in q.q2.items():
+            if coeff % q.mod_q2 == 0:
+                continue
+            if left in cluster_set and right in boundary_set:
+                boundary_couplings.append((cluster_remap[left], boundary_remap[right], int(coeff)))
+            elif right in cluster_set and left in boundary_set:
+                boundary_couplings.append((cluster_remap[right], boundary_remap[left], int(coeff)))
+        if not boundary_couplings:
+            continue
+        selected_regions.append(
+            (
+                region_vars,
+                boundary_vars,
+                internal_q2,
+                tuple(boundary_couplings),
+            )
+        )
+        selected_cluster_vars.update(cluster_set)
+        if len(selected_regions) >= _Q3_FREE_SMALL_BOUNDARY_REGION_MAX_REGIONS:
+            break
+
+    if not selected_regions:
+        return None
+
+    core_vars = tuple(var for var in range(q.n) if var not in selected_cluster_vars)
+    core_remap = {var: idx for idx, var in enumerate(core_vars)}
+    core_q2 = {
+        (core_remap[i], core_remap[j]): coeff
+        for (i, j), coeff in q.q2.items()
+        if i in core_remap and j in core_remap
+    }
+    mod_q1 = 1 << q.level
+    mod_q2 = max(1, 1 << (q.level - 1))
+    q2_lift = mod_q1 // mod_q2 if mod_q2 else 0
+
+    factor_scopes: list[tuple[int, ...]] = [edge for edge in core_q2]
+    cluster_specs: list[_HalfPhaseClusterSpec] = []
+    for cluster_vars, boundary_vars, internal_q2, boundary_couplings in selected_regions:
+        if not all(var in core_remap for var in boundary_vars):
+            return None
+        boundary_core = tuple(core_remap[var] for var in boundary_vars)
+        factor_scopes.append(boundary_core)
+        cluster_order, _cluster_width = _factor_scope_order(
+            len(cluster_vars),
+            list(internal_q2),
+        )
+        native_treewidth_plan = _build_native_q3_free_treewidth_plan(
+            n_vars=len(cluster_vars),
+            level=q.level,
+            q2=internal_q2,
+            order=cluster_order,
+        )
+        cluster_specs.append(
+            _HalfPhaseClusterSpec(
+                cluster_vars=cluster_vars,
+                boundary_vars=boundary_core,
+                internal_q2=internal_q2,
+                boundary_couplings=boundary_couplings,
+                boundary_shift_table=_build_cluster_boundary_shift_table(
+                    cluster_size=len(cluster_vars),
+                    boundary_size=len(boundary_vars),
+                    boundary_couplings=boundary_couplings,
+                    q2_lift=q2_lift,
+                    mod_q1=mod_q1,
+                ),
+                cluster_order=tuple(cluster_order),
+                native_treewidth_plan=native_treewidth_plan,
+            )
+        )
+
+    width_limit = _q3_free_treewidth_width_limit()
+    degeneracy_lower_bound = _factor_scope_degeneracy(len(core_vars), factor_scopes)
+    if degeneracy_lower_bound > width_limit:
+        return None
+
+    order, width = _factor_scope_order(len(core_vars), factor_scopes)
+    if width > width_limit:
+        return None
+
+    return _HalfPhaseClusterPlan(
+        level=q.level,
+        core_vars=core_vars,
+        core_q2=core_q2,
+        order=tuple(order),
+        width=width,
+        clusters=tuple(cluster_specs),
+    )
+
+
+def _small_boundary_region_candidates(
+    adjacency: Sequence[set[int]],
+    *,
+    min_region_size: int = _Q3_FREE_SMALL_BOUNDARY_REGION_MIN_SIZE,
+    max_region_size: int = _Q3_FREE_SMALL_BOUNDARY_REGION_MAX_SIZE,
+    max_boundary: int = _Q3_FREE_SMALL_BOUNDARY_REGION_MAX_BOUNDARY,
+) -> tuple[tuple[int, ...], ...]:
+    if not adjacency:
+        return ()
+    leaves = [idx for idx, neighbors in enumerate(adjacency) if len(neighbors) <= 1]
+    roots = list(leaves[:2])
+    if leaves:
+        last_leaf = leaves[-1]
+        if last_leaf not in roots:
+            roots.append(last_leaf)
+    for fallback_root in (0, len(adjacency) - 1):
+        if 0 <= fallback_root < len(adjacency) and fallback_root not in roots:
+            roots.append(fallback_root)
+
+    candidates: dict[tuple[int, ...], tuple[int, int]] = {}
+
+    for root in roots:
+        seen = [False] * len(adjacency)
+        parent = [-1] * len(adjacency)
+        children = [[] for _ in range(len(adjacency))]
+        order: list[int] = []
+        stack = [int(root)]
+        seen[int(root)] = True
+        while stack:
+            node = stack.pop()
+            order.append(node)
+            for neighbor in sorted(adjacency[node], reverse=True):
+                if seen[neighbor]:
+                    continue
+                seen[neighbor] = True
+                parent[neighbor] = node
+                children[node].append(neighbor)
+                stack.append(neighbor)
+        for start in range(len(adjacency)):
+            if seen[start]:
+                continue
+            seen[start] = True
+            stack = [start]
+            while stack:
+                node = stack.pop()
+                order.append(node)
+                for neighbor in sorted(adjacency[node], reverse=True):
+                    if seen[neighbor]:
+                        continue
+                    seen[neighbor] = True
+                    parent[neighbor] = node
+                    children[node].append(neighbor)
+                    stack.append(neighbor)
+
+        tin = [-1] * len(adjacency)
+        tout = [-1] * len(adjacency)
+        for idx, node in enumerate(order):
+            tin[node] = idx
+        subtree_sizes = [1] * len(adjacency)
+        for node in reversed(order):
+            size = 1
+            for child in children[node]:
+                size += subtree_sizes[child]
+            subtree_sizes[node] = size
+            tout[node] = tin[node] + size
+
+        for node in order:
+            size = subtree_sizes[node]
+            if size < int(min_region_size) or size > int(max_region_size):
+                continue
+            region = tuple(sorted(order[tin[node] : tout[node]]))
+            region_set = set(region)
+            boundary: set[int] = set()
+            valid = True
+            for var in region:
+                for neighbor in adjacency[var]:
+                    if neighbor in region_set:
+                        continue
+                    boundary.add(int(neighbor))
+                    if len(boundary) > int(max_boundary):
+                        valid = False
+                        break
+                if not valid:
+                    break
+            if not valid or not boundary:
+                continue
+            score = (len(region), -len(boundary))
+            existing = candidates.get(region)
+            if existing is None or score > existing:
+                candidates[region] = score
+
+    ranked = sorted(
+        candidates.items(),
+        key=lambda item: (item[1][0], item[1][1], -item[0][0]),
+        reverse=True,
+    )
+    return tuple(region for region, _score in ranked)
+
+
+def _articulation_boundary_region_candidates(
+    adjacency: Sequence[set[int]],
+    *,
+    min_region_size: int = _Q3_FREE_SMALL_BOUNDARY_REGION_MIN_SIZE,
+    max_region_size: int = _Q3_FREE_SMALL_BOUNDARY_REGION_MAX_SIZE,
+    max_boundary: int = _Q3_FREE_SMALL_BOUNDARY_REGION_MAX_BOUNDARY,
+) -> tuple[tuple[int, ...], ...]:
+    if not adjacency:
+        return ()
+
+    n = len(adjacency)
+    disc = [-1] * n
+    low = [0] * n
+    parent = [-1] * n
+    time = 0
+    articulation: set[int] = set()
+
+    for root in range(n):
+        if disc[root] != -1:
+            continue
+        stack: list[tuple[int, int, bool]] = [(root, 0, False)]
+        root_children = 0
+        while stack:
+            node, idx, returning = stack.pop()
+            if not returning:
+                if disc[node] == -1:
+                    disc[node] = time
+                    low[node] = time
+                    time += 1
+                neighbors = sorted(adjacency[node])
+                if idx < len(neighbors):
+                    neighbor = neighbors[idx]
+                    stack.append((node, idx + 1, False))
+                    if disc[neighbor] == -1:
+                        parent[neighbor] = node
+                        if node == root:
+                            root_children += 1
+                        stack.append((node, neighbor, True))
+                        stack.append((neighbor, 0, False))
+                    elif neighbor != parent[node]:
+                        low[node] = min(low[node], disc[neighbor])
+                continue
+
+            child = idx
+            low[node] = min(low[node], low[child])
+            if parent[node] != -1 and low[child] >= disc[node]:
+                articulation.add(node)
+        if root_children > 1:
+            articulation.add(root)
+
+    candidates: dict[tuple[int, ...], tuple[int, int]] = {}
+    for cut in articulation:
+        seen = {cut}
+        for start in sorted(adjacency[cut]):
+            if start in seen:
+                continue
+            stack = [start]
+            component: list[int] = []
+            seen.add(start)
+            while stack:
+                node = stack.pop()
+                component.append(node)
+                for neighbor in adjacency[node]:
+                    if neighbor in seen:
+                        continue
+                    seen.add(neighbor)
+                    stack.append(neighbor)
+            region = tuple(sorted(component))
+            if (
+                len(region) < int(min_region_size)
+                or len(region) > int(max_region_size)
+            ):
+                continue
+            region_set = set(region)
+            boundary = {
+                int(neighbor)
+                for var in region
+                for neighbor in adjacency[var]
+                if neighbor not in region_set
+            }
+            if not boundary or len(boundary) > int(max_boundary):
+                continue
+            score = (len(region), -len(boundary))
+            existing = candidates.get(region)
+            if existing is None or score > existing:
+                candidates[region] = score
+
+    ranked = sorted(
+        candidates.items(),
+        key=lambda item: (item[1][0], item[1][1], -item[0][0]),
+        reverse=True,
+    )
+    return tuple(region for region, _score in ranked)
+
+
+def _q2_block_cut_decomposition(
+    adjacency: Sequence[set[int]],
+) -> tuple[tuple[tuple[int, ...], ...], frozenset[int]]:
+    """Return biconnected blocks plus articulation vertices of q2 graph."""
+    if not adjacency:
+        return (), frozenset()
+
+    n = len(adjacency)
+    disc = [-1] * n
+    low = [0] * n
+    parent = [-1] * n
+    time = 0
+    articulation: set[int] = set()
+    blocks: list[tuple[int, ...]] = []
+    edge_stack: list[tuple[int, int]] = []
+
+    for root in range(n):
+        if disc[root] != -1:
+            continue
+        disc[root] = time
+        low[root] = time
+        time += 1
+        root_children = 0
+        stack: list[tuple[int, list[int], int]] = [(root, sorted(adjacency[root]), 0)]
+        while stack:
+            node, neighbors, idx = stack[-1]
+            if idx < len(neighbors):
+                neighbor = neighbors[idx]
+                stack[-1] = (node, neighbors, idx + 1)
+                if disc[neighbor] == -1:
+                    parent[neighbor] = node
+                    if node == root:
+                        root_children += 1
+                    edge_stack.append((node, neighbor))
+                    disc[neighbor] = time
+                    low[neighbor] = time
+                    time += 1
+                    stack.append((neighbor, sorted(adjacency[neighbor]), 0))
+                    continue
+                if neighbor != parent[node] and disc[neighbor] < disc[node]:
+                    edge_stack.append((node, neighbor))
+                    low[node] = min(low[node], disc[neighbor])
+                continue
+
+            stack.pop()
+            if parent[node] != -1:
+                parent_node = parent[node]
+                low[parent_node] = min(low[parent_node], low[node])
+                if low[node] >= disc[parent_node]:
+                    articulation.add(parent_node)
+                    block_vertices: set[int] = set()
+                    while edge_stack:
+                        left, right = edge_stack.pop()
+                        block_vertices.add(left)
+                        block_vertices.add(right)
+                        if (left == parent_node and right == node) or (left == node and right == parent_node):
+                            break
+                    if block_vertices:
+                        blocks.append(tuple(sorted(block_vertices)))
+            elif root_children <= 1:
+                articulation.discard(root)
+            if parent[node] == -1 and edge_stack:
+                block_vertices = set()
+                while edge_stack:
+                    left, right = edge_stack.pop()
+                    block_vertices.add(left)
+                    block_vertices.add(right)
+                if block_vertices:
+                    blocks.append(tuple(sorted(block_vertices)))
+
+    unique_blocks: list[tuple[int, ...]] = []
+    seen_blocks: set[tuple[int, ...]] = set()
+    for block in blocks:
+        if block not in seen_blocks:
+            seen_blocks.add(block)
+            unique_blocks.append(block)
+    return tuple(unique_blocks), frozenset(articulation)
+
+
+def _block_cut_boundary_region_candidates(
+    adjacency: Sequence[set[int]],
+    *,
+    min_region_size: int = _Q3_FREE_SMALL_BOUNDARY_REGION_MIN_SIZE,
+    max_region_size: int = _Q3_FREE_SMALL_BOUNDARY_REGION_MAX_SIZE,
+    max_boundary: int = _Q3_FREE_SMALL_BOUNDARY_REGION_MAX_BOUNDARY,
+) -> tuple[tuple[int, ...], ...]:
+    if not adjacency:
+        return ()
+    blocks, articulation = _q2_block_cut_decomposition(adjacency)
+
+    if not blocks:
+        return ()
+
+    block_neighbors: list[set[int]] = [set() for _ in range(len(blocks))]
+    articulation_blocks: dict[int, set[int]] = {}
+    for block_idx, block in enumerate(blocks):
+        block_set = set(block)
+        for var in block:
+            if var in articulation:
+                articulation_blocks.setdefault(var, set()).add(block_idx)
+                block_neighbors[block_idx].add(var)
+
+    candidates: dict[tuple[int, ...], tuple[int, int]] = {}
+
+    def add_region(region_vars: set[int], boundary_vars: set[int]) -> None:
+        region = tuple(sorted(int(var) for var in region_vars))
+        boundary = tuple(sorted(int(var) for var in boundary_vars if var not in region_vars))
+        if (
+            len(region) < int(min_region_size)
+            or len(region) > int(max_region_size)
+            or not boundary
+            or len(boundary) > int(max_boundary)
+        ):
+            return
+        score = (len(region), -len(boundary))
+        existing = candidates.get(region)
+        if existing is None or score > existing:
+            candidates[region] = score
+
+    for start_block_idx, block in enumerate(blocks):
+        block_set = set(block)
+        external_articulations = {var for var in block if var in articulation}
+        add_region(block_set - external_articulations, external_articulations)
+
+        for root_articulation in sorted(external_articulations):
+            seen_blocks = {start_block_idx}
+            seen_articulations = {root_articulation}
+            branch_blocks = [start_block_idx]
+            frontier_blocks = [start_block_idx]
+            while frontier_blocks:
+                block_idx = frontier_blocks.pop()
+                for art in block_neighbors[block_idx]:
+                    if art == root_articulation:
+                        continue
+                    if art in seen_articulations:
+                        continue
+                    seen_articulations.add(art)
+                    for next_block_idx in articulation_blocks.get(art, ()):
+                        if next_block_idx in seen_blocks:
+                            continue
+                        seen_blocks.add(next_block_idx)
+                        branch_blocks.append(next_block_idx)
+                        frontier_blocks.append(next_block_idx)
+
+            branch_vertices: set[int] = set()
+            for block_idx in branch_blocks:
+                branch_vertices.update(blocks[block_idx])
+
+            boundary_vars: set[int] = {root_articulation}
+            for art in sorted(branch_vertices & articulation):
+                attached = articulation_blocks.get(art, set())
+                if any(block_idx not in seen_blocks for block_idx in attached):
+                    boundary_vars.add(art)
+
+            add_region(branch_vertices - boundary_vars, boundary_vars)
+
+    ranked = sorted(
+        candidates.items(),
+        key=lambda item: (item[1][0], item[1][1], -item[0][0]),
+        reverse=True,
+    )
+    return tuple(region for region, _score in ranked)
+
+
+def _build_small_boundary_region_plan(q) -> _HalfPhaseClusterPlan | None:
+    """Collapse exact small-boundary regions onto a remaining q2 core."""
+    if q.q3 or not q.q2:
+        return None
+    adjacency = _build_q2_adjacency(q)
+    candidate_regions: list[tuple[int, ...]] = []
+    seen_regions: set[tuple[int, ...]] = set()
+    for region in _small_boundary_region_candidates(adjacency):
+        if region not in seen_regions:
+            seen_regions.add(region)
+            candidate_regions.append(region)
+    for region in _articulation_boundary_region_candidates(adjacency):
+        if region not in seen_regions:
+            seen_regions.add(region)
+            candidate_regions.append(region)
+    for region in _block_cut_boundary_region_candidates(adjacency):
+        if region not in seen_regions:
+            seen_regions.add(region)
+            candidate_regions.append(region)
+    candidates = tuple(candidate_regions[: _Q3_FREE_SMALL_BOUNDARY_REGION_MAX_REGIONS * 4])
+    if not candidates:
+        return None
+    return _build_selected_boundary_region_plan(
+        q,
+        adjacency=adjacency,
+        candidate_regions=candidates,
+    )
+
+
+def _build_block_cut_tree_region_plan(q) -> _HalfPhaseClusterPlan | None:
+    """Exactly contract block-cut tree lobes onto articulation-variable core."""
+    if q.q3 or not q.q2:
+        return None
+    cache_key = _q_structure_key(q)
+    cached = _STRUCTURE_Q3_FREE_BLOCK_CUT_PLAN_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
+    adjacency = _build_q2_adjacency(q)
+    blocks, articulation = _q2_block_cut_decomposition(adjacency)
+    if not blocks or not articulation:
+        _STRUCTURE_Q3_FREE_BLOCK_CUT_PLAN_CACHE[cache_key] = None
+        return None
+
+    selected_clusters: list[
+        tuple[
+            tuple[int, ...],
+            tuple[int, ...],
+            dict[tuple[int, int], int],
+            tuple[tuple[int, int, int], ...],
+        ]
+    ] = []
+    selected_cluster_vars: set[int] = set()
+    for block in blocks:
+        boundary_vars = tuple(sorted(int(var) for var in block if var in articulation))
+        cluster_vars = tuple(sorted(int(var) for var in block if var not in articulation))
+        if (
+            not cluster_vars
+            or not boundary_vars
+            or len(boundary_vars) > _Q3_FREE_SMALL_BOUNDARY_REGION_MAX_BOUNDARY
+        ):
+            continue
+        cluster_set = set(cluster_vars)
+        boundary_set = set(boundary_vars)
+        cluster_remap = {var: idx for idx, var in enumerate(cluster_vars)}
+        boundary_remap = {var: idx for idx, var in enumerate(boundary_vars)}
+        internal_q2 = {
+            (cluster_remap[i], cluster_remap[j]): coeff
+            for (i, j), coeff in q.q2.items()
+            if i in cluster_set and j in cluster_set
+        }
+        boundary_couplings: list[tuple[int, int, int]] = []
+        for (left, right), coeff in q.q2.items():
+            if coeff % q.mod_q2 == 0:
+                continue
+            if left in cluster_set and right in boundary_set:
+                boundary_couplings.append((cluster_remap[left], boundary_remap[right], int(coeff)))
+            elif right in cluster_set and left in boundary_set:
+                boundary_couplings.append((cluster_remap[right], boundary_remap[left], int(coeff)))
+        if not boundary_couplings:
+            continue
+        selected_clusters.append(
+            (
+                cluster_vars,
+                boundary_vars,
+                internal_q2,
+                tuple(boundary_couplings),
+            )
+        )
+        selected_cluster_vars.update(cluster_vars)
+
+    if not selected_clusters:
+        _STRUCTURE_Q3_FREE_BLOCK_CUT_PLAN_CACHE[cache_key] = None
+        return None
+
+    core_vars = tuple(var for var in range(q.n) if var not in selected_cluster_vars)
+    core_remap = {var: idx for idx, var in enumerate(core_vars)}
+    core_q2 = {
+        (core_remap[i], core_remap[j]): coeff
+        for (i, j), coeff in q.q2.items()
+        if i in core_remap and j in core_remap
+    }
+    mod_q1 = 1 << q.level
+    mod_q2 = max(1, 1 << (q.level - 1))
+    q2_lift = mod_q1 // mod_q2 if mod_q2 else 0
+
+    factor_scopes: list[tuple[int, ...]] = [edge for edge in core_q2]
+    cluster_specs: list[_HalfPhaseClusterSpec] = []
+    for cluster_vars, boundary_vars, internal_q2, boundary_couplings in selected_clusters:
+        if not all(var in core_remap for var in boundary_vars):
+            _STRUCTURE_Q3_FREE_BLOCK_CUT_PLAN_CACHE[cache_key] = None
+            return None
+        boundary_core = tuple(core_remap[var] for var in boundary_vars)
+        factor_scopes.append(boundary_core)
+        cluster_order, cluster_width = _factor_scope_order(
+            len(cluster_vars),
+            list(internal_q2),
+        )
+        if cluster_width > _q3_free_treewidth_width_limit():
+            _STRUCTURE_Q3_FREE_BLOCK_CUT_PLAN_CACHE[cache_key] = None
+            return None
+        native_treewidth_plan = _build_native_q3_free_treewidth_plan(
+            n_vars=len(cluster_vars),
+            level=q.level,
+            q2=internal_q2,
+            order=cluster_order,
+        )
+        cluster_specs.append(
+            _HalfPhaseClusterSpec(
+                cluster_vars=cluster_vars,
+                boundary_vars=boundary_core,
+                internal_q2=internal_q2,
+                boundary_couplings=boundary_couplings,
+                boundary_shift_table=_build_cluster_boundary_shift_table(
+                    cluster_size=len(cluster_vars),
+                    boundary_size=len(boundary_vars),
+                    boundary_couplings=boundary_couplings,
+                    q2_lift=q2_lift,
+                    mod_q1=mod_q1,
+                ),
+                cluster_order=tuple(cluster_order),
+                native_treewidth_plan=native_treewidth_plan,
+            )
+        )
+
+    width_limit = _q3_free_treewidth_width_limit()
+    degeneracy_lower_bound = _factor_scope_degeneracy(len(core_vars), factor_scopes)
+    if degeneracy_lower_bound > width_limit:
+        _STRUCTURE_Q3_FREE_BLOCK_CUT_PLAN_CACHE[cache_key] = None
+        return None
+
+    order, width = _factor_scope_order(len(core_vars), factor_scopes)
+    if width > width_limit:
+        _STRUCTURE_Q3_FREE_BLOCK_CUT_PLAN_CACHE[cache_key] = None
+        return None
+
+    plan = _HalfPhaseClusterPlan(
+        level=q.level,
+        core_vars=core_vars,
+        core_q2=core_q2,
+        order=tuple(order),
+        width=width,
+        clusters=tuple(cluster_specs),
+    )
+    _STRUCTURE_Q3_FREE_BLOCK_CUT_PLAN_CACHE[cache_key] = plan
+    return plan
 
 
 def _build_half_phase_cluster_plan(q) -> _HalfPhaseClusterPlan | None:
@@ -4161,7 +5266,13 @@ def _build_q1_cluster_plan(q) -> _HalfPhaseClusterPlan | None:
     cluster_plan = _build_half_phase_cluster_plan(q)
     if cluster_plan is not None:
         return cluster_plan
-    return _build_generic_q1_cluster_plan(q)
+    cluster_plan = _build_generic_q1_cluster_plan(q)
+    if cluster_plan is not None:
+        return cluster_plan
+    cluster_plan = _build_block_cut_tree_region_plan(q)
+    if cluster_plan is not None:
+        return cluster_plan
+    return _build_small_boundary_region_plan(q)
 
 
 def _fold_phase_shifted_q1_batch(
@@ -4276,12 +5387,18 @@ def _evaluate_half_phase_cluster_plan_scaled(
             _combine_factor_scaled(factors, spec.boundary_vars, table),
         )
 
-    total, _ = _sum_factor_tables_scaled(
+    total = _sum_acyclic_factor_tables_scaled(
         len(cluster_plan.core_vars),
         factors,
-        cluster_plan.order,
         scalar=scalar,
     )
+    if total is None:
+        total, _ = _sum_factor_tables_scaled(
+            len(cluster_plan.core_vars),
+            factors,
+            cluster_plan.order,
+            scalar=scalar,
+        )
     return total
 
 
@@ -4564,12 +5681,18 @@ def _evaluate_half_phase_cluster_plan_scaled_batch(
             factor_exponents,
         )
 
-    totals, _ = _sum_factor_tables_scaled_batch(
+    totals = _sum_acyclic_factor_tables_scaled_batch(
         len(cluster_plan.core_vars),
         factors,
-        cluster_plan.order,
         scalar=(scalar_values, scalar_exponents),
     )
+    if totals is None:
+        totals, _ = _sum_factor_tables_scaled_batch(
+            len(cluster_plan.core_vars),
+            factors,
+            cluster_plan.order,
+            scalar=(scalar_values, scalar_exponents),
+        )
     return totals
 
 
@@ -4642,8 +5765,13 @@ _STRUCTURE_BAD_Q2_COVER_CACHE = _BoundedMemoCache(_STRUCTURE_PHASE3_CACHE_MAX)
 _STRUCTURE_PHASE3_PLAN_CACHE = _BoundedMemoCache(_STRUCTURE_PHASE3_CACHE_MAX)
 _STRUCTURE_PHASE3_TREEWIDTH_FACTOR_CACHE = _BoundedMemoCache(_STRUCTURE_PHASE3_CACHE_MAX)
 _STRUCTURE_PHASE3_TREEWIDTH_NATIVE_PLAN_CACHE = _BoundedMemoCache(_STRUCTURE_PHASE3_CACHE_MAX)
+_STRUCTURE_PHASE3_TREEWIDTH_BATCH_SUPPORT_CACHE = _BoundedMemoCache(_STRUCTURE_PHASE3_CACHE_MAX)
+_STRUCTURE_PHASE3_SUPPORT_PLAN_CACHE = _BoundedMemoCache(_STRUCTURE_PHASE3_CACHE_MAX)
 _STRUCTURE_PHASE3_LEVEL3_NATIVE_PLAN_CACHE = _BoundedMemoCache(_STRUCTURE_PHASE3_CACHE_MAX)
 _STRUCTURE_PHASE3_LEVEL3_NATIVE_PLAN_SEEN_CACHE = _BoundedMemoCache(_STRUCTURE_PHASE3_CACHE_MAX)
+_STRUCTURE_PHASE3_LEVEL3_BATCH_NATIVE_PLAN_CACHE = _BoundedMemoCache(_STRUCTURE_PHASE3_CACHE_MAX)
+_STRUCTURE_PHASE3_GENERIC_BATCH_NATIVE_PLAN_CACHE = _BoundedMemoCache(_STRUCTURE_PHASE3_CACHE_MAX)
+_STRUCTURE_PHASE3_BATCH_FAST_PLAN_CACHE = _BoundedMemoCache(_STRUCTURE_PHASE3_CACHE_MAX)
 _STRUCTURE_PHASE3_FACTOR_CACHE = _BoundedMemoCache(_STRUCTURE_PHASE3_CACHE_MAX)
 _STRUCTURE_Q3_SEPARATOR_CACHE = _BoundedMemoCache(_STRUCTURE_PHASE3_CACHE_MAX)
 _STRUCTURE_Q3_COVER_TEMPLATE_CACHE = _BoundedMemoCache(_STRUCTURE_PHASE3_CACHE_MAX)
@@ -4652,6 +5780,8 @@ _STRUCTURE_Q3_2CORE_CACHE = _BoundedMemoCache(_STRUCTURE_PHASE3_CACHE_MAX)
 _STRUCTURE_Q3_FREE_CUTSET_PLAN_CACHE = _BoundedMemoCache(_STRUCTURE_PHASE3_CACHE_MAX)
 _STRUCTURE_Q3_FREE_TENSOR_HINT_CACHE = _BoundedMemoCache(_STRUCTURE_PHASE3_CACHE_MAX)
 _STRUCTURE_Q3_FREE_EXECUTION_PLAN_CACHE = _BoundedMemoCache(_STRUCTURE_PHASE3_CACHE_MAX)
+_STRUCTURE_Q3_FREE_REUSABLE_EXECUTION_PLAN_CACHE = _BoundedMemoCache(_STRUCTURE_PHASE3_CACHE_MAX)
+_STRUCTURE_Q3_FREE_BLOCK_CUT_PLAN_CACHE = _BoundedMemoCache(_STRUCTURE_PHASE3_CACHE_MAX)
 _STRUCTURE_Q3_FREE_REFINED_ORDER_CACHE = _BoundedMemoCache(_STRUCTURE_PHASE3_CACHE_MAX)
 _STRUCTURE_PHASE3_REFINED_ORDER_CACHE = _BoundedMemoCache(_STRUCTURE_PHASE3_CACHE_MAX)
 _STRUCTURE_INTERACTION_GRAPH_CACHE = _BoundedMemoCache(_STRUCTURE_PHASE3_CACHE_MAX)
@@ -4887,6 +6017,108 @@ def _q_q3_support_key(q):
             hasher.update(_PACK_QKEY_Q3.pack(i, j, k, 1))
     return _cache_phase_structure_key(q, "_schur_q3_support_key", (q.n, q.level, hasher.digest()))
 
+
+def _q_cubic_treewidth_batch_support_key(q):
+    hasher = hashlib.blake2b(digest_size=20)
+    hasher.update(_PACK_QSTRUCT_HEADER.pack(q.n, q.level))
+    for (i, j), coeff in q.q2.items():
+        if coeff % q.mod_q2:
+            hasher.update(_PACK_QKEY_Q2.pack(i, j, 1))
+    for (i, j, k), coeff in q.q3.items():
+        if coeff % q.mod_q3:
+            hasher.update(_PACK_QKEY_Q3.pack(i, j, k, 1))
+    return (q.n, q.level, hasher.digest())
+
+
+def _build_cubic_treewidth_batch_support(q):
+    cache_key = _q_cubic_treewidth_batch_support_key(q)
+    cached = _STRUCTURE_PHASE3_TREEWIDTH_BATCH_SUPPORT_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
+    q2_support = tuple(
+        sorted(
+            (int(i), int(j))
+            for (i, j), coeff in q.q2.items()
+            if coeff % q.mod_q2
+        )
+    )
+    q3_support = tuple(
+        sorted(
+            (int(i), int(j), int(k))
+            for (i, j, k), coeff in q.q3.items()
+            if coeff % q.mod_q3
+        )
+    )
+    cached = (q2_support, q3_support)
+    _STRUCTURE_PHASE3_TREEWIDTH_BATCH_SUPPORT_CACHE[cache_key] = cached
+    return cached
+
+
+def _phase3_support_plan(q):
+    """Return a support-only Phase-3 plan reusable across coefficient changes."""
+    cache_key = _q_cubic_treewidth_batch_support_key(q)
+    cached = _STRUCTURE_PHASE3_SUPPORT_PLAN_CACHE.get(cache_key)
+    if cached is not None:
+        cover, order, width, structural_obstruction, fully_peeled = cached
+        return list(cover), list(order), width, structural_obstruction, fully_peeled
+
+    cover = tuple(_minimum_q3_vertex_cover_uncached(q))
+    order, width = _min_fill_cubic_order_uncached(q)
+    core_vars, peel_order = _q3_hypergraph_2core(q)
+    core_cover_size = _q3_core_cover_size(q, core_vars) if q.q3 else 0
+    if peel_order:
+        peel_set = set(peel_order)
+        order = peel_order + [var for var in order if var not in peel_set]
+        width = _treewidth_order_width(q, order)
+    if q.q3:
+        order, width = _finalize_phase3_treewidth_order(q, order)
+    structural_obstruction = min(core_cover_size, width) if q.q3 else 0
+    fully_peeled = bool(peel_order) and not core_vars
+
+    cached = (
+        tuple(int(var) for var in cover),
+        tuple(int(var) for var in order),
+        int(width),
+        int(structural_obstruction),
+        bool(fully_peeled),
+    )
+    _STRUCTURE_PHASE3_SUPPORT_PLAN_CACHE[cache_key] = cached
+    cover, order, width, structural_obstruction, fully_peeled = cached
+    return list(cover), list(order), int(width), int(structural_obstruction), bool(fully_peeled)
+
+
+def _phase3_batch_support_plan_fast(q):
+    """Return a cheap support-only plan for repeated native batch evaluation."""
+    cache_key = _q_cubic_treewidth_batch_support_key(q)
+    cached = _STRUCTURE_PHASE3_BATCH_FAST_PLAN_CACHE.get(cache_key)
+    if cached is not None:
+        cover, order, width, structural_obstruction, fully_peeled = cached
+        return list(cover), list(order), width, structural_obstruction, fully_peeled
+
+    cover = tuple(_minimum_q3_vertex_cover_uncached(q))
+    order, width = _min_degree_cubic_order_uncached(q)
+    core_vars, peel_order = _q3_hypergraph_2core(q)
+    core_cover_size = _q3_core_cover_size(q, core_vars) if q.q3 else 0
+    if peel_order:
+        peel_set = set(peel_order)
+        order = peel_order + [var for var in order if var not in peel_set]
+        width = _treewidth_order_width(q, order)
+    structural_obstruction = min(core_cover_size, width) if q.q3 else 0
+    fully_peeled = bool(peel_order) and not core_vars
+
+    cached = (
+        tuple(int(var) for var in cover),
+        tuple(int(var) for var in order),
+        int(width),
+        int(structural_obstruction),
+        bool(fully_peeled),
+    )
+    _STRUCTURE_PHASE3_BATCH_FAST_PLAN_CACHE[cache_key] = cached
+    cover, order, width, structural_obstruction, fully_peeled = cached
+    return list(cover), list(order), int(width), int(structural_obstruction), bool(fully_peeled)
+
+
 def _phase_function_from_parts(n, *, level, q0, q1, q2, q3):
     phase = PhaseFunction.__new__(PhaseFunction)
     phase.n = n
@@ -4917,6 +6149,17 @@ def _phase_function_from_parts_mutable(n, *, level, q0, q1, q2, q3):
     return phase
 
 
+@lru_cache(maxsize=1 << 15)
+def _direct_affine_mask_pattern(mask: int) -> _DirectAffineMaskPattern:
+    support = tuple(int(idx) for idx in _support_from_mask(int(mask)))
+    pairs = tuple((int(left), int(right)) for left, right in combinations(support, 2))
+    triples = tuple(
+        (int(left), int(middle), int(right))
+        for left, middle, right in combinations(support, 3)
+    )
+    return _DirectAffineMaskPattern(support=support, pairs=pairs, triples=triples)
+
+
 def _copy_cubic_function(q):
     phase = _phase_function_from_parts(
         q.n,
@@ -4928,6 +6171,407 @@ def _copy_cubic_function(q):
     )
     phase._schur_mutable = True
     return phase
+
+
+def _copy_cubic_function_extended(q, final_n: int):
+    target_n = max(int(final_n), int(q.n))
+    q1 = list(q.q1)
+    if target_n > int(q.n):
+        q1.extend([0] * (target_n - int(q.n)))
+    phase = _phase_function_from_parts(
+        target_n,
+        level=q.level,
+        q0=q.q0,
+        q1=q1,
+        q2=dict(q.q2),
+        q3=dict(q.q3),
+    )
+    phase._schur_mutable = True
+    return phase
+
+
+def _lift_direct_linear_coeff(level: int, coeff: int, precision_level: int) -> int:
+    modulus = 1 << int(level)
+    return (int(coeff) * (1 << (int(level) - int(precision_level)))) % modulus
+
+
+def _lift_direct_quadratic_coeff(level: int, coeff: int, precision_level: int) -> int:
+    modulus = max(1, 1 << (int(level) - 1))
+    return (int(coeff) * (1 << (int(level) - int(precision_level)))) % modulus
+
+
+def _build_post_replay_state(
+    base_state: SchurState,
+    observable_gates: Sequence[Gate],
+    inverse_gates: Sequence[Gate],
+) -> SchurState:
+    state = _fork_state_for_extension(base_state)
+    _apply_gate_sequence_to_state(state, observable_gates + inverse_gates)
+    state._flush_pending_dead_variables()
+    return state
+
+
+def _build_direct_post_replay_validation_observable(observables: Sequence[str]) -> str | None:
+    if not observables:
+        return None
+    if len(observables) == 1:
+        return observables[0]
+    n_qubits = len(observables[0])
+    chosen = ["I"] * n_qubits
+    saw_non_identity = False
+    for qubit in range(n_qubits):
+        for pauli in ("Y", "X", "Z"):
+            if any(observable[qubit] == pauli for observable in observables):
+                chosen[qubit] = pauli
+                saw_non_identity = True
+                break
+    return "".join(chosen) if saw_non_identity else observables[0]
+
+
+def _build_direct_post_replay_template(
+    base_state: SchurState,
+    inverse_gates: Sequence[Gate],
+    observable_count: int,
+) -> _DirectPostReplayTemplate | None:
+    if (
+        observable_count < _DIRECT_POST_REPLAY_MIN_OBSERVABLES
+        or len(inverse_gates) < _DIRECT_POST_REPLAY_MIN_SUFFIX_GATES
+        or base_state._arbitrary_phases
+    ):
+        return None
+
+    level = int(base_state.q.level)
+    if level < 3:
+        return None
+
+    diag_coeffs: dict[tuple[int, int], int] = {}
+    quad_coeffs: dict[tuple[int, int], int] = {}
+
+    def linear_coeff(coeff: int, precision_level: int) -> int:
+        key = (int(coeff), int(precision_level))
+        cached = diag_coeffs.get(key)
+        if cached is None:
+            cached = _lift_direct_linear_coeff(level, coeff, precision_level)
+            diag_coeffs[key] = cached
+        return cached
+
+    def quadratic_coeff(coeff: int, precision_level: int) -> int:
+        key = (int(coeff), int(precision_level))
+        cached = quad_coeffs.get(key)
+        if cached is None:
+            cached = _lift_direct_quadratic_coeff(level, coeff, precision_level)
+            quad_coeffs[key] = cached
+        return cached
+
+    rows = [int(mask) for mask in base_state.eps]
+    m = int(base_state.m)
+    scalar_half_pow2_delta = 0
+    suffix_ops: list[tuple[int, ...]] = []
+
+    for gate in inverse_gates:
+        name = gate[0]
+        if name == "x":
+            suffix_ops.append((0, int(gate[1])))
+            continue
+        if name == "cnot":
+            control = int(gate[1])
+            target = int(gate[2])
+            suffix_ops.append((1, control, target))
+            rows[target] ^= rows[control]
+            continue
+        if name == "rz_dyadic":
+            qubit = int(gate[1])
+            coeff = linear_coeff(int(gate[2]), int(gate[3]))
+            suffix_ops.append((2, qubit, int(rows[qubit]), coeff))
+            continue
+        if name == "t":
+            qubit = int(gate[1])
+            suffix_ops.append((2, qubit, int(rows[qubit]), linear_coeff(1, 3)))
+            continue
+        if name == "tdg":
+            qubit = int(gate[1])
+            suffix_ops.append((2, qubit, int(rows[qubit]), linear_coeff(-1, 3)))
+            continue
+        if name == "s":
+            qubit = int(gate[1])
+            suffix_ops.append((2, qubit, int(rows[qubit]), linear_coeff(2, 3)))
+            continue
+        if name == "sdg":
+            qubit = int(gate[1])
+            suffix_ops.append((2, qubit, int(rows[qubit]), linear_coeff(-2, 3)))
+            continue
+        if name == "z":
+            qubit = int(gate[1])
+            suffix_ops.append((2, qubit, int(rows[qubit]), linear_coeff(4, 3)))
+            continue
+        if name == "rz_pi_16":
+            qubit = int(gate[1])
+            suffix_ops.append((2, qubit, int(rows[qubit]), linear_coeff(1, 5)))
+            continue
+        if name == "rz_pi_16_dg":
+            qubit = int(gate[1])
+            suffix_ops.append((2, qubit, int(rows[qubit]), linear_coeff(-1, 5)))
+            continue
+        if name == "rz_pi_32":
+            qubit = int(gate[1])
+            suffix_ops.append((2, qubit, int(rows[qubit]), linear_coeff(1, 6)))
+            continue
+        if name == "rz_pi_32_dg":
+            qubit = int(gate[1])
+            suffix_ops.append((2, qubit, int(rows[qubit]), linear_coeff(-1, 6)))
+            continue
+        if name == "cz":
+            q0 = int(gate[1])
+            q1 = int(gate[2])
+            suffix_ops.append((3, q0, q1, int(rows[q0]), int(rows[q1]), quadratic_coeff(2, 3)))
+            continue
+        if name == "rzz_dyadic":
+            q0 = int(gate[1])
+            q1 = int(gate[2])
+            coeff = int(gate[3])
+            precision_level = int(gate[4])
+            lifted_linear = linear_coeff(coeff, precision_level)
+            suffix_ops.append((2, q0, int(rows[q0]), lifted_linear))
+            suffix_ops.append((2, q1, int(rows[q1]), lifted_linear))
+            suffix_ops.append(
+                (
+                    3,
+                    q0,
+                    q1,
+                    int(rows[q0]),
+                    int(rows[q1]),
+                    quadratic_coeff(-coeff, precision_level),
+                )
+            )
+            continue
+        if name == "h":
+            qubit = int(gate[1])
+            new_var = m
+            suffix_ops.append((4, qubit, int(rows[qubit]), new_var, linear_coeff(4, 3), quadratic_coeff(2, 3)))
+            rows[qubit] = 1 << new_var
+            m += 1
+            scalar_half_pow2_delta -= 1
+            continue
+        if name == "sx":
+            qubit = int(gate[1])
+            new_var = m
+            suffix_ops.append(
+                (
+                    5,
+                    qubit,
+                    int(rows[qubit]),
+                    new_var,
+                    linear_coeff(1, 3),
+                    linear_coeff(6, 3),
+                    linear_coeff(6, 3),
+                    quadratic_coeff(2, 3),
+                )
+            )
+            rows[qubit] = 1 << new_var
+            m += 1
+            scalar_half_pow2_delta -= 1
+            continue
+        if name == "sxdg":
+            qubit = int(gate[1])
+            new_var = m
+            suffix_ops.append(
+                (
+                    5,
+                    qubit,
+                    int(rows[qubit]),
+                    new_var,
+                    linear_coeff(7, 3),
+                    linear_coeff(2, 3),
+                    linear_coeff(2, 3),
+                    quadratic_coeff(2, 3),
+                )
+            )
+            rows[qubit] = 1 << new_var
+            m += 1
+            scalar_half_pow2_delta -= 1
+            continue
+        return None
+
+    final_rows = tuple(rows)
+    return _DirectPostReplayTemplate(
+        base_rows=tuple(int(mask) for mask in base_state.eps),
+        final_rows=final_rows,
+        final_m=m,
+        suffix_ops=tuple(suffix_ops),
+        scalar_half_pow2_delta=scalar_half_pow2_delta,
+        echelon_cache=_prepare_affine_constraint_cache(base_state.n, m, final_rows),
+        z_coeff=linear_coeff(4, 3),
+        s_coeff=linear_coeff(2, 3),
+        sdg_coeff=linear_coeff(-2, 3),
+    )
+
+
+def _construct_direct_post_replay_payload(
+    base_state: SchurState,
+    observable: str,
+    template: _DirectPostReplayTemplate,
+) -> tuple[tuple[int, ...], complex, int, PhaseFunction]:
+    q = _copy_cubic_function_extended(base_state.q, template.final_m)
+    eps0 = list(base_state.eps0)
+    scalar = complex(base_state.scalar)
+    scalar_half_pow2 = int(base_state.scalar_half_pow2) + int(template.scalar_half_pow2_delta)
+    q1_terms = q.q1
+    q2_terms = q.q2
+    q3_terms = q.q3
+    mod_q1 = int(q.mod_q1)
+    mod_q2 = int(q.mod_q2)
+    mod_q3 = int(q.mod_q3)
+    q0_residue = _phase_fraction_to_residue(q.q0, mod_q1)
+    base_rows = template.base_rows
+
+    def apply_affine_pattern(pattern: _DirectAffineMaskPattern, offset: int, alpha: int) -> None:
+        alpha %= mod_q1
+        if not alpha or not pattern.support:
+            return
+
+        linear = alpha if not offset else (-alpha) % mod_q1
+        pair = (-alpha) % mod_q2 if not offset else alpha % mod_q2
+        cubic = alpha % mod_q3 if not offset else (-alpha) % mod_q3
+
+        if linear:
+            for idx in pattern.support:
+                q1_terms[idx] = (q1_terms[idx] + linear) % mod_q1
+
+        if pair:
+            for key in pattern.pairs:
+                value = (q2_terms.get(key, 0) + pair) % mod_q2
+                if value:
+                    q2_terms[key] = value
+                elif key in q2_terms:
+                    del q2_terms[key]
+
+        if cubic:
+            for key in pattern.triples:
+                value = (q3_terms.get(key, 0) + cubic) % mod_q3
+                if value:
+                    q3_terms[key] = value
+                elif key in q3_terms:
+                    del q3_terms[key]
+
+    def apply_diag_pattern(pattern: _DirectAffineMaskPattern, shift: int, alpha: int) -> None:
+        nonlocal q0_residue
+        if shift:
+            q0_residue = (q0_residue + int(alpha)) % mod_q1
+        apply_affine_pattern(pattern, shift, alpha)
+
+    def apply_bilinear_patterns(
+        pattern0: _DirectAffineMaskPattern,
+        shift0: int,
+        pattern1: _DirectAffineMaskPattern,
+        shift1: int,
+        xor_pattern: _DirectAffineMaskPattern,
+        coeff: int,
+    ) -> None:
+        nonlocal q0_residue
+        coeff %= mod_q2
+        if not coeff:
+            return
+        if shift0 and shift1:
+            q0_residue = (q0_residue + int(coeff)) % mod_q1
+        apply_affine_pattern(pattern0, shift0, coeff)
+        apply_affine_pattern(pattern1, shift1, coeff)
+        apply_affine_pattern(xor_pattern, shift0 ^ shift1, (-coeff) % mod_q1)
+
+    for qubit, pauli in enumerate(observable):
+        pattern = _direct_affine_mask_pattern(int(base_rows[qubit]))
+        if pauli == "I":
+            continue
+        if pauli == "X":
+            eps0[qubit] ^= 1
+            continue
+        if pauli == "Z":
+            apply_diag_pattern(pattern, eps0[qubit], template.z_coeff)
+            continue
+        apply_diag_pattern(pattern, eps0[qubit], template.sdg_coeff)
+        eps0[qubit] ^= 1
+        apply_diag_pattern(pattern, eps0[qubit], template.s_coeff)
+
+    for op in template.suffix_ops:
+        code = int(op[0])
+        if code == 0:
+            eps0[int(op[1])] ^= 1
+            continue
+        if code == 1:
+            control = int(op[1])
+            target = int(op[2])
+            eps0[target] ^= eps0[control]
+            continue
+        if code == 2:
+            qubit = int(op[1])
+            apply_diag_pattern(_direct_affine_mask_pattern(int(op[2])), eps0[qubit], int(op[3]))
+            continue
+        if code == 3:
+            q0 = int(op[1])
+            q1_idx = int(op[2])
+            pattern0 = _direct_affine_mask_pattern(int(op[3]))
+            pattern1 = _direct_affine_mask_pattern(int(op[4]))
+            xor_pattern = _direct_affine_mask_pattern(int(op[3]) ^ int(op[4]))
+            apply_bilinear_patterns(pattern0, eps0[q0], pattern1, eps0[q1_idx], xor_pattern, int(op[5]))
+            continue
+        if code == 4:
+            qubit = int(op[1])
+            old_mask = int(op[2])
+            new_var = int(op[3])
+            if old_mask:
+                for old_var in _direct_affine_mask_pattern(old_mask).support:
+                    key = (old_var, new_var) if old_var < new_var else (new_var, old_var)
+                    value = (q2_terms.get(key, 0) + int(op[5])) % mod_q2
+                    if value:
+                        q2_terms[key] = value
+                    elif key in q2_terms:
+                        del q2_terms[key]
+            if eps0[qubit]:
+                q1_terms[new_var] = (q1_terms[new_var] + int(op[4])) % mod_q1
+            eps0[qubit] = 0
+            continue
+
+        qubit = int(op[1])
+        old_mask = int(op[2])
+        new_var = int(op[3])
+        old_pattern = _direct_affine_mask_pattern(old_mask)
+        new_pattern = _direct_affine_mask_pattern(1 << new_var)
+        xor_pattern = _direct_affine_mask_pattern(old_mask ^ (1 << new_var))
+        q0_residue = (q0_residue + int(op[4])) % mod_q1
+        q1_terms[new_var] = (q1_terms[new_var] + int(op[5])) % mod_q1
+        shift = int(eps0[qubit]) & 1
+        if old_pattern.support or shift:
+            apply_diag_pattern(old_pattern, shift, int(op[6]))
+            apply_bilinear_patterns(old_pattern, shift, new_pattern, 0, xor_pattern, int(op[7]))
+        eps0[qubit] = 0
+
+    q.q0 = Fraction(q0_residue, mod_q1)
+    return tuple(int(bit) & 1 for bit in eps0), scalar, scalar_half_pow2, q
+
+
+def _direct_post_replay_payload_matches_state(
+    payload: tuple[tuple[int, ...], complex, int, PhaseFunction],
+    state: SchurState,
+    template: _DirectPostReplayTemplate,
+) -> bool:
+    eps0, scalar, scalar_half_pow2, q = payload
+    if state.m != template.final_m:
+        return False
+    if tuple(int(mask) for mask in state.eps) != template.final_rows:
+        return False
+    if tuple(int(bit) & 1 for bit in state.eps0) != eps0:
+        return False
+    if state.scalar_half_pow2 != scalar_half_pow2:
+        return False
+    if abs(complex(state.scalar) - complex(scalar)) > 1e-12:
+        return False
+    return (
+        int(state.q.n) == int(q.n)
+        and int(state.q.level) == int(q.level)
+        and state.q.q0 == q.q0
+        and list(state.q.q1) == list(q.q1)
+        and dict(state.q.q2) == dict(q.q2)
+        and dict(state.q.q3) == dict(q.q3)
+    )
 
 
 def _evaluate_q_from_mask(q, mask):
@@ -5158,6 +6802,12 @@ def _q3_free_prefers_dense_one_shot_direct(
 
 def _sum_q3_free_via_one_shot_cutset_scaled(q: PhaseFunction) -> ScaledComplex | None:
     """Directly route giant dense q2 kernels through the one-shot cutset planner."""
+    if q.q3 or not q.q2 or _is_half_phase_q2(q):
+        return None
+    if q.n < _Q3_FREE_ONE_SHOT_DIRECT_MIN_VARS:
+        return None
+    if len(q.q2) < int(math.ceil(_Q3_FREE_ONE_SHOT_DIRECT_MIN_Q2_PER_VAR * q.n)):
+        return None
     _order, direct_width = _min_fill_cubic_order(q)
     if not _q3_free_prefers_dense_one_shot_direct(q, direct_width=direct_width):
         return None
@@ -5430,6 +7080,14 @@ def _plan_q3_free_constraint_components(
             continue
 
         feedback_vars = _select_feedback_vertices(component_q.n, chords, depth)
+        cluster_plan = (
+            _build_q1_cluster_plan(component_q)
+            if (
+                max_degree <= 4
+                and component_q.n >= _Q3_FREE_SERIES_CORE_RECURSE_MIN_VARS
+            )
+            else None
+        )
         treewidth_order = _q3_free_treewidth_order(
             component_q,
             len(feedback_vars),
@@ -5442,6 +7100,33 @@ def _plan_q3_free_constraint_components(
                 treewidth_order,
             )
             direct_width = _treewidth_order_width(component_q, treewidth_order)
+            if (
+                cluster_plan is not None
+                and cluster_plan.width <= _q3_free_treewidth_width_limit()
+                and (
+                    cluster_plan.width + 2 < direct_width
+                    or (
+                        prefer_one_shot_slicing
+                        and direct_width >= _Q3_FREE_ONE_SHOT_CUTSET_ACTIVATION_WIDTH
+                    )
+                )
+            ):
+                component_plans.append(
+                    _Q3FreeConstraintComponentPlan(
+                        variables=stored_variables,
+                        level=component_q.level,
+                        q2=component_q.q2,
+                        backend="generic",
+                        binary_phase_plan=binary_phase_plan,
+                        cluster_plan=cluster_plan,
+                        skip_dense_schur=True,
+                        direct_schur_ok=False,
+                        quadratic_tensor_q2=_is_half_phase_q2(component_q),
+                        lambda_offset=lambda_offset,
+                        prefer_reusable_decomposition=prefer_reusable_decomposition,
+                    )
+                )
+                continue
             prefer_one_shot_cutset_candidate = (
                 prefer_one_shot_slicing
                 and direct_width >= _Q3_FREE_ONE_SHOT_CUTSET_ACTIVATION_WIDTH
@@ -5946,6 +7631,59 @@ def _q3_free_execution_plan_cache_key(
     )
 
 
+_Q3_FREE_REUSABLE_EXECUTION_PLAN_PENDING = object()
+
+
+def _q3_free_reusable_execution_plan_cache_key(
+    q: PhaseFunction,
+    *,
+    allow_tensor_contraction: bool,
+    prefer_one_shot_slicing: bool,
+) -> tuple[Any, ...]:
+    return (
+        _q_structure_key(q),
+        tuple(int(var) for var in _qubit_quadratic_tensor_obstruction_support(q)),
+        bool(allow_tensor_contraction),
+        bool(prefer_one_shot_slicing),
+        _get_solver_config(),
+        bool(_quimb_import_enabled()),
+        bool(_kahypar_available()),
+    )
+
+
+def _build_q3_free_reusable_execution_plan(
+    *,
+    q: PhaseFunction,
+    allow_tensor_contraction: bool,
+    prefer_one_shot_slicing: bool = False,
+) -> _Q3FreeReusableExecutionPlan:
+    isolated_vars, component_plans = _plan_q3_free_constraint_components(
+        q,
+        q.n,
+        allow_tensor_contraction=allow_tensor_contraction,
+        prefer_reusable_decomposition=True,
+        prefer_one_shot_slicing=prefer_one_shot_slicing,
+    )
+    return _Q3FreeReusableExecutionPlan(
+        level=q.level,
+        isolated_vars=_compact_index_storage_array(isolated_vars, upper_bound=q.n),
+        components=tuple(component_plans),
+    )
+
+
+def _materialize_q3_free_execution_plan(
+    q: PhaseFunction,
+    reusable_plan: _Q3FreeReusableExecutionPlan,
+) -> _Q3FreeExecutionPlan:
+    return _Q3FreeExecutionPlan(
+        level=q.level,
+        q0=q.q0,
+        q1=_compact_residue_storage_array(q.q1, modulus=q.mod_q1),
+        isolated_vars=reusable_plan.isolated_vars,
+        components=reusable_plan.components,
+    )
+
+
 def _build_q3_free_execution_plan(
     *,
     q: PhaseFunction,
@@ -5971,6 +7709,39 @@ def _build_q3_free_execution_plan(
         if context is not None:
             context.q3_free_constraint_plan_cache[cache_key] = cached
         return cached
+
+    reusable_cache_key = None
+    if q.n >= _Q3_FREE_REUSABLE_EXECUTION_PLAN_MIN_VARS and q.q2:
+        reusable_cache_key = _q3_free_reusable_execution_plan_cache_key(
+            q,
+            allow_tensor_contraction=allow_tensor_contraction,
+            prefer_one_shot_slicing=prefer_one_shot_slicing,
+        )
+        reusable_cached = _STRUCTURE_Q3_FREE_REUSABLE_EXECUTION_PLAN_CACHE.get(reusable_cache_key)
+        if reusable_cached is _Q3_FREE_REUSABLE_EXECUTION_PLAN_PENDING:
+            reusable_cached = _build_q3_free_reusable_execution_plan(
+                q=q,
+                allow_tensor_contraction=allow_tensor_contraction,
+                prefer_one_shot_slicing=prefer_one_shot_slicing,
+            )
+            _STRUCTURE_Q3_FREE_REUSABLE_EXECUTION_PLAN_CACHE[reusable_cache_key] = reusable_cached
+        elif reusable_cached is None and prefer_reusable_decomposition:
+            reusable_cached = _build_q3_free_reusable_execution_plan(
+                q=q,
+                allow_tensor_contraction=allow_tensor_contraction,
+                prefer_one_shot_slicing=prefer_one_shot_slicing,
+            )
+            _STRUCTURE_Q3_FREE_REUSABLE_EXECUTION_PLAN_CACHE[reusable_cache_key] = reusable_cached
+        elif reusable_cached is None:
+            _STRUCTURE_Q3_FREE_REUSABLE_EXECUTION_PLAN_CACHE[reusable_cache_key] = (
+                _Q3_FREE_REUSABLE_EXECUTION_PLAN_PENDING
+            )
+        if isinstance(reusable_cached, _Q3FreeReusableExecutionPlan):
+            plan = _materialize_q3_free_execution_plan(q, reusable_cached)
+            _STRUCTURE_Q3_FREE_EXECUTION_PLAN_CACHE[cache_key] = plan
+            if context is not None:
+                context.q3_free_constraint_plan_cache[cache_key] = plan
+            return plan
 
     isolated_vars, component_plans = _plan_q3_free_constraint_components(
         q,
@@ -6194,6 +7965,8 @@ def _optimize_q3_free_phase(
 ) -> tuple[PhaseFunction, bool]:
     """Apply q3-free optimization only when it improves planned runtime."""
     assert not q.q3, "q3-free optimization expects a q3-free phase function."
+    if q.n > _Q3_FREE_OPTIONAL_REWRITE_MAX_VARS:
+        return q, False
     if (
         baseline_runtime_score is not None
         and _q3_free_runtime_score_is_good_baseline(
@@ -7058,17 +8831,24 @@ def _select_feedback_vertices(n, chords, depth):
     uncovered_count = len(chords)
     uncovered_incident = [len(edges) for edges in incident]
     chosen: list[int] = []
-    candidates = [var for var in range(n) if uncovered_incident[var]]
+    heap: list[tuple[int, int, int]] = []
+    for var in range(n):
+        if uncovered_incident[var]:
+            heapq.heappush(heap, (-uncovered_incident[var], -depth[var], var))
 
     while uncovered_count:
         best = -1
-        best_key: tuple[int, int, int] | None = None
-        for var in candidates:
-            key = (uncovered_incident[var], depth[var], -var)
-            if best_key is None or key > best_key:
-                best = var
-                best_key = key
-        if best < 0 or best_key is None or best_key[0] <= 0:
+        while heap:
+            neg_count, neg_depth, var = heapq.heappop(heap)
+            current_count = uncovered_incident[var]
+            if current_count <= 0:
+                continue
+            if neg_count != -current_count or neg_depth != -depth[var]:
+                heapq.heappush(heap, (-current_count, -depth[var], var))
+                continue
+            best = var
+            break
+        if best < 0:
             raise RuntimeError("Failed to cover q3-free cycle edges.")
         chosen.append(best)
         for edge_idx in incident[best]:
@@ -7079,6 +8859,10 @@ def _select_feedback_vertices(n, chords, depth):
             left, right, _phase = chords[edge_idx]
             uncovered_incident[left] -= 1
             uncovered_incident[right] -= 1
+            if uncovered_incident[left] > 0:
+                heapq.heappush(heap, (-uncovered_incident[left], -depth[left], left))
+            if uncovered_incident[right] > 0:
+                heapq.heappush(heap, (-uncovered_incident[right], -depth[right], right))
     return sorted(chosen)
 
 
@@ -7683,6 +9467,13 @@ def _sum_q3_free_via_gauss_reduction_scaled(q):
             q.q1,
         )
 
+    cluster_plan = _build_q1_cluster_plan(q)
+    if cluster_plan is not None:
+        return _evaluate_half_phase_cluster_plan_scaled(
+            cluster_plan,
+            q.q1,
+        )
+
     one_shot_cutset_total = _sum_q3_free_via_one_shot_cutset_scaled(q)
     if one_shot_cutset_total is not None:
         return one_shot_cutset_total
@@ -7699,13 +9490,6 @@ def _sum_q3_free_via_gauss_reduction_scaled(q):
         bad_q2_cover_total = _sum_q3_free_via_bad_q2_cover_scaled(q, cover=bad_q2_cover)
         if bad_q2_cover_total is not None:
             return bad_q2_cover_total
-
-    cluster_plan = _build_q1_cluster_plan(q)
-    if cluster_plan is not None:
-        return _evaluate_half_phase_cluster_plan_scaled(
-            cluster_plan,
-            q.q1,
-        )
 
     parity_reduced_total = _sum_half_phase_parity_component_reduction_scaled(q)
     if parity_reduced_total is not None:
@@ -7996,6 +9780,43 @@ def _cubic_order_width(q, order):
     return max_scope
 
 
+def _q3_free_series_reduction_core(
+    adjacency: Sequence[Sequence[int] | dict[int, int] | set[int]],
+) -> tuple[tuple[int, ...], tuple[int, ...]]:
+    """Return exact degree-<=2 peel order plus surviving core vertices."""
+    n = len(adjacency)
+    working = [set(int(neighbor) for neighbor in neighbors) for neighbors in adjacency]
+    active = [True] * n
+    pending = deque(
+        idx for idx, neighbors in enumerate(working) if len(neighbors) <= 2
+    )
+    peel_order: list[int] = []
+
+    while pending:
+        var = pending.popleft()
+        if not active[var]:
+            continue
+        neighbors = tuple(sorted(working[var]))
+        if len(neighbors) > 2:
+            continue
+        active[var] = False
+        peel_order.append(int(var))
+        if len(neighbors) == 2:
+            left, right = neighbors
+            if left != right and active[left] and active[right]:
+                working[left].add(right)
+                working[right].add(left)
+        for neighbor in neighbors:
+            if active[neighbor]:
+                working[neighbor].discard(var)
+                if len(working[neighbor]) <= 2:
+                    pending.append(int(neighbor))
+        working[var].clear()
+
+    core_vars = tuple(idx for idx, is_active in enumerate(active) if is_active)
+    return tuple(peel_order), core_vars
+
+
 def _q3_free_treewidth_order(q, feedback_size, order_hint=None, max_degree=None):
     """
     Return a favorable elimination order for a q3-free component, if any.
@@ -8035,6 +9856,59 @@ def _q3_free_treewidth_order(q, feedback_size, order_hint=None, max_degree=None)
         ):
             return None
 
+    if not q.q3 and adjacency is not None and q.n > 3:
+        peel_order, core_vars = _q3_free_series_reduction_core(adjacency)
+        if not core_vars:
+            if _q3_free_treewidth_candidate_is_viable(q, peel_order, 3, feedback_size):
+                return list(peel_order)
+            return None
+        if len(core_vars) < q.n:
+            core_q = _component_restriction(q, core_vars)
+            core_adjacency = [set() for _ in range(core_q.n)]
+            for left, right in core_q.q2:
+                core_adjacency[left].add(right)
+                core_adjacency[right].add(left)
+            core_hint = None
+            if order_hint is not None:
+                core_remap = {var: idx for idx, var in enumerate(core_vars)}
+                filtered_hint = [core_remap[var] for var in order_hint if var in core_remap]
+                if len(filtered_hint) == core_q.n:
+                    core_hint = filtered_hint
+            core_order = _q3_free_treewidth_order(
+                core_q,
+                min(feedback_size, max(2, core_q.n)),
+                order_hint=core_hint,
+                max_degree=max((len(neighbors) for neighbors in core_adjacency), default=0),
+            )
+            if core_order is not None:
+                lifted_order = list(peel_order)
+                lifted_order.extend(int(core_vars[idx]) for idx in core_order)
+                lifted_width = _cubic_order_width(q, lifted_order)
+                if _q3_free_treewidth_candidate_is_viable(
+                    q,
+                    lifted_order,
+                    lifted_width,
+                    feedback_size,
+                ):
+                    return lifted_order
+
+    if (
+        not q.q3
+        and q.n >= _Q3_FREE_CHEAP_ORDER_HINT_MIN_VARS
+        and max_degree is not None
+        and max_degree <= 4
+    ):
+        for cheap_order in _iter_q3_free_cheap_order_hints(q.n, q=q):
+            try:
+                width = _cubic_order_width(q, cheap_order)
+            except ValueError:
+                continue
+            if (
+                width <= width_limit
+                and _q3_free_treewidth_candidate_is_viable(q, cheap_order, width, feedback_size)
+            ):
+                return cheap_order
+
     if max_degree is not None and max_degree <= 4:
         # On sparse strip-like q3-free graphs, min-degree usually lands within
         # one bucket of min-fill at a fraction of the planning cost. This keeps
@@ -8071,6 +9945,96 @@ def _sum_q3_free_component(
     )
 
 
+def _iter_q3_free_cheap_order_hints(
+    n_vars: int,
+    *,
+    q: PhaseFunction | None = None,
+) -> tuple[list[int], ...]:
+    """Return cheap structural order hints for giant low-degree q3-free kernels."""
+    forward = list(range(int(n_vars)))
+    reverse = list(range(int(n_vars) - 1, -1, -1))
+    hints: list[list[int]] = [forward, reverse]
+    if q is not None:
+        separator_order = _pair_graph_separator_order(q)
+        if separator_order is not None:
+            order, _width = separator_order
+            order_key = tuple(int(var) for var in order)
+            if (
+                len(order_key) == int(n_vars)
+                and len(set(order_key)) == int(n_vars)
+                and order_key not in {tuple(forward), tuple(reverse)}
+            ):
+                hints.append(list(order_key))
+    return tuple(hints)
+
+
+def _best_cheap_q3_free_order(
+    q: PhaseFunction,
+    *,
+    order_hint: Sequence[int] | None = None,
+) -> tuple[tuple[int, ...], int]:
+    """Return lowest-width cheap order available for a q3-free kernel."""
+    candidate_orders: list[tuple[int, ...]] = []
+    if order_hint is not None:
+        hint_order = tuple(int(var) for var in order_hint)
+        if len(hint_order) == q.n and len(set(hint_order)) == q.n:
+            candidate_orders.append(hint_order)
+    candidate_orders.extend(
+        tuple(order) for order in _iter_q3_free_cheap_order_hints(q.n, q=q)
+    )
+    if not candidate_orders:
+        raise ValueError("Expected at least one cheap q3-free order candidate.")
+
+    best_order = candidate_orders[0]
+    best_width = _cubic_order_width(q, best_order)
+    for order in candidate_orders[1:]:
+        width = _cubic_order_width(q, order)
+        if width < best_width:
+            best_order = order
+            best_width = width
+    return tuple(best_order), int(best_width)
+
+
+def _cheap_q3_free_work_surrogate(q: PhaseFunction, width: int) -> int:
+    """
+    Cheap structural proxy for q3-free DP work on giant surrogate searches.
+
+    One-shot giant-kernel ranking already uses surrogate widths and skips exact
+    residual planning. Keep work scoring equally cheap so candidate evaluation
+    does not spend most of its time in exact bucket-work estimation.
+    """
+    effective_width = max(0, int(width))
+    scope = min(effective_width + 1, 62)
+    structural_mass = max(1, int(q.n) + int(len(q.q2)))
+    return max(1, structural_mass * (1 << scope))
+
+
+def _native_rank_q3_free_cutset_extensions(
+    q: PhaseFunction,
+    *,
+    selected_vars: Sequence[int],
+    candidate_vars: Sequence[int],
+    remaining_order_hint: Sequence[int] | None = None,
+) -> tuple[tuple[int, int, int], ...] | None:
+    native_rank = _native_symbol("rank_q3_free_cutset_extensions")
+    if native_rank is None or q.q3:
+        return None
+    try:
+        ranked = native_rank(
+            int(q.n),
+            q.q2,
+            tuple(int(var) for var in selected_vars),
+            tuple(int(var) for var in candidate_vars),
+            None if remaining_order_hint is None else tuple(int(var) for var in remaining_order_hint),
+        )
+    except Exception:
+        return None
+    result: list[tuple[int, int, int]] = []
+    for candidate, width, work in ranked:
+        result.append((int(candidate), int(width), int(work)))
+    return tuple(result)
+
+
 def _sum_q3_free_component_scaled(
     q,
     *,
@@ -8087,6 +10051,12 @@ def _sum_q3_free_component_scaled(
     gauss_reduced_total = _sum_q3_free_via_gauss_reduction_scaled(q)
     if gauss_reduced_total is not None:
         return gauss_reduced_total
+    block_cut_plan = _build_block_cut_tree_region_plan(q)
+    if block_cut_plan is not None:
+        return _evaluate_half_phase_cluster_plan_scaled(
+            block_cut_plan,
+            q.q1,
+        )
     binary_total = _sum_binary_phase_quadratic_scaled(q)
     if binary_total is not None:
         return binary_total
@@ -8674,6 +10644,156 @@ def _combine_factor_scaled(factors, scope, table):
     return _ONE_SCALED
 
 
+def _sum_acyclic_factor_tables_scaled(
+    n_vars: int,
+    factors: dict[tuple[int, ...], list[ScaledComplex]],
+    *,
+    scalar: ScaledComplex = _ONE_SCALED,
+) -> ScaledComplex | None:
+    """Exact sum-product on an acyclic variable/factor graph."""
+    factor_items = [(tuple(scope), table) for scope, table in factors.items() if scope]
+    if not factor_items:
+        return _scale_scaled_complex(scalar, 2 * n_vars)
+
+    used_vars = sorted({int(var) for scope, _table in factor_items for var in scope})
+    if not used_vars:
+        return scalar
+
+    factor_neighbors = [tuple(int(var) for var in scope) for scope, _table in factor_items]
+    var_to_factors: dict[int, list[int]] = {var: [] for var in used_vars}
+    for factor_idx, scope in enumerate(factor_neighbors):
+        for var in scope:
+            var_to_factors[var].append(factor_idx)
+
+    edge_count = sum(len(scope) for scope in factor_neighbors)
+    node_count = len(used_vars) + len(factor_items)
+    visited_vars: set[int] = set()
+    visited_factors: set[int] = set()
+    component_roots: list[tuple[str, int]] = []
+
+    for start_var in used_vars:
+        if start_var in visited_vars:
+            continue
+        component_roots.append(("var", start_var))
+        queue: deque[tuple[str, int]] = deque([("var", start_var)])
+        while queue:
+            kind, idx = queue.popleft()
+            if kind == "var":
+                if idx in visited_vars:
+                    continue
+                visited_vars.add(idx)
+                for factor_idx in var_to_factors.get(idx, ()):
+                    if factor_idx not in visited_factors:
+                        queue.append(("factor", factor_idx))
+            else:
+                if idx in visited_factors:
+                    continue
+                visited_factors.add(idx)
+                for var in factor_neighbors[idx]:
+                    if var not in visited_vars:
+                        queue.append(("var", var))
+
+    component_count = len(component_roots)
+    if edge_count != node_count - component_count:
+        return None
+
+    factor_to_var_cache: dict[tuple[int, int], tuple[ScaledComplex, ScaledComplex]] = {}
+    var_to_factor_cache: dict[tuple[int, int], tuple[ScaledComplex, ScaledComplex]] = {}
+
+    def msg_var_to_factor(var: int, parent_factor: int) -> tuple[ScaledComplex, ScaledComplex]:
+        cache_key = (var, parent_factor)
+        cached = var_to_factor_cache.get(cache_key)
+        if cached is not None:
+            return cached
+        values = [_ONE_SCALED, _ONE_SCALED]
+        for factor_idx in var_to_factors.get(var, ()):
+            if factor_idx == parent_factor:
+                continue
+            incoming = msg_factor_to_var(factor_idx, var)
+            values[0] = _mul_scaled_complex(values[0], incoming[0])
+            values[1] = _mul_scaled_complex(values[1], incoming[1])
+        result = (values[0], values[1])
+        var_to_factor_cache[cache_key] = result
+        return result
+
+    def msg_factor_to_var(factor_idx: int, parent_var: int) -> tuple[ScaledComplex, ScaledComplex]:
+        cache_key = (factor_idx, parent_var)
+        cached = factor_to_var_cache.get(cache_key)
+        if cached is not None:
+            return cached
+        scope, table = factor_items[factor_idx]
+        parent_pos = scope.index(parent_var)
+        other_positions = [idx for idx in range(len(scope)) if idx != parent_pos]
+        other_messages = [
+            msg_var_to_factor(scope[pos], factor_idx)
+            for pos in other_positions
+        ]
+        outputs = [_ZERO_SCALED, _ZERO_SCALED]
+        for parent_bit in (0, 1):
+            total = _ZERO_SCALED
+            for assignment in range(1 << len(other_positions)):
+                full_assignment = 0
+                full_assignment |= parent_bit << parent_pos
+                for offset, pos in enumerate(other_positions):
+                    bit = (assignment >> offset) & 1
+                    full_assignment |= bit << pos
+                weight = table[full_assignment]
+                for offset, pos in enumerate(other_positions):
+                    bit = (assignment >> offset) & 1
+                    weight = _mul_scaled_complex(weight, other_messages[offset][bit])
+                total = _add_scaled_complex(total, weight)
+            outputs[parent_bit] = total
+        result = (outputs[0], outputs[1])
+        factor_to_var_cache[cache_key] = result
+        return result
+
+    def component_total_from_var(root_var: int) -> ScaledComplex:
+        incoming = msg_var_to_factor(root_var, -1)
+        return _add_scaled_complex(incoming[0], incoming[1])
+
+    total = scalar
+    used_var_set = set(used_vars)
+    isolated_count = max(0, n_vars - len(used_var_set))
+    if isolated_count:
+        total = _scale_scaled_complex(total, 2 * isolated_count)
+    for kind, idx in component_roots:
+        if kind != "var":
+            continue
+        total = _mul_scaled_complex(total, component_total_from_var(idx))
+    return total
+
+
+def _sum_acyclic_factor_tables_scaled_batch(
+    n_vars: int,
+    factors: dict[tuple[int, ...], tuple[np.ndarray, np.ndarray]],
+    *,
+    scalar: tuple[np.ndarray, np.ndarray],
+) -> list[ScaledComplex] | None:
+    """Batched companion to ``_sum_acyclic_factor_tables_scaled``."""
+    scalar_values, scalar_exponents = scalar
+    batch_size = len(scalar_values)
+    if batch_size == 0:
+        return []
+    row_totals: list[ScaledComplex] = []
+    for row_idx in range(batch_size):
+        row_factors = {
+            tuple(scope): [
+                (complex(values[row_idx, assignment]), int(exponents[row_idx, assignment]))
+                for assignment in range(values.shape[1])
+            ]
+            for scope, (values, exponents) in factors.items()
+        }
+        total = _sum_acyclic_factor_tables_scaled(
+            n_vars,
+            row_factors,
+            scalar=(complex(scalar_values[row_idx]), int(scalar_exponents[row_idx])),
+        )
+        if total is None:
+            return None
+        row_totals.append(total)
+    return row_totals
+
+
 def _factor_table_multiply_scaled_batch(
     left: tuple[np.ndarray, np.ndarray],
     right: tuple[np.ndarray, np.ndarray],
@@ -9132,6 +11252,72 @@ def _q3_free_tensor_slice_hint(q: PhaseFunction) -> tuple[int, ...]:
     return result
 
 
+def _direct_order_guided_q3_free_cutset_plan(
+    q: PhaseFunction,
+    adjacency: Sequence[set[int]],
+    *,
+    preferred: set[int] | None = None,
+    max_size: int,
+    target_remaining_width: int | None = None,
+    allow_generic_remaining: bool = False,
+) -> _Q3FreeCutsetConditioningPlan | None:
+    """Try a tiny fixed-budget cutset plan from cheap order frontier peaks.
+
+    Giant low-degree q3-free kernels spend most of their time in search
+    orchestration, not one candidate evaluation. Before launching a broader
+    one-shot search, try prefixes of the order-guided peak ranking induced by
+    cheap chronological orders. This keeps the cost linear in ``max_size``.
+    """
+    max_size = max(0, int(max_size))
+    if q.q3 or max_size <= 0 or q.n <= 1:
+        return None
+
+    preferred = set() if preferred is None else {int(var) for var in preferred}
+    best_eval: _Q3FreeCutsetCandidateEvaluation | None = None
+    seen_cutsets: set[tuple[int, ...]] = set()
+
+    for cheap_order in _iter_q3_free_cheap_order_hints(q.n, q=q):
+        order_guided = _order_guided_q3_free_cutset_vertices(
+            adjacency,
+            candidate_orders=(cheap_order,),
+            preferred=preferred,
+            max_candidates=max_size,
+        )
+        if not order_guided:
+            continue
+        for size in range(1, min(len(order_guided), max_size) + 1):
+            cutset = tuple(int(var) for var in order_guided[:size])
+            if cutset in seen_cutsets:
+                continue
+            seen_cutsets.add(cutset)
+            evaluation = _evaluate_q3_free_cutset_candidate(
+                q,
+                cutset,
+                remaining_order_hint=cheap_order,
+                prioritize_width=True,
+                target_remaining_width=target_remaining_width,
+                allow_generic_remaining=allow_generic_remaining,
+                prefer_one_shot_slicing=True,
+            )
+            if evaluation is None or not evaluation.viable or evaluation.plan is None:
+                continue
+            if best_eval is None or evaluation.score < best_eval.score:
+                best_eval = evaluation
+                if (
+                    evaluation.plan.remaining_backend == "treewidth"
+                    and evaluation.plan.remaining_width <= _q3_free_treewidth_width_limit()
+                ):
+                    return evaluation.plan
+                if (
+                    target_remaining_width is not None
+                    and evaluation.plan.remaining_width <= int(target_remaining_width)
+                    and _q3_free_cutset_plan_generic_penalty(evaluation.plan) == 0
+                ):
+                    return evaluation.plan
+
+    return None if best_eval is None else best_eval.plan
+
+
 def _candidate_q3_free_cutset_vertices(
     adjacency: Sequence[set[int]],
     *,
@@ -9159,6 +11345,107 @@ def _candidate_q3_free_cutset_vertices(
         )
     scored.sort(reverse=True)
     return tuple(var for *_score, var in scored[: min(len(scored), int(max_candidates))])
+
+
+def _order_guided_q3_free_cutset_vertices(
+    adjacency: Sequence[set[int]],
+    *,
+    candidate_orders: Sequence[Sequence[int]],
+    preferred: set[int] | None = None,
+    max_candidates: int = _Q3_FREE_ONE_SHOT_CUTSET_CANDIDATE_POOL,
+) -> tuple[int, ...]:
+    preferred = set() if preferred is None else {int(var) for var in preferred}
+    n_vars = len(adjacency)
+    if n_vars <= 1 or not candidate_orders:
+        return ()
+
+    aggregate_scores: dict[int, list[int]] = {}
+    peak_cap = max(1, min(int(max_candidates), _Q3_FREE_ORDER_GUIDED_CUTSET_MAX_PEAKS))
+
+    for order in candidate_orders:
+        order_list = [int(var) for var in order]
+        if len(order_list) != n_vars:
+            continue
+        positions = {var: idx for idx, var in enumerate(order_list)}
+        if len(positions) != n_vars:
+            continue
+
+        diff = [0] * n_vars
+        interval_lo = [positions[var] for var in range(n_vars)]
+        interval_hi = [positions[var] for var in range(n_vars)]
+
+        for left, neighbors in enumerate(adjacency):
+            left_pos = positions[left]
+            for right in neighbors:
+                if right <= left:
+                    continue
+                right_pos = positions[right]
+                lo = min(left_pos, right_pos)
+                hi = max(left_pos, right_pos)
+                if lo < hi:
+                    diff[lo] += 1
+                    diff[hi] -= 1
+                interval_lo[left] = min(interval_lo[left], right_pos)
+                interval_hi[left] = max(interval_hi[left], right_pos)
+                interval_lo[right] = min(interval_lo[right], left_pos)
+                interval_hi[right] = max(interval_hi[right], left_pos)
+
+        running = 0
+        cut_widths: list[int] = []
+        for cut in range(n_vars - 1):
+            running += diff[cut]
+            cut_widths.append(running)
+        if not cut_widths:
+            continue
+
+        peak_cuts = sorted(
+            range(len(cut_widths)),
+            key=lambda cut: (cut_widths[cut], -abs((2 * cut + 1) - n_vars)),
+            reverse=True,
+        )[:peak_cap]
+        if not peak_cuts or cut_widths[peak_cuts[0]] <= 0:
+            continue
+
+        for var in range(n_vars):
+            span_lo = interval_lo[var]
+            span_hi = interval_hi[var]
+            if span_hi <= span_lo:
+                continue
+            peak_hits = 0
+            peak_weight = 0
+            best_closeness = -n_vars
+            for cut in peak_cuts:
+                if span_lo <= cut < span_hi:
+                    peak_hits += 1
+                    peak_weight += cut_widths[cut]
+                    best_closeness = max(
+                        best_closeness,
+                        -min(abs(positions[var] - cut), abs(positions[var] - (cut + 1))),
+                    )
+            if peak_hits == 0:
+                continue
+            scores = aggregate_scores.setdefault(var, [0, 0, 0, 0, 0, 0])
+            scores[0] += peak_weight
+            scores[1] += peak_hits
+            scores[2] += len(adjacency[var])
+            scores[3] = max(scores[3], span_hi - span_lo)
+            scores[4] = max(scores[4], best_closeness)
+            scores[5] += int(var in preferred)
+
+    ranked = sorted(
+        aggregate_scores,
+        key=lambda var: (
+            aggregate_scores[var][5],
+            aggregate_scores[var][0],
+            aggregate_scores[var][1],
+            aggregate_scores[var][4],
+            aggregate_scores[var][2],
+            aggregate_scores[var][3],
+            -var,
+        ),
+        reverse=True,
+    )
+    return tuple(ranked[: min(len(ranked), int(max_candidates))])
 
 
 def _merge_q3_free_cutset_candidate_orders(
@@ -9266,11 +11553,48 @@ def _build_q3_free_cutset_residue_data(
     )
 
 
+def _build_q3_free_residual_projection(
+    q: PhaseFunction,
+    cutset_vars: tuple[int, ...],
+    *,
+    remaining_universe: tuple[int, ...] | None = None,
+    parent_projection: _Q3FreeResidualProjection | None = None,
+) -> _Q3FreeResidualProjection | None:
+    cutset_set = set(int(var) for var in cutset_vars)
+    if parent_projection is not None:
+        parent_remaining = tuple(int(var) for var in parent_projection.remaining_vars)
+        if cutset_set <= set(parent_remaining):
+            child_remaining_vars = tuple(
+                int(var) for var in parent_remaining if var not in cutset_set
+            )
+            removed_vars = [var for var in parent_remaining if var in cutset_set]
+            if len(child_remaining_vars) + len(removed_vars) == len(parent_remaining):
+                local_keep = [
+                    idx for idx, var in enumerate(parent_remaining) if var not in cutset_set
+                ]
+                child_q = _component_restriction(parent_projection.remaining_q, local_keep)
+                return _Q3FreeResidualProjection(
+                    remaining_vars=child_remaining_vars,
+                    remaining_q=child_q,
+                )
+    if remaining_universe is None:
+        remaining_universe = tuple(range(q.n))
+    remaining_vars = tuple(var for var in remaining_universe if var not in cutset_set)
+    if not remaining_vars:
+        return None
+    return _Q3FreeResidualProjection(
+        remaining_vars=remaining_vars,
+        remaining_q=_component_restriction(q, remaining_vars),
+    )
+
+
 def _evaluate_q3_free_cutset_candidate(
     q: PhaseFunction,
     cutset_vars: tuple[int, ...],
     *,
     remaining_universe: tuple[int, ...] | None = None,
+    residual_projection: _Q3FreeResidualProjection | None = None,
+    remaining_order_hint: Sequence[int] | None = None,
     prioritize_width: bool = False,
     target_remaining_width: int | None = None,
     allow_generic_remaining: bool = False,
@@ -9301,18 +11625,39 @@ def _evaluate_q3_free_cutset_candidate(
 
     if remaining_universe is None:
         remaining_universe = tuple(range(q.n))
-    cutset_set = set(cutset_vars)
-    remaining_vars = tuple(var for var in remaining_universe if var not in cutset_set)
+    cutset_set = set(int(var) for var in cutset_vars)
+    if residual_projection is None:
+        residual_projection = _build_q3_free_residual_projection(
+            q,
+            cutset_vars,
+            remaining_universe=remaining_universe,
+        )
+    if residual_projection is None:
+        return None
+    remaining_vars = tuple(int(var) for var in residual_projection.remaining_vars)
     if not remaining_vars:
         return None
+    remaining_index = {var: idx for idx, var in enumerate(remaining_vars)}
 
     cutset_remaining, cutset_cutset_left, cutset_cutset_right, cutset_cutset_residue = (
         _build_q3_free_cutset_residue_data(q, cutset_vars, remaining_vars)
     )
     branch_count = 1 << len(cutset_vars)
-    remaining_q = _component_restriction(q, remaining_vars)
+    remaining_q = residual_projection.remaining_q
+    remaining_adjacency, remaining_edges = _q3_free_graph(remaining_q)
+    remaining_max_degree = max((len(neighbors) for neighbors in remaining_adjacency), default=0)
+    use_one_shot_surrogate = (
+        prefer_one_shot_slicing
+        and remaining_q.n >= _Q3_FREE_SERIES_CORE_RECURSE_MIN_VARS
+        and remaining_max_degree <= 4
+    )
 
-    def summarize_generic_remaining() -> tuple[tuple[int, ...], int, int, int]:
+    def summarize_generic_remaining(
+        surrogate_width: int,
+        surrogate_work: int,
+    ) -> tuple[tuple[int, ...], int, int, int]:
+        if use_one_shot_surrogate:
+            return (), int(surrogate_width), max(1, int(surrogate_work)), 1
         component_sets = detect_factorization(remaining_q)
         covered = set().union(*component_sets) if component_sets else set()
         isolated_vars = tuple(sorted(set(range(remaining_q.n)) - covered))
@@ -9321,16 +11666,27 @@ def _evaluate_q3_free_cutset_candidate(
         generic_penalty = 1
         for component in component_sets:
             component_q = _component_restriction(remaining_q, component)
+            component_adjacency, component_edges = _q3_free_graph(component_q)
+            component_max_degree = max((len(neighbors) for neighbors in component_adjacency), default=0)
+            if (
+                use_one_shot_surrogate
+                and component_q.n >= _Q3_FREE_SERIES_CORE_RECURSE_MIN_VARS
+                and component_max_degree <= 4
+            ):
+                order, width = _best_cheap_q3_free_order(component_q)
+                component_width = max(component_width, int(width))
+                component_work += max(1, int(_estimate_treewidth_dp_work(component_q, order)))
+                generic_penalty += 1
+                continue
             order, width = _min_fill_cubic_order(component_q)
             component_width = max(component_width, int(width))
             component_work += max(1, int(_estimate_treewidth_dp_work(component_q, order)))
-            component_adjacency, component_edges = _q3_free_graph(component_q)
             component_depth, component_chords = _q3_free_spanning_data(component_adjacency, component_edges)
             if _q3_free_treewidth_order(
                 component_q,
                 len(_select_feedback_vertices(component_q.n, component_chords, component_depth)),
                 order_hint=order,
-                max_degree=max((len(neighbors) for neighbors in component_adjacency), default=0),
+                max_degree=component_max_degree,
             ) is None:
                 generic_penalty += 1
         return isolated_vars, component_width, max(1, component_work), generic_penalty
@@ -9358,21 +11714,58 @@ def _evaluate_q3_free_cutset_candidate(
             score=make_score(0, target_miss=target_miss, width=0, work=branch_count),
         )
 
-    candidate_order, width = _min_fill_cubic_order(remaining_q)
-    work = _estimate_treewidth_dp_work(remaining_q, candidate_order)
+    local_hint_order: tuple[int, ...] | None = None
+    if remaining_order_hint is not None:
+        local_hint = [remaining_index[var] for var in remaining_order_hint if var in remaining_index]
+        if len(local_hint) == remaining_q.n:
+            local_hint_order = tuple(int(var) for var in local_hint)
+
+    if local_hint_order is not None:
+        candidate_order = local_hint_order
+        width = _cubic_order_width(remaining_q, candidate_order)
+    elif use_one_shot_surrogate:
+        candidate_order, width = _best_cheap_q3_free_order(remaining_q)
+    else:
+        candidate_order, width = _min_fill_cubic_order(remaining_q)
+    if use_one_shot_surrogate:
+        work = _cheap_q3_free_work_surrogate(remaining_q, width)
+    else:
+        work = _estimate_treewidth_dp_work(remaining_q, candidate_order)
     effective_work = branch_count * work
-    reduced_adjacency, reduced_edges = _q3_free_graph(remaining_q)
+    reduced_adjacency, reduced_edges = remaining_adjacency, remaining_edges
     reduced_depth, reduced_chords = _q3_free_spanning_data(reduced_adjacency, reduced_edges)
     reduced_feedback = _select_feedback_vertices(remaining_q.n, reduced_chords, reduced_depth)
-    viable_order = _q3_free_treewidth_order(
+    skip_exact_treewidth_search = (
+        use_one_shot_surrogate
+        and allow_generic_remaining
+        and width > max(
+            _q3_free_treewidth_width_limit() + 4,
+            (
+                int(target_remaining_width) + 8
+                if target_remaining_width is not None
+                else _q3_free_treewidth_width_limit() + 4
+            ),
+        )
+    )
+    viable_order = None if skip_exact_treewidth_search else _q3_free_treewidth_order(
         remaining_q,
         len(reduced_feedback),
         order_hint=candidate_order,
-        max_degree=max((len(neighbors) for neighbors in reduced_adjacency), default=0),
+        max_degree=remaining_max_degree,
     )
+    if viable_order is None and local_hint_order is not None and not use_one_shot_surrogate:
+        candidate_order, width = _min_fill_cubic_order(remaining_q)
+        work = _estimate_treewidth_dp_work(remaining_q, candidate_order)
+        effective_work = branch_count * work
+        viable_order = _q3_free_treewidth_order(
+            remaining_q,
+            len(reduced_feedback),
+            order_hint=candidate_order,
+            max_degree=remaining_max_degree,
+        )
     if viable_order is None:
         if allow_generic_remaining:
-            isolated_vars, component_width, component_work, generic_penalty = summarize_generic_remaining()
+            isolated_vars, component_width, component_work, generic_penalty = summarize_generic_remaining(width, work)
             generic_work = branch_count * component_work
             plan = _Q3FreeCutsetConditioningPlan(
                 level=q.level,
@@ -9579,6 +11972,7 @@ def _build_q3_free_cutset_conditioning_plan_uncached(
     prioritize_width: bool = False,
     target_remaining_width: int | None = None,
     candidate_override: Sequence[int] | None = None,
+    remaining_order_hint: Sequence[int] | None = None,
     allow_generic_remaining: bool = False,
     prefer_one_shot_slicing: bool = False,
 ) -> _Q3FreeCutsetConditioningPlan | None:
@@ -9591,9 +11985,20 @@ def _build_q3_free_cutset_conditioning_plan_uncached(
     preferred = set(_select_feedback_vertices(q.n, chords, depth))
     preferred.update(tensor_hint)
     if candidate_override is None:
-        candidates = _candidate_q3_free_cutset_vertices(
+        order_guided_candidates = _order_guided_q3_free_cutset_vertices(
+            adjacency,
+                candidate_orders=_iter_q3_free_cheap_order_hints(q.n, q=q),
+            preferred=preferred,
+            max_candidates=int(candidate_pool),
+        )
+        generic_candidates = _candidate_q3_free_cutset_vertices(
             adjacency,
             preferred=preferred,
+            max_candidates=int(candidate_pool),
+        )
+        candidates = _merge_q3_free_cutset_candidate_orders(
+            order_guided_candidates,
+            generic_candidates,
             max_candidates=int(candidate_pool),
         )
     else:
@@ -9606,25 +12011,93 @@ def _build_q3_free_cutset_conditioning_plan_uncached(
 
     best_evaluation: _Q3FreeCutsetCandidateEvaluation | None = None
     evaluation_cache: dict[tuple[int, ...], _Q3FreeCutsetCandidateEvaluation | None] = {}
+    projection_cache: dict[tuple[int, ...], _Q3FreeResidualProjection | None] = {}
     remaining_universe = tuple(range(q.n))
-    frontier: list[tuple[int, ...]] = [()]
+    frontier: list[tuple[tuple[int, ...], _Q3FreeCutsetCandidateEvaluation | None]] = [((), None)]
     max_size = min(int(max_size), len(candidates))
+    use_native_candidate_shortlist = (
+        prefer_one_shot_slicing
+        and allow_generic_remaining
+        and q.n >= _Q3_FREE_SERIES_CORE_RECURSE_MIN_VARS
+        and not q.q3
+    )
+    giant_low_degree_surrogate = (
+        use_native_candidate_shortlist
+        and max((len(neighbors) for neighbors in adjacency), default=0) <= 4
+    )
+    if giant_low_degree_surrogate:
+        max_size = min(int(max_size), 6)
+        candidate_pool = min(int(candidate_pool), 16)
+        beam_width = min(int(beam_width), 3)
+        branches_per_state = min(int(branches_per_state), 2)
 
-    def cached_evaluation(cutset_vars: tuple[int, ...]) -> _Q3FreeCutsetCandidateEvaluation | None:
+    def global_remaining_order_hint(
+        evaluation: _Q3FreeCutsetCandidateEvaluation | None,
+    ) -> tuple[int, ...] | None:
+        if (
+            evaluation is None
+            or not evaluation.viable
+            or evaluation.plan is None
+            or evaluation.plan.remaining_backend != "treewidth"
+            or not evaluation.plan.remaining_order
+        ):
+            return None
+        return tuple(
+            int(evaluation.plan.remaining_vars[idx])
+            for idx in evaluation.plan.remaining_order
+        )
+
+    def cached_evaluation(
+        cutset_vars: tuple[int, ...],
+        *,
+        local_remaining_order_hint: Sequence[int] | None = None,
+        parent_evaluation: _Q3FreeCutsetCandidateEvaluation | None = None,
+    ) -> _Q3FreeCutsetCandidateEvaluation | None:
         cached = evaluation_cache.get(cutset_vars)
-        if cached is not None or cutset_vars in evaluation_cache:
+        if (
+            local_remaining_order_hint is None
+            and (cached is not None or cutset_vars in evaluation_cache)
+        ):
             return cached
+        parent_projection = None
+        if (
+            parent_evaluation is not None
+            and parent_evaluation.plan is not None
+            and set(parent_evaluation.cutset_vars) < set(cutset_vars)
+        ):
+            parent_projection = projection_cache.get(parent_evaluation.cutset_vars)
+        residual_projection = _build_q3_free_residual_projection(
+            q,
+            cutset_vars,
+            remaining_universe=remaining_universe,
+            parent_projection=parent_projection,
+        )
+        projection_cache[cutset_vars] = residual_projection
         evaluation = _evaluate_q3_free_cutset_candidate(
             q,
             cutset_vars,
             remaining_universe=remaining_universe,
+            residual_projection=residual_projection,
+            remaining_order_hint=local_remaining_order_hint or remaining_order_hint,
             prioritize_width=prioritize_width,
             target_remaining_width=target_remaining_width,
             allow_generic_remaining=allow_generic_remaining,
             prefer_one_shot_slicing=prefer_one_shot_slicing,
         )
-        evaluation_cache[cutset_vars] = evaluation
-        return evaluation
+        cached = evaluation_cache.get(cutset_vars)
+        if cached is None or (
+            evaluation is not None
+            and (
+                not cached.viable
+                or evaluation.score < cached.score
+            )
+        ):
+            evaluation_cache[cutset_vars] = evaluation
+            cached = evaluation
+        elif cutset_vars not in evaluation_cache:
+            evaluation_cache[cutset_vars] = evaluation
+            cached = evaluation
+        return cached
 
     def meets_width_target(evaluation: _Q3FreeCutsetCandidateEvaluation | None) -> bool:
         return bool(
@@ -9636,22 +12109,141 @@ def _build_q3_free_cutset_conditioning_plan_uncached(
             and evaluation.plan.remaining_width <= int(target_remaining_width)
         )
 
+    def greedy_result_is_good_enough(
+        evaluation: _Q3FreeCutsetCandidateEvaluation | None,
+    ) -> bool:
+        if evaluation is None or not evaluation.viable or evaluation.plan is None:
+            return False
+        if evaluation.plan.remaining_backend != "treewidth":
+            return False
+        if _q3_free_cutset_plan_generic_penalty(evaluation.plan) != 0:
+            return False
+        if not giant_low_degree_surrogate:
+            return False
+        return True
+
+    def maybe_update_best(
+        evaluation: _Q3FreeCutsetCandidateEvaluation | None,
+    ) -> bool:
+        nonlocal best_evaluation
+        if evaluation is None or not evaluation.viable:
+            return False
+        if best_evaluation is None or evaluation.score < best_evaluation.score:
+            best_evaluation = evaluation
+            return True
+        return False
+
+    def width_value(evaluation: _Q3FreeCutsetCandidateEvaluation | None) -> int | None:
+        if evaluation is None or not evaluation.viable or evaluation.plan is None:
+            return None
+        return int(evaluation.plan.remaining_width)
+
+    def local_search_improve(
+        seed_evaluation: _Q3FreeCutsetCandidateEvaluation | None,
+    ) -> _Q3FreeCutsetCandidateEvaluation | None:
+        if (
+            not use_native_candidate_shortlist
+            or seed_evaluation is None
+            or not seed_evaluation.viable
+            or len(seed_evaluation.cutset_vars) >= max_size
+        ):
+            return seed_evaluation
+        current = seed_evaluation
+        for _pass in range(_Q3_FREE_ONE_SHOT_LOCAL_SEARCH_PASSES):
+            ranked_extensions = _native_rank_q3_free_cutset_extensions(
+                q,
+                selected_vars=current.cutset_vars,
+                candidate_vars=[candidate for candidate in candidates if candidate not in current.cutset_vars],
+                remaining_order_hint=global_remaining_order_hint(current),
+            )
+            if not ranked_extensions:
+                break
+            neighbor_best = current
+            top_candidates = [
+                candidate for candidate, _width, _work in ranked_extensions[: _Q3_FREE_ONE_SHOT_LOCAL_SEARCH_TOPK]
+            ]
+            for candidate in top_candidates:
+                if len(current.cutset_vars) < max_size:
+                    evaluation = cached_evaluation(
+                        tuple(sorted(current.cutset_vars + (candidate,))),
+                        local_remaining_order_hint=global_remaining_order_hint(current),
+                        parent_evaluation=current,
+                    )
+                    if (
+                        evaluation is not None
+                        and evaluation.viable
+                        and evaluation.score < neighbor_best.score
+                    ):
+                        neighbor_best = evaluation
+                for remove_var in current.cutset_vars:
+                    swapped = tuple(
+                        sorted(var for var in current.cutset_vars if var != remove_var) + [candidate]
+                    )
+                    evaluation = cached_evaluation(
+                        swapped,
+                        local_remaining_order_hint=global_remaining_order_hint(current),
+                        parent_evaluation=current,
+                    )
+                    if (
+                        evaluation is not None
+                        and evaluation.viable
+                        and evaluation.score < neighbor_best.score
+                    ):
+                        neighbor_best = evaluation
+            if len(current.cutset_vars) > 1:
+                for remove_var in current.cutset_vars:
+                    dropped = tuple(var for var in current.cutset_vars if var != remove_var)
+                    evaluation = cached_evaluation(
+                        dropped,
+                        local_remaining_order_hint=global_remaining_order_hint(current),
+                    )
+                    if (
+                        evaluation is not None
+                        and evaluation.viable
+                        and evaluation.score < neighbor_best.score
+                    ):
+                        neighbor_best = evaluation
+            if neighbor_best is current:
+                break
+            current = neighbor_best
+            maybe_update_best(current)
+            if meets_width_target(current):
+                break
+        return current
+
     if tensor_hint:
         hinted_vars = [var for var in tensor_hint if var in candidates]
         for size in range(1, min(max_size, len(hinted_vars)) + 1):
             evaluation = cached_evaluation(tuple(sorted(hinted_vars[:size])))
-            if evaluation is not None and evaluation.viable and (
-                best_evaluation is None or evaluation.score < best_evaluation.score
-            ):
-                best_evaluation = evaluation
+            maybe_update_best(evaluation)
 
     selected: list[int] = []
+    selected_evaluation: _Q3FreeCutsetCandidateEvaluation | None = None
+    greedy_remaining_order_hint = remaining_order_hint
     for _size in range(1, max_size + 1):
         best_choice: tuple[int, _Q3FreeCutsetCandidateEvaluation] | None = None
-        for candidate in candidates:
+        candidate_iterable: Sequence[int] = candidates
+        if use_native_candidate_shortlist:
+            remaining_candidates = [candidate for candidate in candidates if candidate not in selected]
+            ranked_extensions = _native_rank_q3_free_cutset_extensions(
+                q,
+                selected_vars=selected,
+                candidate_vars=remaining_candidates,
+                remaining_order_hint=greedy_remaining_order_hint,
+            )
+            if ranked_extensions is not None:
+                shortlist_size = max(int(branches_per_state) * 2, int(beam_width), 8)
+                candidate_iterable = tuple(
+                    candidate for candidate, _width, _work in ranked_extensions[:shortlist_size]
+                )
+        for candidate in candidate_iterable:
             if candidate in selected:
                 continue
-            evaluation = cached_evaluation(tuple(sorted(selected + [candidate])))
+            evaluation = cached_evaluation(
+                tuple(sorted(selected + [candidate])),
+                local_remaining_order_hint=greedy_remaining_order_hint,
+                parent_evaluation=selected_evaluation,
+            )
             if evaluation is None:
                 continue
             if best_choice is None or evaluation.score < best_choice[1].score:
@@ -9659,12 +12251,28 @@ def _build_q3_free_cutset_conditioning_plan_uncached(
         if best_choice is None:
             break
         selected.append(best_choice[0])
-        if best_choice[1].viable and (
-            best_evaluation is None or best_choice[1].score < best_evaluation.score
-        ):
-            best_evaluation = best_choice[1]
-            if not prioritize_width or meets_width_target(best_choice[1]):
+        selected_evaluation = best_choice[1]
+        greedy_remaining_order_hint = global_remaining_order_hint(best_choice[1])
+        best_width_before = width_value(best_evaluation)
+        if maybe_update_best(best_choice[1]):
+            best_width_after = width_value(best_evaluation)
+            width_improved = (
+                best_width_after is not None
+                and (best_width_before is None or best_width_after < best_width_before)
+            )
+            if width_improved:
+                selected_evaluation = local_search_improve(selected_evaluation)
+            if giant_low_degree_surrogate and meets_width_target(best_evaluation):
                 break
+            if not prioritize_width or meets_width_target(selected_evaluation):
+                break
+        if giant_low_degree_surrogate and best_evaluation is not None and meets_width_target(best_evaluation):
+            break
+
+    if greedy_result_is_good_enough(best_evaluation):
+        plan = best_evaluation.plan
+        assert plan is not None
+        return _attach_q3_free_cutset_runtime_cache(plan)
 
     if (
         best_evaluation is not None
@@ -9723,21 +12331,48 @@ def _build_q3_free_cutset_conditioning_plan_uncached(
             estimated_total_work=estimated_total_work,
         ))
 
+    stagnation_steps = 0
+    best_width_seen = width_value(best_evaluation)
     for _size in range(1, max_size + 1):
         expansions: list[tuple[tuple[int, ...], tuple[int, ...], _Q3FreeCutsetCandidateEvaluation]] = []
         seen_cutsets: set[tuple[int, ...]] = set()
-        for selected_indexes in frontier:
+        for selected_indexes, parent_evaluation in frontier:
             next_idx = selected_indexes[-1] + 1 if selected_indexes else 0
-            for candidate_idx in range(
-                next_idx,
-                min(len(candidates), next_idx + int(branches_per_state)),
-            ):
+            candidate_indexes: list[int] = list(
+                range(
+                    next_idx,
+                    min(len(candidates), next_idx + int(branches_per_state)),
+                )
+            )
+            if use_native_candidate_shortlist:
+                prefix_candidates = [candidates[idx] for idx in selected_indexes]
+                available_candidates = [candidates[idx] for idx in range(next_idx, len(candidates))]
+                ranked_extensions = _native_rank_q3_free_cutset_extensions(
+                    q,
+                    selected_vars=prefix_candidates,
+                    candidate_vars=available_candidates,
+                    remaining_order_hint=global_remaining_order_hint(parent_evaluation),
+                )
+                if ranked_extensions is not None:
+                    shortlisted = {
+                        int(candidate)
+                        for candidate, _width, _work in ranked_extensions[: max(int(branches_per_state), 4)]
+                    }
+                    candidate_indexes = [
+                        idx for idx in range(next_idx, len(candidates))
+                        if candidates[idx] in shortlisted
+                    ]
+            for candidate_idx in candidate_indexes:
                 expanded_indexes = selected_indexes + (candidate_idx,)
                 cutset_vars = tuple(sorted(candidates[idx] for idx in expanded_indexes))
                 if cutset_vars in seen_cutsets:
                     continue
                 seen_cutsets.add(cutset_vars)
-                evaluation = cached_evaluation(cutset_vars)
+                evaluation = cached_evaluation(
+                    cutset_vars,
+                    local_remaining_order_hint=global_remaining_order_hint(parent_evaluation),
+                    parent_evaluation=parent_evaluation,
+                )
                 if evaluation is None:
                     continue
                 expansions.append((evaluation.score, expanded_indexes, evaluation))
@@ -9746,16 +12381,49 @@ def _build_q3_free_cutset_conditioning_plan_uncached(
             break
 
         expansions.sort(key=lambda item: item[0])
+        improved_this_round = False
+        width_improved_this_round = False
         for _score, _expanded_indexes, evaluation in expansions:
-            if evaluation.viable and (
-                best_evaluation is None or evaluation.score < best_evaluation.score
-            ):
-                best_evaluation = evaluation
+            if maybe_update_best(evaluation):
+                improved_this_round = True
+                candidate_width = width_value(best_evaluation)
+                if (
+                    candidate_width is not None
+                    and (best_width_seen is None or candidate_width < best_width_seen)
+                ):
+                    best_width_seen = candidate_width
+                    width_improved_this_round = True
 
+        if improved_this_round and (not giant_low_degree_surrogate or width_improved_this_round):
+            best_evaluation = local_search_improve(best_evaluation)
+            improved_this_round = True
+
+        frontier_limit = int(beam_width)
+        if giant_low_degree_surrogate and not width_improved_this_round:
+            frontier_limit = 1
         frontier = [
-            expanded_indexes
-            for _score, expanded_indexes, _evaluation in expansions[: int(beam_width)]
+            (expanded_indexes, evaluation)
+            for _score, expanded_indexes, _evaluation in expansions[: frontier_limit]
+            for evaluation in (_evaluation,)
         ]
+        if improved_this_round:
+            stagnation_steps = 0
+            if meets_width_target(best_evaluation):
+                break
+        else:
+            stagnation_steps += 1
+            if (
+                giant_low_degree_surrogate
+                and best_evaluation is not None
+                and not width_improved_this_round
+            ):
+                break
+            if (
+                use_native_candidate_shortlist
+                and best_evaluation is not None
+                and stagnation_steps >= _Q3_FREE_ONE_SHOT_STAGNATION_LIMIT
+            ):
+                break
 
     if best_evaluation is None:
         return None
@@ -9886,17 +12554,55 @@ def _q3_free_one_shot_cutset_conditioning_plan(
 ) -> _Q3FreeCutsetConditioningPlan | None:
     """Try a stronger cutset search for giant one-shot q3-free components."""
     _cfg = _get_solver_config()
-    plan = _q3_free_cutset_conditioning_plan(q, prefer_one_shot_slicing=True)
+    adjacency, edges = _q3_free_graph(q)
+    max_degree = max((len(neighbors) for neighbors in adjacency), default=0)
+    giant_surrogate_path = (
+        q.n >= _Q3_FREE_SERIES_CORE_RECURSE_MIN_VARS
+        and max_degree <= 4
+    )
+    depth, chords = _q3_free_spanning_data(adjacency, edges)
+    if giant_surrogate_path:
+        cheap_order, cheap_width = _best_cheap_q3_free_order(q)
+        if cheap_width <= min(_q3_free_treewidth_width_limit(), _cfg.tensor_hint_target_width + 2):
+            feedback_size = len(_select_feedback_vertices(q.n, chords, depth))
+            if _q3_free_treewidth_candidate_is_viable(q, cheap_order, cheap_width, feedback_size):
+                return None
+    plan = None if giant_surrogate_path else _q3_free_cutset_conditioning_plan(q, prefer_one_shot_slicing=True)
     if (
         plan is not None
         and plan.remaining_width <= _cfg.tensor_hint_target_width
         and _q3_free_cutset_plan_generic_penalty(plan) == 0
     ):
         return plan
-    adjacency, edges = _q3_free_graph(q)
-    depth, chords = _q3_free_spanning_data(adjacency, edges)
     preferred = set(_select_feedback_vertices(q.n, chords, depth))
     preferred.update(_q3_free_tensor_slice_hint(q))
+    direct_plan = (
+        _direct_order_guided_q3_free_cutset_plan(
+            q,
+            adjacency,
+            preferred=preferred,
+            max_size=_cfg.one_shot_cutset_max_size,
+            target_remaining_width=_cfg.tensor_hint_target_width,
+            allow_generic_remaining=True,
+        )
+        if giant_surrogate_path
+        else None
+    )
+    if (
+        direct_plan is not None
+        and (
+            (
+                direct_plan.remaining_backend == "treewidth"
+                and direct_plan.remaining_width <= _q3_free_treewidth_width_limit()
+            )
+            or (
+                direct_plan.remaining_width <= _cfg.tensor_hint_target_width
+                and _q3_free_cutset_plan_generic_penalty(direct_plan) == 0
+            )
+        )
+    ):
+        return direct_plan
+    peel_order, core_vars = _q3_free_series_reduction_core(adjacency)
     separator_candidates = _separator_ranked_q3_free_cutset_vertices(
         adjacency,
         preferred=preferred,
@@ -9912,20 +12618,138 @@ def _q3_free_one_shot_cutset_conditioning_plan(
         generic_candidates,
         max_candidates=_cfg.one_shot_cutset_candidate_pool,
     )
-    separator_plan = (
+    unified_candidate_orders: list[Sequence[int]] = [merged_candidates] if merged_candidates else []
+    hint_candidates: list[tuple[int, ...]] = []
+    if (
+        len(core_vars) >= _Q3_FREE_SERIES_CORE_RECURSE_MIN_VARS
+        and q.n - len(core_vars) >= _Q3_FREE_SERIES_CORE_RECURSE_MIN_SHRINK
+    ):
+        core_q = _component_restriction(q, core_vars)
+        core_adjacency, core_edges = _q3_free_graph(core_q)
+        core_depth, core_chords = _q3_free_spanning_data(core_adjacency, core_edges)
+        core_preferred = set(_select_feedback_vertices(core_q.n, core_chords, core_depth))
+        core_preferred.update(_q3_free_tensor_slice_hint(core_q))
+        core_contract_candidates = _merge_q3_free_cutset_candidate_orders(
+            _separator_ranked_q3_free_cutset_vertices(
+                core_adjacency,
+                preferred=core_preferred,
+                max_candidates=_cfg.one_shot_cutset_candidate_pool,
+            ),
+            _order_guided_q3_free_cutset_vertices(
+                core_adjacency,
+                candidate_orders=_iter_q3_free_cheap_order_hints(core_q.n, q=core_q),
+                preferred=core_preferred,
+                max_candidates=_cfg.one_shot_cutset_candidate_pool,
+            ),
+            _candidate_q3_free_cutset_vertices(
+                core_adjacency,
+                preferred=core_preferred,
+                max_candidates=_cfg.one_shot_cutset_candidate_pool,
+            ),
+            max_candidates=_cfg.one_shot_cutset_candidate_pool,
+        )
+        core_plan = None
+        should_run_core_seed_search = (
+            not giant_surrogate_path
+            or len(core_contract_candidates) < min(4, _cfg.one_shot_cutset_candidate_pool)
+        )
+        if should_run_core_seed_search:
+            core_plan = _build_q3_free_cutset_conditioning_plan_uncached(
+                core_q,
+                max_size=min(_cfg.one_shot_cutset_max_size, 4 if giant_surrogate_path else _cfg.one_shot_cutset_max_size),
+                candidate_pool=min(12 if giant_surrogate_path else _cfg.one_shot_cutset_candidate_pool, core_q.n),
+                beam_width=min(2 if giant_surrogate_path else _cfg.one_shot_cutset_beam_width, _cfg.one_shot_cutset_beam_width),
+                branches_per_state=min(2 if giant_surrogate_path else _cfg.one_shot_cutset_branches_per_state, _cfg.one_shot_cutset_branches_per_state),
+                prioritize_width=True,
+                target_remaining_width=_cfg.tensor_hint_target_width,
+                allow_generic_remaining=True,
+                prefer_one_shot_slicing=True,
+            )
+        mapped_contract_candidates = tuple(
+            int(core_vars[idx]) for idx in core_contract_candidates
+        )
+        if core_plan is not None and core_plan.cutset_vars:
+            mapped_cutset = tuple(int(core_vars[idx]) for idx in core_plan.cutset_vars)
+            core_remaining_order_hint = None
+            if (
+                core_plan.remaining_backend == "treewidth"
+                and core_plan.remaining_order
+            ):
+                core_remaining_vars = tuple(
+                    int(core_vars[idx]) for idx in core_plan.remaining_vars
+                )
+                core_remaining_order = tuple(
+                    int(core_remaining_vars[idx]) for idx in core_plan.remaining_order
+                )
+                peeled_remaining = tuple(
+                    int(var) for var in peel_order if var not in mapped_cutset
+                )
+                core_remaining_order_hint = peeled_remaining + core_remaining_order
+            mapped_contract_candidates = _merge_q3_free_cutset_candidate_orders(
+                mapped_cutset,
+                mapped_contract_candidates,
+                max_candidates=_cfg.one_shot_cutset_candidate_pool,
+            )
+            if mapped_contract_candidates:
+                unified_candidate_orders.append(mapped_contract_candidates)
+            if core_remaining_order_hint is not None:
+                hint_candidates.append(core_remaining_order_hint)
+
+    order_guided_variants: dict[tuple[int, ...], tuple[tuple[int, ...], int]] = {}
+    for cheap_order in _iter_q3_free_cheap_order_hints(q.n, q=q):
+        order_guided_candidates = _order_guided_q3_free_cutset_vertices(
+            adjacency,
+            candidate_orders=(cheap_order,),
+            preferred=preferred,
+            max_candidates=_cfg.one_shot_cutset_candidate_pool,
+        )
+        if not order_guided_candidates:
+            continue
+        hint_width = _cubic_order_width(q, cheap_order)
+        cached_variant = order_guided_variants.get(order_guided_candidates)
+        if cached_variant is None or hint_width < cached_variant[1]:
+            order_guided_variants[order_guided_candidates] = (
+                tuple(int(var) for var in cheap_order),
+                int(hint_width),
+            )
+    for order_guided_candidates, (cheap_order, _hint_width) in order_guided_variants.items():
+        unified_candidate_orders.append(order_guided_candidates)
+        hint_candidates.append(cheap_order)
+
+    unified_candidates = _merge_q3_free_cutset_candidate_orders(
+        *unified_candidate_orders,
+        max_candidates=_cfg.one_shot_cutset_candidate_pool,
+    ) if unified_candidate_orders else ()
+    best_hint = None
+    best_hint_width = None
+    seen_hints: set[tuple[int, ...]] = set()
+    for hint in hint_candidates:
+        hint_key = tuple(int(var) for var in hint)
+        if hint_key in seen_hints or len(hint_key) != q.n:
+            continue
+        seen_hints.add(hint_key)
+        try:
+            hint_width = _cubic_order_width(q, hint_key)
+        except ValueError:
+            continue
+        if best_hint_width is None or hint_width < best_hint_width:
+            best_hint = hint_key
+            best_hint_width = int(hint_width)
+    unified_plan = (
         _build_q3_free_cutset_conditioning_plan_uncached(
             q,
             max_size=_cfg.one_shot_cutset_max_size,
-            candidate_pool=max(len(merged_candidates), 1),
+            candidate_pool=max(len(unified_candidates), 1),
             beam_width=_cfg.one_shot_cutset_beam_width,
             branches_per_state=_cfg.one_shot_cutset_branches_per_state,
             prioritize_width=True,
             target_remaining_width=_cfg.tensor_hint_target_width,
-            candidate_override=merged_candidates,
+            candidate_override=unified_candidates,
+            remaining_order_hint=best_hint,
             allow_generic_remaining=True,
             prefer_one_shot_slicing=True,
         )
-        if merged_candidates
+        if unified_candidates
         else None
     )
 
@@ -9941,7 +12765,7 @@ def _q3_free_one_shot_cutset_conditioning_plan(
             len(candidate.cutset_vars),
         )
 
-    return min((plan, separator_plan), key=plan_score)
+    return min((plan, direct_plan, unified_plan), key=plan_score)
 
 
 def _sum_q3_free_via_cutset_conditioning_scaled(q: PhaseFunction) -> ScaledComplex | None:
@@ -10367,6 +13191,11 @@ def _finalize_q3_free_treewidth_order(q, order: Sequence[int]):
         return list(refined_order), int(refined_width)
 
     base_width = int(_treewidth_order_width(q, base_order))
+    if q.n > _Q3_FREE_OPTIONAL_REWRITE_MAX_VARS:
+        cached = (base_order, base_width)
+        _STRUCTURE_Q3_FREE_REFINED_ORDER_CACHE[cache_key] = cached
+        refined_order, refined_width = cached
+        return list(refined_order), int(refined_width)
     refined_order, refined_width = _refine_q3_free_treewidth_order_locally(q, base_order, base_width)
     cached = (tuple(int(var) for var in refined_order), int(refined_width))
     _STRUCTURE_Q3_FREE_REFINED_ORDER_CACHE[cache_key] = cached
@@ -11112,7 +13941,15 @@ def _estimate_q3_separator_work(q, separator: Sequence[int]) -> int:
     return (1 << len(separator)) * max(1, branch_cost)
 
 
-def _prefer_treewidth_phase3(q, cover, order, width, *, fully_peeled: bool = False):
+def _prefer_treewidth_phase3(
+    q,
+    cover,
+    order,
+    width,
+    *,
+    fully_peeled: bool = False,
+    treewidth_work: int | None = None,
+):
     """Decide whether Phase 3 should use treewidth DP on ``q``."""
     width_limit = (
         _Q3_TREEWIDTH_DP_PEELED_MAX_WIDTH
@@ -11121,7 +13958,8 @@ def _prefer_treewidth_phase3(q, cover, order, width, *, fully_peeled: bool = Fal
     )
     if width > width_limit:
         return False
-    treewidth_work = max(1, int(_estimate_treewidth_dp_work(q, order)))
+    if treewidth_work is None:
+        treewidth_work = max(1, int(_estimate_treewidth_dp_work(q, order)))
     if fully_peeled and treewidth_work <= _Q3_TREEWIDTH_DP_PEELED_MAX_WORK:
         return True
     if width <= max(1, len(cover)):
@@ -11177,6 +14015,7 @@ def _select_direct_phase3_backend(
     *,
     allow_tensor_contraction=True,
     fully_peeled: bool = False,
+    treewidth_work: int | None = None,
 ):
     """Return the direct Phase-3 backend worth preferring over Phase-2 branching."""
     if fully_peeled and _prefer_treewidth_phase3(
@@ -11185,6 +14024,7 @@ def _select_direct_phase3_backend(
         order,
         width,
         fully_peeled=True,
+        treewidth_work=treewidth_work,
     ):
         return 'treewidth_dp_peeled'
     if _prefer_hybrid_contraction_phase3(
@@ -11203,7 +14043,14 @@ def _select_direct_phase3_backend(
         allow_tensor_contraction=allow_tensor_contraction,
     ):
         return 'tensor_contraction'
-    if _prefer_treewidth_phase3(q, cover, order, width, fully_peeled=fully_peeled):
+    if _prefer_treewidth_phase3(
+        q,
+        cover,
+        order,
+        width,
+        fully_peeled=fully_peeled,
+        treewidth_work=treewidth_work,
+    ):
         return 'treewidth_dp'
     if _prefer_cubic_contraction_phase3(
         q,
@@ -11579,6 +14426,155 @@ def _build_native_level3_phase3_treewidth_plan(
     return native_plan
 
 
+def _build_native_level3_phase3_treewidth_batch_support_plan(
+    *,
+    q,
+    order: Sequence[int],
+) -> object | None:
+    native_build = _native_symbol("build_level3_treewidth_plan")
+    native_batch = _native_symbol("sum_level3_treewidth_preplanned_batch_array")
+    if native_build is None or native_batch is None or not _native_level3_enabled(q):
+        return None
+
+    cache_key = (_q_cubic_treewidth_batch_support_key(q), tuple(int(var) for var in order))
+    cached = _STRUCTURE_PHASE3_LEVEL3_BATCH_NATIVE_PLAN_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
+    q2_support, q3_support = _build_cubic_treewidth_batch_support(q)
+    try:
+        native_plan = native_build(
+            int(q.n),
+            (0,) * int(q.n),
+            {edge: 1 for edge in q2_support},
+            {edge: 1 for edge in q3_support},
+            tuple(int(var) for var in order),
+        )
+    except Exception:
+        return None
+    _STRUCTURE_PHASE3_LEVEL3_BATCH_NATIVE_PLAN_CACHE[cache_key] = native_plan
+    return native_plan
+
+
+def _sum_native_level3_phase3_treewidth_batch_shared_support(
+    q_batch: Sequence[PhaseFunction],
+    order: Sequence[int],
+) -> tuple[list[ScaledComplex], int] | None:
+    native_sum = _native_symbol("sum_level3_treewidth_preplanned_batch_array")
+    if native_sum is None or not q_batch or not _native_level3_enabled(q_batch[0]):
+        return None
+
+    ref_q = q_batch[0]
+    native_plan = _build_native_level3_phase3_treewidth_batch_support_plan(q=ref_q, order=order)
+    if native_plan is None:
+        return None
+
+    q2_support, q3_support = _build_cubic_treewidth_batch_support(ref_q)
+    mod_q1 = int(ref_q.mod_q1)
+    mod_q2 = int(ref_q.mod_q2)
+    mod_q3 = int(ref_q.mod_q3)
+
+    q1_batch = np.ascontiguousarray([
+        [int(coeff) % mod_q1 for coeff in q.q1]
+        for q in q_batch
+    ], dtype=np.int64)
+    q2_batch = np.ascontiguousarray([
+        [int(q.q2.get(edge, 0)) % mod_q2 for edge in q2_support]
+        for q in q_batch
+    ], dtype=np.int64)
+    q3_batch = np.ascontiguousarray([
+        [int(q.q3.get(edge, 0)) % mod_q3 for edge in q3_support]
+        for q in q_batch
+    ], dtype=np.int64)
+
+    try:
+        core_totals, actual_width = native_sum(native_plan, q1_batch, q2_batch, q3_batch)
+    except Exception:
+        return None
+
+    totals = [
+        _make_scaled_complex(cmath.exp(2j * cmath.pi * float(q.q0)) * complex(core_total))
+        for q, core_total in zip(q_batch, core_totals)
+    ]
+    return totals, int(actual_width)
+
+
+def _build_native_phase_function_treewidth_batch_support_plan(
+    *,
+    q,
+    order: Sequence[int],
+) -> object | None:
+    native_build = _native_symbol("build_phase_function_treewidth_support_plan")
+    native_batch = _native_symbol("sum_phase_function_treewidth_preplanned_batch_scaled_array")
+    if native_build is None or native_batch is None:
+        return None
+
+    cache_key = (_q_cubic_treewidth_batch_support_key(q), int(q.level), tuple(int(var) for var in order))
+    cached = _STRUCTURE_PHASE3_GENERIC_BATCH_NATIVE_PLAN_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
+    q2_support, q3_support = _build_cubic_treewidth_batch_support(q)
+    try:
+        native_plan = native_build(
+            int(q.n),
+            int(q.level),
+            {edge: 1 for edge in q2_support},
+            {edge: 1 for edge in q3_support},
+            tuple(int(var) for var in order),
+        )
+    except Exception:
+        return None
+    _STRUCTURE_PHASE3_GENERIC_BATCH_NATIVE_PLAN_CACHE[cache_key] = native_plan
+    return native_plan
+
+
+def _sum_native_phase_function_treewidth_batch_shared_support(
+    q_batch: Sequence[PhaseFunction],
+    order: Sequence[int],
+) -> tuple[list[ScaledComplex], int] | None:
+    native_sum = _native_symbol("sum_phase_function_treewidth_preplanned_batch_scaled_array")
+    if native_sum is None or not q_batch:
+        return None
+
+    ref_q = q_batch[0]
+    native_plan = _build_native_phase_function_treewidth_batch_support_plan(q=ref_q, order=order)
+    if native_plan is None:
+        return None
+
+    q2_support, q3_support = _build_cubic_treewidth_batch_support(ref_q)
+    mod_q1 = int(ref_q.mod_q1)
+    mod_q2 = int(ref_q.mod_q2)
+    mod_q3 = int(ref_q.mod_q3)
+
+    q1_batch = np.ascontiguousarray([
+        [int(coeff) % mod_q1 for coeff in q.q1]
+        for q in q_batch
+    ], dtype=np.int64)
+    q2_batch = np.ascontiguousarray([
+        [int(q.q2.get(edge, 0)) % mod_q2 for edge in q2_support]
+        for q in q_batch
+    ], dtype=np.int64)
+    q3_batch = np.ascontiguousarray([
+        [int(q.q3.get(edge, 0)) % mod_q3 for edge in q3_support]
+        for q in q_batch
+    ], dtype=np.int64)
+
+    try:
+        core_rows, actual_width = native_sum(native_plan, q1_batch, q2_batch, q3_batch)
+    except Exception:
+        return None
+
+    totals = [
+        _mul_scaled_complex(
+            _make_scaled_complex(cmath.exp(2j * cmath.pi * float(q.q0))),
+            (complex(core_value), int(core_half_pow2_exp)),
+        )
+        for q, (core_value, core_half_pow2_exp) in zip(q_batch, core_rows)
+    ]
+    return totals, int(actual_width)
+
+
 def _maybe_get_native_level3_phase3_treewidth_plan(
     *,
     q,
@@ -11722,6 +14718,93 @@ def _sum_via_treewidth_dp_scaled(q, order):
 
     scalar, factors = _build_cubic_factors_scaled(q)
     return _sum_factor_tables_scaled(q.n, factors, order, scalar=scalar)
+
+
+def _sum_via_treewidth_dp_scaled_batch_shared_support(
+    q_batch: Sequence[PhaseFunction],
+    order: Sequence[int],
+) -> tuple[list[ScaledComplex], int]:
+    """Batch cubic treewidth-DP for kernels sharing q2/q3 support."""
+    if not q_batch:
+        return [], 0
+
+    ref_q = q_batch[0]
+    support_key = _q_cubic_treewidth_batch_support_key(ref_q)
+    q2_support, q3_support = _build_cubic_treewidth_batch_support(ref_q)
+    for q in q_batch[1:]:
+        if q.n != ref_q.n or q.level != ref_q.level:
+            raise ValueError("Treewidth batch requires matching variable count and precision level.")
+        if _q_cubic_treewidth_batch_support_key(q) != support_key:
+            raise ValueError("Treewidth batch requires shared q2/q3 support.")
+
+    if int(ref_q.level) == 3:
+        native_batch = _sum_native_level3_phase3_treewidth_batch_shared_support(q_batch, order)
+        if native_batch is not None:
+            return native_batch
+    native_batch = _sum_native_phase_function_treewidth_batch_shared_support(q_batch, order)
+    if native_batch is not None:
+        return native_batch
+
+    batch_size = len(q_batch)
+    mod_q1 = int(ref_q.mod_q1)
+    q2_lift = mod_q1 // int(ref_q.mod_q2) if ref_q.mod_q2 else 0
+    q3_lift = mod_q1 // int(ref_q.mod_q3) if ref_q.mod_q3 else 0
+    omega_values, omega_exponents = _omega_scaled_arrays(ref_q.level)
+
+    scalar_values = np.empty(batch_size, dtype=np.complex128)
+    scalar_exponents = np.zeros(batch_size, dtype=np.int64)
+    q1_batch = np.asarray([
+        [int(coeff) % mod_q1 for coeff in q.q1]
+        for q in q_batch
+    ], dtype=np.int64)
+    for row_idx, q in enumerate(q_batch):
+        scalar_values[row_idx] = cmath.exp(2j * cmath.pi * float(q.q0))
+
+    factors: dict[tuple[int, ...], tuple[np.ndarray, np.ndarray]] = {}
+
+    active_q1 = np.flatnonzero(np.any(q1_batch != 0, axis=0))
+    for var in active_q1.tolist():
+        residues = q1_batch[:, int(var)]
+        table_values = np.ones((batch_size, 2), dtype=np.complex128)
+        table_exponents = np.zeros((batch_size, 2), dtype=np.int64)
+        table_values[:, 1] = omega_values[residues]
+        table_exponents[:, 1] = omega_exponents[residues]
+        factors[(int(var),)] = (table_values, table_exponents)
+
+    if q2_support:
+        q2_rows = np.asarray([
+            [int(q.q2.get(edge, 0)) % int(ref_q.mod_q2) for edge in q2_support]
+            for q in q_batch
+        ], dtype=np.int64)
+        q2_residues = np.asarray((q2_rows * q2_lift) % mod_q1, dtype=np.int64)
+        for edge_idx, edge in enumerate(q2_support):
+            residues = q2_residues[:, edge_idx]
+            table_values = np.ones((batch_size, 4), dtype=np.complex128)
+            table_exponents = np.zeros((batch_size, 4), dtype=np.int64)
+            table_values[:, 3] = omega_values[residues]
+            table_exponents[:, 3] = omega_exponents[residues]
+            factors[edge] = (table_values, table_exponents)
+
+    if q3_support:
+        q3_rows = np.asarray([
+            [int(q.q3.get(edge, 0)) % int(ref_q.mod_q3) for edge in q3_support]
+            for q in q_batch
+        ], dtype=np.int64)
+        q3_residues = np.asarray((q3_rows * q3_lift) % mod_q1, dtype=np.int64)
+        for edge_idx, edge in enumerate(q3_support):
+            residues = q3_residues[:, edge_idx]
+            table_values = np.ones((batch_size, 8), dtype=np.complex128)
+            table_exponents = np.zeros((batch_size, 8), dtype=np.int64)
+            table_values[:, 7] = omega_values[residues]
+            table_exponents[:, 7] = omega_exponents[residues]
+            factors[edge] = (table_values, table_exponents)
+
+    return _sum_factor_tables_scaled_batch(
+        ref_q.n,
+        factors,
+        order,
+        scalar=(scalar_values, scalar_exponents),
+    )
 
 
 def _sum_via_treewidth_dp_peeled_scaled(q, order):
@@ -13700,11 +16783,192 @@ def build_state(
         gate_sequence = _rewrite_gate_sequence(gates)
     else:
         gate_sequence = tuple(gates)
-    gate_ops = {name: getattr(state, name) for name in {gate[0] for gate in gate_sequence}}
-    for gate in gate_sequence:
-        gate_ops[gate[0]](*gate[1:])
+    _apply_gate_sequence_to_state(state, gate_sequence)
     state._flush_pending_dead_variables()
     return state
+
+
+_SUBCIRCUIT_MACRO_MIN_TOTAL_GATES = 128
+_SUBCIRCUIT_MACRO_WINDOW_LENGTHS = (32, 24, 16, 12, 8, 6, 5, 4)
+_SUBCIRCUIT_MACRO_SEEN_CACHE_SIZE = 1 << 14
+_SUBCIRCUIT_MACRO_COMPILED_CACHE_SIZE = 1 << 11
+_SUBCIRCUIT_MACRO_PLAN_CACHE_SIZE = 64
+_SUBCIRCUIT_MACRO_PLAN_STEP = "__subcircuit_macro__"
+
+_SubcircuitMacro = Callable[[SchurState, tuple[int, ...]], None]
+_SUBCIRCUIT_MACRO_PLAN_PENDING = object()
+_NO_SUBCIRCUIT_MACRO_PLAN = object()
+_SUBCIRCUIT_MACRO_PLAN_CACHE = _BoundedMemoCache(_SUBCIRCUIT_MACRO_PLAN_CACHE_SIZE)
+
+
+def _apply_gate_sequence_to_state_linear(
+    state: SchurState,
+    gates: Sequence[Gate],
+) -> None:
+    if not gates:
+        return
+    gate_ops = {name: getattr(state, name) for name in {gate[0] for gate in gates}}
+    for gate in gates:
+        gate_ops[gate[0]](*gate[1:])
+
+
+def _subcircuit_qubit_slot(
+    actual_qubit: int,
+    slot_for_qubit: dict[int, int],
+    qubits: list[int],
+) -> int:
+    slot = slot_for_qubit.get(actual_qubit)
+    if slot is not None:
+        return slot
+    slot = len(qubits)
+    slot_for_qubit[actual_qubit] = slot
+    qubits.append(actual_qubit)
+    return slot
+
+
+def _canonicalize_subcircuit_window(
+    gates: Sequence[Gate],
+    start: int,
+    length: int,
+) -> tuple[tuple[Gate, ...], tuple[int, ...]]:
+    template: list[Gate] = []
+    qubits: list[int] = []
+    slot_for_qubit: dict[int, int] = {}
+    stop = start + length
+    for idx in range(start, stop):
+        gate = gates[idx]
+        name = str(gate[0])
+        if name == "rz_dyadic":
+            qubit = _subcircuit_qubit_slot(int(gate[1]), slot_for_qubit, qubits)
+            template.append((name, qubit, int(gate[2]), int(gate[3])))
+            continue
+        if name == "rz_arbitrary":
+            qubit = _subcircuit_qubit_slot(int(gate[1]), slot_for_qubit, qubits)
+            template.append((name, qubit, float(gate[2])))
+            continue
+        if name == "rzz_dyadic":
+            q0 = _subcircuit_qubit_slot(int(gate[1]), slot_for_qubit, qubits)
+            q1 = _subcircuit_qubit_slot(int(gate[2]), slot_for_qubit, qubits)
+            template.append((name, q0, q1, int(gate[3]), int(gate[4])))
+            continue
+        if len(gate) == 2:
+            qubit = _subcircuit_qubit_slot(int(gate[1]), slot_for_qubit, qubits)
+            template.append((name, qubit))
+            continue
+        q0 = _subcircuit_qubit_slot(int(gate[1]), slot_for_qubit, qubits)
+        q1 = _subcircuit_qubit_slot(int(gate[2]), slot_for_qubit, qubits)
+        template.append((name, q0, q1))
+    return tuple(template), tuple(qubits)
+
+
+def _compiled_subcircuit_macro_source_line(
+    gate: Gate,
+    op_alias: str,
+) -> str:
+    name = str(gate[0])
+    if name == "rz_dyadic":
+        return f"    {op_alias}(q{int(gate[1])}, {int(gate[2])}, {int(gate[3])})"
+    if name == "rz_arbitrary":
+        return f"    {op_alias}(q{int(gate[1])}, {float(gate[2])!r})"
+    if name == "rzz_dyadic":
+        return f"    {op_alias}(q{int(gate[1])}, q{int(gate[2])}, {int(gate[3])}, {int(gate[4])})"
+    args = ", ".join(f"q{int(qubit)}" for qubit in gate[1:])
+    return f"    {op_alias}({args})"
+
+
+def _compile_subcircuit_macro(template: tuple[Gate, ...]) -> _SubcircuitMacro:
+    qubit_count = 0
+    for gate in template:
+        name = str(gate[0])
+        if name == "rz_dyadic" or name == "rz_arbitrary":
+            qubit_count = max(qubit_count, int(gate[1]) + 1)
+        elif name == "rzz_dyadic":
+            qubit_count = max(qubit_count, int(gate[1]) + 1, int(gate[2]) + 1)
+        else:
+            qubit_count = max(qubit_count, *(int(qubit) + 1 for qubit in gate[1:]))
+
+    gate_names = tuple(dict.fromkeys(str(gate[0]) for gate in template))
+    op_aliases = {name: f"_op_{idx}" for idx, name in enumerate(gate_names)}
+    lines = ["def _macro(state, qubits):"]
+    for qubit in range(qubit_count):
+        lines.append(f"    q{qubit} = qubits[{qubit}]")
+    for name in gate_names:
+        lines.append(f"    {op_aliases[name]} = state.{name}")
+    for gate in template:
+        lines.append(_compiled_subcircuit_macro_source_line(gate, op_aliases[str(gate[0])]))
+    namespace: dict[str, Any] = {}
+    exec("\n".join(lines), {}, namespace)
+    return namespace["_macro"]
+
+
+def _build_subcircuit_macro_replay_plan(
+    gates: Sequence[Gate],
+) -> tuple[tuple[Any, ...], ...] | None:
+    seen_templates = _BoundedMemoCache(_SUBCIRCUIT_MACRO_SEEN_CACHE_SIZE)
+    compiled_templates = _BoundedMemoCache(_SUBCIRCUIT_MACRO_COMPILED_CACHE_SIZE)
+    plan: list[tuple[Any, ...]] = []
+    macro_count = 0
+    idx = 0
+    gate_count = len(gates)
+    while idx < gate_count:
+        macro_applied = False
+        for window_length in _SUBCIRCUIT_MACRO_WINDOW_LENGTHS:
+            if idx + window_length > gate_count:
+                continue
+            template, qubits = _canonicalize_subcircuit_window(gates, idx, window_length)
+            macro = compiled_templates.get(template)
+            if macro is None and seen_templates.get(template):
+                macro = _compile_subcircuit_macro(template)
+                compiled_templates[template] = macro
+            if macro is not None:
+                plan.append((_SUBCIRCUIT_MACRO_PLAN_STEP, macro, qubits))
+                idx += window_length
+                macro_count += 1
+                macro_applied = True
+                break
+            seen_templates[template] = True
+        if macro_applied:
+            continue
+        plan.append(gates[idx])
+        idx += 1
+    return tuple(plan) if macro_count else None
+
+
+def _apply_gate_sequence_to_state(
+    state: SchurState,
+    gates: Sequence[Gate],
+) -> None:
+    if not gates:
+        return
+    if len(gates) < _SUBCIRCUIT_MACRO_MIN_TOTAL_GATES:
+        _apply_gate_sequence_to_state_linear(state, gates)
+        return
+
+    gate_sequence = gates if isinstance(gates, tuple) else tuple(gates)
+    cached_plan = _SUBCIRCUIT_MACRO_PLAN_CACHE.get(gate_sequence)
+    if cached_plan is None:
+        _SUBCIRCUIT_MACRO_PLAN_CACHE[gate_sequence] = _SUBCIRCUIT_MACRO_PLAN_PENDING
+        _apply_gate_sequence_to_state_linear(state, gate_sequence)
+        return
+    if cached_plan is _SUBCIRCUIT_MACRO_PLAN_PENDING:
+        cached_plan = _build_subcircuit_macro_replay_plan(gate_sequence)
+        _SUBCIRCUIT_MACRO_PLAN_CACHE[gate_sequence] = (
+            _NO_SUBCIRCUIT_MACRO_PLAN if cached_plan is None else cached_plan
+        )
+    elif cached_plan is _NO_SUBCIRCUIT_MACRO_PLAN:
+        _apply_gate_sequence_to_state_linear(state, gate_sequence)
+        return
+
+    if cached_plan is None:
+        _apply_gate_sequence_to_state_linear(state, gate_sequence)
+        return
+
+    gate_ops = {name: getattr(state, name) for name in {gate[0] for gate in gate_sequence}}
+    for step in cached_plan:
+        if step[0] == _SUBCIRCUIT_MACRO_PLAN_STEP:
+            step[1](state, step[2])
+            continue
+        gate_ops[step[0]](*step[1:])
 
 
 def _batch_query_state(
@@ -13787,6 +17051,7 @@ def _batch_query_state(
         )
     results = []
     native_solved = None
+    pending_queries: list[tuple[int, int, PhaseFunction]] = []
     if state.m and cache is not None:
         native_solved = _native_solve_for_output_batch(state.eps0, cache, output_list)
 
@@ -13834,35 +17099,44 @@ def _batch_query_state(
 
         shift_mask, _, gamma, initial_free = solved
         q_free = _aff_compose_cached(state.q, shift_mask, gamma, initial_free, context=context)
-        reduced_total, elim_info = _reduce_and_sum_scaled(q_free, context=context)
-        info = _info(
-            initial_free,
-            elim_info['quad'],
-            elim_info['constraint'],
-            elim_info['branched'],
-            elim_info['remaining'],
-            structural_obstruction=elim_info.get('structural_obstruction', elim_info['remaining']),
-            gauss_obstruction=elim_info.get(
-                'gauss_obstruction',
-                elim_info.get('structural_obstruction', elim_info['remaining']),
-            ),
-            phase_states=elim_info.get('phase_states', 0),
-            phase_splits=elim_info.get('phase_splits', 0),
-            cost_model_r=elim_info.get('cost_r', elim_info['remaining']),
-            phase3_backend=elim_info.get('phase3_backend'),
-        )
-        if analyze_only:
-            results.append(info)
-            continue
+        pending_queries.append((len(results), initial_free, q_free))
+        results.append(None)
 
-        scaled_amp = _normalize_scaled_complex(
-            complex(state.scalar) * reduced_total[0],
-            reduced_total[1] + state.scalar_half_pow2,
+    if pending_queries:
+        reduced_rows = _reduce_and_sum_scaled_batch(
+            [q_free for _result_idx, _initial_free, q_free in pending_queries],
+            context=context,
         )
-        amp = ScaledAmplitude.from_tuple(scaled_amp) if preserve_scale else _scaled_to_complex(scaled_amp)
-        results.append((amp, info))
+        for (result_idx, initial_free, _q_free), (reduced_total, elim_info) in zip(pending_queries, reduced_rows):
+            info = _info(
+                initial_free,
+                elim_info['quad'],
+                elim_info['constraint'],
+                elim_info['branched'],
+                elim_info['remaining'],
+                structural_obstruction=elim_info.get('structural_obstruction', elim_info['remaining']),
+                gauss_obstruction=elim_info.get(
+                    'gauss_obstruction',
+                    elim_info.get('structural_obstruction', elim_info['remaining']),
+                ),
+                phase_states=elim_info.get('phase_states', 0),
+                phase_splits=elim_info.get('phase_splits', 0),
+                cost_model_r=elim_info.get('cost_r', elim_info['remaining']),
+                phase3_backend=elim_info.get('phase3_backend'),
+            )
+            if analyze_only:
+                results[result_idx] = info
+                continue
 
-    return results
+            scaled_amp = _normalize_scaled_complex(
+                complex(state.scalar) * reduced_total[0],
+                reduced_total[1] + state.scalar_half_pow2,
+            )
+            amp = ScaledAmplitude.from_tuple(scaled_amp) if preserve_scale else _scaled_to_complex(scaled_amp)
+            results[result_idx] = (amp, info)
+
+    assert all(result is not None for result in results)
+    return [result for result in results if result is not None]
 
 
 @overload
@@ -13993,6 +17267,195 @@ def compute_amplitudes(
             extended_reductions=extended_reductions,
             analyze_only=False,
         )
+    finally:
+        if _token is not None:
+            _SOLVER_CONFIG_VAR.reset(_token)
+
+
+def compute_circuit_pauli_expectations(
+    circuit: CircuitInput,
+    observables: Sequence[str],
+    *,
+    input_bits: BitSequence | None = None,
+    as_complex: bool = False,
+    allow_tensor_contraction: bool = True,
+    extended_reductions: ExtendedReductionMode | str = "auto",
+    solver_config: SolverConfig | None = None,
+) -> list[tuple[ScaledAmplitude | complex, ReductionInfo]]:
+    """
+    Compute ``<x|U^† P U|x>`` for many Pauli strings while reusing reductions.
+
+    Observables are interpreted in the normalized circuit's qubit order.
+    """
+    from .circuits import normalize_circuit
+
+    spec = normalize_circuit(circuit)
+    prepared_input = list(input_bits) if input_bits is not None else [0] * spec.n_qubits
+    if len(prepared_input) != spec.n_qubits:
+        raise ValueError(f"Expected {spec.n_qubits} input bits, received {len(prepared_input)}.")
+    normalized_observables = _validate_pauli_observables(observables, spec.n_qubits)
+    observable_gate_sets = tuple(_pauli_string_gates(observable) for observable in normalized_observables)
+    inverse_gates = _invert_native_gates(spec.gates)
+    # Global phase cancels in U P U†, so keep the reusable U prefix phase-neutral.
+    base_state = build_state(
+        spec.n_qubits,
+        spec.gates,
+        prepared_input,
+        global_phase_radians=0.0,
+        extended_reductions=extended_reductions,
+    )
+
+    _token = _SOLVER_CONFIG_VAR.set(solver_config) if solver_config is not None else None
+    try:
+        context = _ReductionContext(
+            preserve_scale=not as_complex,
+            allow_tensor_contraction=allow_tensor_contraction,
+            extended_reductions=extended_reductions,
+        )
+        results: list[tuple[ScaledAmplitude | complex, ReductionInfo] | None] = [None] * len(normalized_observables)
+        pending: list[tuple[int, complex, int, int, PhaseFunction]] = []
+        suffix_query_cache: dict[
+            tuple[int, tuple[int, ...], tuple[int, ...]],
+            tuple[EchelonCache, tuple[int, tuple[int, ...], tuple[int, ...], int] | None],
+        ] = {}
+        direct_template = _build_direct_post_replay_template(
+            base_state,
+            inverse_gates,
+            len(normalized_observables),
+        )
+        direct_solved_cache: dict[
+            tuple[int, ...],
+            tuple[int, tuple[int, ...], tuple[int, ...], int] | None,
+        ] = {}
+
+        if direct_template is not None:
+            validation_observable = _build_direct_post_replay_validation_observable(normalized_observables)
+            if validation_observable is not None:
+                validation_state = _build_post_replay_state(
+                    base_state,
+                    _pauli_string_gates(validation_observable),
+                    inverse_gates,
+                )
+                validation_payload = _construct_direct_post_replay_payload(
+                    base_state,
+                    validation_observable,
+                    direct_template,
+                )
+                if not _direct_post_replay_payload_matches_state(
+                    validation_payload,
+                    validation_state,
+                    direct_template,
+                ):
+                    direct_template = None
+
+        for obs_idx, (observable, observable_gates) in enumerate(zip(normalized_observables, observable_gate_sets)):
+            if direct_template is not None:
+                eps0, scalar, scalar_half_pow2, q = _construct_direct_post_replay_payload(
+                    base_state,
+                    observable,
+                    direct_template,
+                )
+                solved_key = tuple(int(bit) & 1 for bit in eps0)
+                if solved_key in direct_solved_cache:
+                    solved = direct_solved_cache[solved_key]
+                else:
+                    solved = _solve_output_from_echelon(
+                        eps0,
+                        direct_template.echelon_cache,
+                        prepared_input,
+                    )
+                    direct_solved_cache[solved_key] = solved
+
+                if solved is None:
+                    info = _info(0, 0, 0, 0, 0, zero=True)
+                    zero_scaled = _make_scaled_complex(0j)
+                    amp = ScaledAmplitude.from_tuple(zero_scaled) if not as_complex else 0j
+                    results[obs_idx] = (amp, info)
+                    continue
+
+                shift_mask, _, gamma, initial_free = solved
+                q_free = _aff_compose_cached(q, shift_mask, gamma, initial_free, context=context)
+                pending.append((obs_idx, scalar, scalar_half_pow2, initial_free, q_free))
+                continue
+
+            state = _build_post_replay_state(base_state, observable_gates, inverse_gates)
+
+            if state._arbitrary_phases:
+                amp, info = state.amplitude(
+                    prepared_input,
+                    as_complex=as_complex,
+                    allow_tensor_contraction=allow_tensor_contraction,
+                    extended_reductions=extended_reductions,
+                    solver_config=solver_config,
+                )
+                results[obs_idx] = (amp, info)
+                continue
+
+            if state.m == 0:
+                ok = all(state.eps0[idx] == prepared_input[idx] for idx in range(state.n))
+                info = _info(0, 0, 0, 0, 0, zero=not ok)
+                if ok:
+                    scaled = _normalize_scaled_complex(
+                        state.scalar * cmath.exp(2j * cmath.pi * float(state.q.q0)),
+                        state.scalar_half_pow2,
+                    )
+                    amp = ScaledAmplitude.from_tuple(scaled) if not as_complex else _scaled_to_complex(scaled)
+                else:
+                    zero_scaled = _make_scaled_complex(0j)
+                    amp = ScaledAmplitude.from_tuple(zero_scaled) if not as_complex else 0j
+                results[obs_idx] = (amp, info)
+                continue
+
+            query_signature = (int(state.m), tuple(int(bit) for bit in state.eps0), tuple(int(mask) for mask in state.eps))
+            cached_query = suffix_query_cache.get(query_signature)
+            if cached_query is None:
+                cache = state._prepare_echelon()
+                solved = state._solve_for_output(cache, prepared_input)
+                suffix_query_cache[query_signature] = (cache, solved)
+            else:
+                cache, solved = cached_query
+            if solved is None:
+                info = _info(0, 0, 0, 0, 0, zero=True)
+                zero_scaled = _make_scaled_complex(0j)
+                amp = ScaledAmplitude.from_tuple(zero_scaled) if not as_complex else 0j
+                results[obs_idx] = (amp, info)
+                continue
+
+            shift_mask, _, gamma, initial_free = solved
+            q_free = _aff_compose_cached(state.q, shift_mask, gamma, initial_free, context=context)
+            pending.append((obs_idx, complex(state.scalar), int(state.scalar_half_pow2), initial_free, q_free))
+
+        if pending:
+            reduced_rows = _reduce_and_sum_scaled_batch(
+                [q_free for _obs_idx, _scalar, _scalar_half_pow2, _initial_free, q_free in pending],
+                context=context,
+            )
+            for (obs_idx, scalar, scalar_half_pow2, initial_free, _q_free), (reduced_total, elim_info) in zip(pending, reduced_rows):
+                info = _info(
+                    initial_free,
+                    elim_info['quad'],
+                    elim_info['constraint'],
+                    elim_info['branched'],
+                    elim_info['remaining'],
+                    structural_obstruction=elim_info.get('structural_obstruction', elim_info['remaining']),
+                    gauss_obstruction=elim_info.get(
+                        'gauss_obstruction',
+                        elim_info.get('structural_obstruction', elim_info['remaining']),
+                    ),
+                    phase_states=elim_info.get('phase_states', 0),
+                    phase_splits=elim_info.get('phase_splits', 0),
+                    cost_model_r=elim_info.get('cost_r', elim_info['remaining']),
+                    phase3_backend=elim_info.get('phase3_backend'),
+                )
+                scaled_amp = _normalize_scaled_complex(
+                    complex(scalar) * reduced_total[0],
+                    reduced_total[1] + int(scalar_half_pow2),
+                )
+                amp = ScaledAmplitude.from_tuple(scaled_amp) if not as_complex else _scaled_to_complex(scaled_amp)
+                results[obs_idx] = (amp, info)
+
+        assert all(result is not None for result in results)
+        return [result for result in results if result is not None]
     finally:
         if _token is not None:
             _SOLVER_CONFIG_VAR.reset(_token)

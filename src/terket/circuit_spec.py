@@ -49,16 +49,30 @@ _QASM_GATE_MAP = {
     "cz": "cz",
 }
 _QASM_QUBIT = re.compile(r"([A-Za-z_][A-Za-z0-9_]*)\[(\d+)\]")
-_QASM_SUPPORTED_GATE_SET = "{h, sx, sxdg, x, t, tdg, s, sdg, z, cnot, cz, rz(theta)}"
+_QASM_SUPPORTED_GATE_SET = "{h, sx, sxdg, x, t, tdg, s, sdg, z, cnot, cz, rz(theta), rx(theta), rzz(theta), u3(theta, phi, lambda)}"
 _MAX_RZ_TOLERANCE = 1e-5
 _EXACT_DYADIC_TOLERANCE = 1e-12
 _EXACT_DYADIC_MAX_LEVEL = 20
 _GLOBAL_PHASE_METADATA_KEY = "global_phase_radians"
+_APPROXIMATION_MODE_METADATA_KEY = "approximation_mode"
+_APPROXIMATION_BASIS_SIZE_METADATA_KEY = "approximation_basis_size"
+_APPROXIMATION_PHASE_COUNT_METADATA_KEY = "approximation_phase_count"
+_APPROXIMATION_RUN_COUNT_METADATA_KEY = "approximation_run_count"
+_APPROXIMATION_TOTAL_RUN_FRO_ERROR_METADATA_KEY = "approximation_total_run_fro_error"
+_APPROXIMATION_MAX_RUN_FRO_ERROR_METADATA_KEY = "approximation_max_run_fro_error"
+_APPROXIMATION_TOTAL_ANGLE_ERROR_METADATA_KEY = "approximation_total_angle_error"
+_APPROXIMATION_MAX_ANGLE_ERROR_METADATA_KEY = "approximation_max_angle_error"
+_APPROXIMATION_TOLERANCE_METADATA_KEY = "approximation_tolerance"
 _ROSS_SELINGER_SUBPROCESS_ONLY = False
 _TEMP_PHASE_GATE = "phase_angle"
+_RZ_COMPILE_MODE_APPROX_DYADIC = "approx_dyadic"
 _RZ_COMPILE_MODE_CLIFFORD_T = "clifford_t"
 _RZ_COMPILE_MODE_DYADIC = "dyadic"
-_RZ_COMPILE_MODES = {_RZ_COMPILE_MODE_CLIFFORD_T, _RZ_COMPILE_MODE_DYADIC}
+_RZ_COMPILE_MODES = {
+    _RZ_COMPILE_MODE_APPROX_DYADIC,
+    _RZ_COMPILE_MODE_CLIFFORD_T,
+    _RZ_COMPILE_MODE_DYADIC,
+}
 _FAST_IMPORT_NATIVE_GATES = frozenset(SUPPORTED_GATES)
 _FAST_IMPORT_GATE_COUNT_THRESHOLD = 4096
 
@@ -85,6 +99,10 @@ class _ImportCompileStats:
     approximated_phase_count: int = 0
     total_angle_error: float = 0.0
     max_angle_error: float = 0.0
+    approximation_basis_size: int = 0
+    approximation_run_count: int = 0
+    total_run_fro_error: float = 0.0
+    max_run_fro_error: float = 0.0
 
     def absorb(self, other: "_ImportCompileStats") -> None:
         self.global_phase_radians = _normalize_global_phase_radians(
@@ -94,6 +112,41 @@ class _ImportCompileStats:
         self.approximated_phase_count += other.approximated_phase_count
         self.total_angle_error += other.total_angle_error
         self.max_angle_error = max(self.max_angle_error, other.max_angle_error)
+        self.approximation_basis_size = max(self.approximation_basis_size, other.approximation_basis_size)
+        self.approximation_run_count += other.approximation_run_count
+        self.total_run_fro_error += other.total_run_fro_error
+        self.max_run_fro_error = max(self.max_run_fro_error, other.max_run_fro_error)
+
+
+@dataclass(frozen=True, slots=True)
+class _ApproximationRunTask:
+    qubit: int
+    exact_unitary: tuple[complex, ...]
+    skeleton: tuple[Gate, ...]
+    global_phase_radians: float
+    approximated_phase_count: int
+
+
+@dataclass(frozen=True, slots=True)
+class _ApproximationRunPlan:
+    compiled_gates: tuple[Gate, ...]
+    global_phase_radians: float
+    approximated_phase_count: int
+    total_angle_error: float
+    max_angle_error: float
+    run_fro_error: float
+
+
+@dataclass(frozen=True, slots=True)
+class _ApproximationAngleAssignment:
+    snapped_angle: float
+    angle_error: float
+
+
+@dataclass(frozen=True, slots=True)
+class _ApproximationClusterPlan:
+    assignments: tuple[_ApproximationAngleAssignment, ...]
+    basis_size: int
 
 
 def make_circuit(
@@ -280,25 +333,57 @@ def parse_openqasm2(
         if line.lower().startswith(("creg ", "barrier ", "measure ", "reset ")):
             continue
 
-        parts = line.split(None, 1)
-        if len(parts) != 2:
+        gate_token_raw, operand_text = _split_qasm_gate_statement(line)
+        if not operand_text:
             raise ValueError(f"Unsupported OpenQASM statement: {raw_line!r}")
-        gate_token = parts[0].lower()
+        gate_token = gate_token_raw.lower()
         gate_name = _QASM_GATE_MAP.get(gate_token)
         gate_angle_expr: str | None = None
         if gate_name is None and gate_token.startswith("rz(") and gate_token.endswith(")"):
             gate_name = "rz"
             gate_angle_expr = gate_token[3:-1]
+        if gate_name is None and gate_token.startswith("rx(") and gate_token.endswith(")"):
+            gate_name = "rx"
+            gate_angle_expr = gate_token[3:-1]
+        if gate_name is None and gate_token.startswith("rzz(") and gate_token.endswith(")"):
+            gate_name = "rzz"
+            gate_angle_expr = gate_token[4:-1]
+        if gate_name is None and gate_token.startswith("u3(") and gate_token.endswith(")"):
+            angle_parts = gate_token[3:-1].split(",")
+            if len(angle_parts) != 3:
+                raise ValueError(f"OpenQASM u3 gate expects three angle parameters: {gate_token_raw!r}.")
+            try:
+                theta = _evaluate_qasm_angle_expr(angle_parts[0].strip())
+                phi = _evaluate_qasm_angle_expr(angle_parts[1].strip())
+                lam = _evaluate_qasm_angle_expr(angle_parts[2].strip())
+            except ValueError as exc:
+                raise ValueError(f"Unsupported u3 angle in {gate_token_raw!r}.") from exc
+            qubit_tokens = [t.strip() for t in operand_text.split(",")]
+            if len(qubit_tokens) != 1:
+                raise ValueError(f"OpenQASM u3 gate expects one qubit, got {len(qubit_tokens)}.")
+            qubit = _parse_qasm_qubit(qubit_tokens[0], offsets, qregs)
+            op_gates, op_phase = _compile_u3_gate(
+                theta,
+                phi,
+                lam,
+                qubit,
+                tolerance=rz_tolerance,
+            )
+            raw_gates.extend(op_gates)
+            global_phase_radians = _normalize_global_phase_radians(
+                global_phase_radians + op_phase
+            )
+            continue
         if gate_name is None:
             raise ValueError(
-                f"Unsupported OpenQASM gate: {parts[0]!r}. "
+                f"Unsupported OpenQASM gate: {gate_token_raw!r}. "
                 f"TerKet supports only Clifford+T gates {_QASM_SUPPORTED_GATE_SET}. "
                 "Consider transpiling to this gate set first."
             )
-        operands = [_parse_qasm_qubit(token.strip(), offsets, qregs) for token in parts[1].split(",")]
+        operands = [_parse_qasm_qubit(token.strip(), offsets, qregs) for token in operand_text.split(",")]
         if gate_name == "rz":
             if len(operands) != 1:
-                raise ValueError(f"OpenQASM gate {parts[0]!r} expects one qubit.")
+                raise ValueError(f"OpenQASM gate {gate_token_raw!r} expects one qubit.")
             if gate_angle_expr is None:  # pragma: no cover - internal guard
                 raise ValueError("Missing OpenQASM rz angle.")
             try:
@@ -317,12 +402,72 @@ def parse_openqasm2(
                     raw_gates.append(phase_gate)
             else:
                 raw_gates.append((_TEMP_PHASE_GATE, operands[0], angle))
+            global_phase_radians = _normalize_global_phase_radians(
+                global_phase_radians - 0.5 * angle
+            )
+        elif gate_name == "rx":
+            if len(operands) != 1:
+                raise ValueError(f"OpenQASM gate {gate_token_raw!r} expects one qubit.")
+            if gate_angle_expr is None:  # pragma: no cover - internal guard
+                raise ValueError("Missing OpenQASM rx angle.")
+            try:
+                angle = _evaluate_qasm_angle_expr(gate_angle_expr)
+            except ValueError as exc:
+                raise ValueError(
+                    f"Unsupported rx angle {gate_angle_expr!r}. Only numeric expressions over pi are supported."
+                ) from exc
+            raw_gates.append(("h", operands[0]))
+            if compile_mode == _RZ_COMPILE_MODE_DYADIC:
+                phase_gate, exact_angle = _exact_phase_gate_from_angle(
+                    angle,
+                    operands[0],
+                    source=f"Unsupported rx angle {gate_angle_expr!r}",
+                )
+                if phase_gate is not None:
+                    raw_gates.append(phase_gate)
+            else:
+                raw_gates.append((_TEMP_PHASE_GATE, operands[0], angle))
+            raw_gates.append(("h", operands[0]))
+            global_phase_radians = _normalize_global_phase_radians(
+                global_phase_radians - 0.5 * angle
+            )
+        elif gate_name == "rzz":
+            if len(operands) != 2:
+                raise ValueError(f"OpenQASM gate {gate_token_raw!r} expects two qubits.")
+            if gate_angle_expr is None:  # pragma: no cover - internal guard
+                raise ValueError("Missing OpenQASM rzz angle.")
+            try:
+                angle = _evaluate_qasm_angle_expr(gate_angle_expr)
+            except ValueError as exc:
+                raise ValueError(
+                    f"Unsupported rzz angle {gate_angle_expr!r}. Only numeric expressions over pi are supported."
+                ) from exc
+            if compile_mode == _RZ_COMPILE_MODE_DYADIC:
+                exact = _exact_dyadic_phase_from_angle(angle)
+                if exact is not None:
+                    coeff, precision_level = exact
+                    raw_gates.append(("rzz_dyadic", operands[0], operands[1], coeff, precision_level))
+                else:
+                    raw_gates.append(("cnot", operands[0], operands[1]))
+                    raw_gates.append((_TEMP_PHASE_GATE, operands[1], angle))
+                    raw_gates.append(("cnot", operands[0], operands[1]))
+            else:
+                raw_gates.append(("cnot", operands[0], operands[1]))
+                raw_gates.append((_TEMP_PHASE_GATE, operands[1], angle))
+                raw_gates.append(("cnot", operands[0], operands[1]))
+            global_phase_radians = _normalize_global_phase_radians(
+                global_phase_radians - 0.5 * angle
+            )
         else:
             raw_gates.append((gate_name, *operands))
 
     fast_import = _fast_import_gate_sequence_if_supported(raw_gates)
     if fast_import is None:
-        compiled_gates, compile_stats = _compile_import_gate_sequence(raw_gates, tolerance=rz_tolerance)
+        compiled_gates, compile_stats = _compile_import_gate_sequence(
+            raw_gates,
+            tolerance=rz_tolerance,
+            compile_mode=compile_mode,
+        )
     else:
         compiled_gates = fast_import
         compile_stats = _ImportCompileStats()
@@ -334,7 +479,12 @@ def parse_openqasm2(
         n_qubits,
         compiled_gates,
         name=name,
-        metadata=_metadata_with_global_phase(global_phase_radians),
+        metadata=_metadata_with_import_stats(
+            global_phase_radians,
+            compile_stats,
+            compile_mode=compile_mode,
+            tolerance=rz_tolerance,
+        ),
     )
 
 
@@ -345,6 +495,20 @@ def _looks_like_openqasm3(source: str) -> bool:
             continue
         return line.startswith("openqasm 3")
     return False
+
+
+def _split_qasm_gate_statement(line: str) -> tuple[str, str]:
+    depth = 0
+    for idx, char in enumerate(line):
+        if char == "(":
+            depth += 1
+            continue
+        if char == ")":
+            depth = max(0, depth - 1)
+            continue
+        if char.isspace() and depth == 0:
+            return line[:idx], line[idx:].strip()
+    return line, ""
 
 
 def _parse_openqasm3_via_qiskit(
@@ -395,12 +559,17 @@ def from_qiskit(
             instruction.operation,
             qubits,
             compile_mode=compile_mode,
+            tolerance=rz_tolerance,
         )
         raw_gates.extend(op_gates)
         global_phase_radians = _normalize_global_phase_radians(global_phase_radians + op_phase)
     fast_import = _fast_import_gate_sequence_if_supported(raw_gates)
     if fast_import is None:
-        compiled_gates, compile_stats = _compile_import_gate_sequence(raw_gates, tolerance=rz_tolerance)
+        compiled_gates, compile_stats = _compile_import_gate_sequence(
+            raw_gates,
+            tolerance=rz_tolerance,
+            compile_mode=compile_mode,
+        )
     else:
         compiled_gates = fast_import
         compile_stats = _ImportCompileStats()
@@ -411,7 +580,12 @@ def from_qiskit(
         circuit.num_qubits,
         compiled_gates,
         name=getattr(circuit, "name", None),
-        metadata=_metadata_with_global_phase(global_phase_radians),
+        metadata=_metadata_with_import_stats(
+            global_phase_radians,
+            compile_stats,
+            compile_mode=compile_mode,
+            tolerance=rz_tolerance,
+        ),
     )
 
 
@@ -429,7 +603,28 @@ def _qiskit_unitary_data(circuit: Any) -> Sequence[Any]:
             end -= 1
             continue
         break
-    return data[:end]
+    kept = data[:end]
+    for idx, instruction in enumerate(kept):
+        name = instruction.operation.name.lower()
+        if name == "measure":
+            raise ValueError(
+                "Unsupported Qiskit circuit: mid-circuit measurement at instruction "
+                f"{idx}. TerKet import supports only unitary circuits plus optional "
+                "trailing measurements."
+            )
+        if name == "reset":
+            raise ValueError(
+                "Unsupported Qiskit circuit: reset at instruction "
+                f"{idx}. TerKet import supports only unitary circuits plus optional "
+                "trailing measurements."
+            )
+        if name == "if_else" or getattr(instruction.operation, "condition", None) is not None or instruction.clbits:
+            raise ValueError(
+                "Unsupported Qiskit circuit: classical control at instruction "
+                f"{idx} ({instruction.operation.name!r}). TerKet import supports only "
+                "unitary circuits plus optional trailing measurements."
+            )
+    return kept
 
 
 def _phase_gate_raw_gates(
@@ -621,6 +816,7 @@ def _qiskit_operation_to_raw_gates(
     qubits: Sequence[int],
     *,
     compile_mode: str,
+    tolerance: float,
 ) -> tuple[list[Gate], float]:
     op_name = operation.name.lower()
     name = _QASM_GATE_MAP.get(op_name)
@@ -652,6 +848,20 @@ def _qiskit_operation_to_raw_gates(
             source=f"Unsupported Qiskit phase angle {operation.params[0]!r}",
             rz_global_phase=False,
         )
+    if op_name == "rx":
+        if len(qubits) != 1:
+            raise ValueError(f"Unsupported Qiskit gate arity for {operation.name!r}.")
+        raw_gates: list[Gate] = [("h", qubits[0])]
+        phase = _extend_phase_gate(
+            raw_gates,
+            operation.params[0],
+            qubits[0],
+            compile_mode=compile_mode,
+            source=f"Unsupported Qiskit rx angle {operation.params[0]!r}",
+            rz_global_phase=True,
+        )
+        raw_gates.append(("h", qubits[0]))
+        return raw_gates, phase
     if op_name in {"cp", "cu1"}:
         if len(qubits) != 2:
             raise ValueError(f"Unsupported Qiskit gate arity for {operation.name!r}.")
@@ -688,9 +898,46 @@ def _qiskit_operation_to_raw_gates(
     if op_name in {"u", "u2", "u3"}:
         if len(qubits) != 1:
             raise ValueError(f"Unsupported Qiskit gate arity for {operation.name!r}.")
+        if compile_mode == _RZ_COMPILE_MODE_CLIFFORD_T:
+            if op_name == "u2":
+                theta = math.pi / 2.0
+                phi = _coerce_finite_radians(
+                    operation.params[0],
+                    source=f"Unsupported Qiskit u2 angle {operation.params[0]!r}",
+                )
+                lam = _coerce_finite_radians(
+                    operation.params[1],
+                    source=f"Unsupported Qiskit u2 angle {operation.params[1]!r}",
+                )
+            else:
+                theta = _coerce_finite_radians(
+                    operation.params[0],
+                    source=f"Unsupported Qiskit {op_name} angle {operation.params[0]!r}",
+                )
+                phi = _coerce_finite_radians(
+                    operation.params[1],
+                    source=f"Unsupported Qiskit {op_name} angle {operation.params[1]!r}",
+                )
+                lam = _coerce_finite_radians(
+                    operation.params[2],
+                    source=f"Unsupported Qiskit {op_name} angle {operation.params[2]!r}",
+                )
+            compiled_gates, compiled_phase = _compile_u3_gate(
+                theta,
+                phi,
+                lam,
+                qubits[0],
+                tolerance=tolerance,
+            )
+            return list(compiled_gates), compiled_phase
         decomposer = _qiskit_one_qubit_psx_decomposer()
         decomposed = decomposer(operation)
-        return _qiskit_circuit_to_raw_gates(decomposed, qubits=qubits, compile_mode=compile_mode)
+        return _qiskit_circuit_to_raw_gates(
+            decomposed,
+            qubits=qubits,
+            compile_mode=compile_mode,
+            tolerance=tolerance,
+        )
     if op_name == "rzz":
         if len(qubits) != 2:
             raise ValueError(f"Unsupported Qiskit gate arity for {operation.name!r}.")
@@ -712,10 +959,20 @@ def _qiskit_operation_to_raw_gates(
 
     definition = getattr(operation, "definition", None)
     if definition is not None:
-        return _qiskit_circuit_to_raw_gates(definition, qubits=qubits, compile_mode=compile_mode)
+        return _qiskit_circuit_to_raw_gates(
+            definition,
+            qubits=qubits,
+            compile_mode=compile_mode,
+            tolerance=tolerance,
+        )
 
     synthesized = _synthesize_qiskit_operation(operation, len(qubits))
-    return _qiskit_circuit_to_raw_gates(synthesized, qubits=qubits, compile_mode=compile_mode)
+    return _qiskit_circuit_to_raw_gates(
+        synthesized,
+        qubits=qubits,
+        compile_mode=compile_mode,
+        tolerance=tolerance,
+    )
 
 
 def _qiskit_circuit_to_raw_gates(
@@ -723,6 +980,7 @@ def _qiskit_circuit_to_raw_gates(
     *,
     qubits: Sequence[int],
     compile_mode: str,
+    tolerance: float,
 ) -> tuple[list[Gate], float]:
     qubit_indices = {qubit: idx for idx, qubit in enumerate(circuit.qubits)}
     raw_gates: list[Gate] = []
@@ -738,6 +996,7 @@ def _qiskit_circuit_to_raw_gates(
             instruction.operation,
             mapped_qubits,
             compile_mode=compile_mode,
+            tolerance=tolerance,
         )
         raw_gates.extend(op_gates)
         global_phase_radians = _normalize_global_phase_radians(global_phase_radians + op_phase)
@@ -763,6 +1022,14 @@ def _synthesize_qiskit_operation(operation: Any, n_qubits: int):
         raise ValueError(f"Unsupported Qiskit gate: {operation.name!r}") from exc
 
 
+def _qiskit_u_gate(theta: float, phi: float, lam: float):
+    try:
+        from qiskit.circuit.library import UGate
+    except ImportError as exc:  # pragma: no cover - depends on optional qiskit install
+        raise RuntimeError("Qiskit is required to import OpenQASM u3 gates.") from exc
+    return UGate(theta, phi, lam)
+
+
 @lru_cache(maxsize=1)
 def _qiskit_one_qubit_psx_decomposer():
     try:
@@ -784,7 +1051,7 @@ def _fast_import_gate_sequence_if_supported(raw_gates: Sequence[Gate]) -> tuple[
         if gate[0] not in _FAST_IMPORT_NATIVE_GATES:
             return None
         normalized.append(gate)
-    return tuple(normalized)
+    return _rewrite_gate_sequence_local(tuple(normalized))
 
 
 def to_qiskit(circuit: Any):
@@ -892,6 +1159,8 @@ def _gate_qubits(gate: Gate) -> tuple[int, ...]:
     name = gate[0]
     if name in {"rz_dyadic", "rz_arbitrary"}:
         return (gate[1],)
+    if name == "rzz_dyadic":
+        return int(gate[1]), int(gate[2])
     return tuple(int(qubit) for qubit in gate[1:])
 
 
@@ -970,6 +1239,15 @@ def _simplify_local_gate_window(rewritten: list[Gate], start: int) -> None:
         if idx + 1 < len(rewritten):
             left = rewritten[idx]
             right = rewritten[idx + 1]
+            left_rzz = _rzz_dyadic_spec(left)
+            right_rzz = _rzz_dyadic_spec(right)
+            if left_rzz is not None and right_rzz is not None:
+                if frozenset((left_rzz[0], left_rzz[1])) == frozenset((right_rzz[0], right_rzz[1])):
+                    level = max(left_rzz[3], right_rzz[3])
+                    coeff = (left_rzz[2] << (level - left_rzz[3])) + (right_rzz[2] << (level - right_rzz[3]))
+                    rewritten[idx:idx + 2] = list(_emit_rzz_dyadic_gate(left_rzz[0], left_rzz[1], coeff, level))
+                    idx = max(0, idx - 2)
+                    continue
             if left[0] == "sx" and right == left:
                 rewritten[idx:idx + 2] = [("x", int(left[1]))]
                 idx = max(0, idx - 2)
@@ -991,6 +1269,11 @@ def _simplify_local_gate_window(rewritten: list[Gate], start: int) -> None:
             first = rewritten[idx]
             second = rewritten[idx + 1]
             third = rewritten[idx + 2]
+            second_phase = _diagonal_phase_spec(second)
+            if first == third and first[0] == "cnot" and second_phase is not None and int(first[2]) == int(second_phase[0]):
+                rewritten[idx:idx + 3] = list(_emit_rzz_dyadic_gate(int(first[1]), int(first[2]), second_phase[1], second_phase[2]))
+                idx = max(0, idx - 2)
+                continue
             if first == third and first[0] == "h" and int(first[1]) == int(second[1]):
                 qubit = int(first[1])
                 if second[0] == "z":
@@ -1038,6 +1321,12 @@ def _combine_dyadic_phases(left: tuple[int, int, int], right: tuple[int, int, in
     return qubit, coeff, level
 
 
+def _rzz_dyadic_spec(gate: Gate) -> tuple[int, int, int, int] | None:
+    if gate[0] != "rzz_dyadic":
+        return None
+    return int(gate[1]), int(gate[2]), int(gate[3]), int(gate[4])
+
+
 def _emit_dyadic_phase_gate(qubit: int, coeff: int, level: int) -> tuple[Gate, ...]:
     coeff, level = _normalize_dyadic_phase(coeff, level)
     modulus = 1 << level
@@ -1054,6 +1343,29 @@ def _emit_dyadic_phase_gate(qubit: int, coeff: int, level: int) -> tuple[Gate, .
     if named is not None:
         return ((named[0], qubit),)
     return (("rz_dyadic", qubit, coeff, level),)
+
+
+def _emit_rzz_dyadic_gate(q0: int, q1: int, coeff: int, level: int) -> tuple[Gate, ...]:
+    coeff, level = _normalize_dyadic_phase(coeff, level)
+    modulus = 1 << level
+    coeff %= modulus
+    if coeff == 0:
+        return ()
+    return (("rzz_dyadic", int(q0), int(q1), coeff, level),)
+
+
+def _rewrite_gate_sequence_local(gates: Sequence[Gate]) -> tuple[Gate, ...]:
+    """Apply only linear-time local rewrites without commutation search."""
+    rewritten: list[Gate] = []
+    for raw_gate in gates:
+        gate = _normalize_gate(raw_gate)
+        if gate[0] in _SELF_INVERSE_GATES and rewritten and rewritten[-1] == gate:
+            rewritten.pop()
+            _simplify_local_gate_window(rewritten, len(rewritten) - 1)
+            continue
+        rewritten.append(gate)
+        _simplify_local_gate_window(rewritten, len(rewritten) - 1)
+    return tuple(rewritten)
 
 
 def _rewrite_gate_sequence(gates: Sequence[Gate]) -> tuple[Gate, ...]:
@@ -1171,6 +1483,32 @@ def _metadata_with_global_phase(global_phase_radians: float) -> dict[str, Any]:
     if normalized == 0.0:
         return {}
     return {_GLOBAL_PHASE_METADATA_KEY: normalized}
+
+
+def _metadata_with_import_stats(
+    global_phase_radians: float,
+    compile_stats: _ImportCompileStats,
+    *,
+    compile_mode: str,
+    tolerance: float,
+) -> dict[str, Any]:
+    metadata = _metadata_with_global_phase(global_phase_radians)
+    if compile_mode != _RZ_COMPILE_MODE_APPROX_DYADIC or compile_stats.approximated_phase_count == 0:
+        return metadata
+    metadata.update(
+        {
+            _APPROXIMATION_MODE_METADATA_KEY: compile_mode,
+            _APPROXIMATION_BASIS_SIZE_METADATA_KEY: int(compile_stats.approximation_basis_size),
+            _APPROXIMATION_PHASE_COUNT_METADATA_KEY: int(compile_stats.approximated_phase_count),
+            _APPROXIMATION_RUN_COUNT_METADATA_KEY: int(compile_stats.approximation_run_count),
+            _APPROXIMATION_TOTAL_RUN_FRO_ERROR_METADATA_KEY: float(compile_stats.total_run_fro_error),
+            _APPROXIMATION_MAX_RUN_FRO_ERROR_METADATA_KEY: float(compile_stats.max_run_fro_error),
+            _APPROXIMATION_TOTAL_ANGLE_ERROR_METADATA_KEY: float(compile_stats.total_angle_error),
+            _APPROXIMATION_MAX_ANGLE_ERROR_METADATA_KEY: float(compile_stats.max_angle_error),
+            _APPROXIMATION_TOLERANCE_METADATA_KEY: float(tolerance),
+        }
+    )
+    return metadata
 
 
 def _circuit_global_phase_radians(spec: CircuitSpec) -> float:
@@ -1376,11 +1714,237 @@ def _matrix_from_key(matrix_key: tuple[complex, ...]) -> np.ndarray:
     return np.array(matrix_key, dtype=complex).reshape(2, 2)
 
 
+def _u3_matrix(theta: float, phi: float, lam: float) -> np.ndarray:
+    half_theta = 0.5 * theta
+    cos_half = math.cos(half_theta)
+    sin_half = math.sin(half_theta)
+    phi_phase = cmath.exp(1j * phi)
+    lam_phase = cmath.exp(1j * lam)
+    return np.array(
+        [
+            [cos_half, -lam_phase * sin_half],
+            [phi_phase * sin_half, phi_phase * lam_phase * cos_half],
+        ],
+        dtype=complex,
+    )
+
+
+def _compile_u3_gate(
+    theta: float,
+    phi: float,
+    lam: float,
+    qubit: int,
+    *,
+    tolerance: float,
+) -> tuple[tuple[Gate, ...], float]:
+    try:
+        template_gates, template_phase = _ross_selinger_unitary_template(
+            _unitary_key(_u3_matrix(theta, phi, lam)),
+            tolerance,
+        )
+        return _retarget_single_qubit_gates(template_gates, qubit), template_phase
+    except RuntimeError:
+        return _compile_u3_gate_via_psx(theta, phi, lam, qubit, tolerance=tolerance)
+
+
 def _one_qubit_run_unitary(run: Sequence[Gate]) -> np.ndarray:
     unitary = _ONE_QUBIT_IDENTITY.copy()
     for gate in run:
         unitary = _one_qubit_gate_matrix(gate) @ unitary
     return unitary
+
+
+def _periodic_angle_distance(angle: float, other: float) -> float:
+    return abs(_normalize_phase_angle(angle - other))
+
+
+def _circular_mean(angles: Sequence[float]) -> float:
+    if not angles:
+        return 0.0
+    vector = sum(cmath.exp(1j * angle) for angle in angles)
+    if abs(vector) < 1e-15:
+        return _normalize_phase_angle(float(angles[0]))
+    return _normalize_phase_angle(cmath.phase(vector))
+
+
+def _nearest_dyadic_phase(angle: float) -> tuple[float, float]:
+    coeff, level, error = dyadic_snap(angle, max_level=_EXACT_DYADIC_MAX_LEVEL, nearest=True)
+    return _normalize_phase_angle(_dyadic_phase_to_angle(coeff, level)), float(error)
+
+
+def _phase_gates_from_snapped_angle(qubit: int, angle: float) -> tuple[Gate, ...]:
+    gate, _ = _exact_phase_gate_from_angle(angle, qubit, source="Internal snapped dyadic angle")
+    if gate is None:
+        return ()
+    return (gate,)
+
+
+def _approximation_run_unitary(compiled_gates: Sequence[Gate], global_phase_radians: float) -> np.ndarray:
+    return cmath.exp(1j * global_phase_radians) * _one_qubit_run_unitary(compiled_gates)
+
+
+def _prepare_approximation_run_task(
+    qubit: int,
+    run: Sequence[Gate],
+    *,
+    tolerance: float,
+) -> tuple[tuple[Gate, ...], _ImportCompileStats] | _ApproximationRunTask:
+    if not run:
+        return (), _ImportCompileStats()
+
+    normalized_run = tuple(
+        gate if gate[0] == _TEMP_PHASE_GATE else _normalize_gate(gate)
+        for gate in run
+    )
+    phase_gate_count = sum(1 for gate in normalized_run if gate[0] == _TEMP_PHASE_GATE)
+    if phase_gate_count == 0:
+        return _rewrite_gate_sequence(normalized_run), _ImportCompileStats()
+
+    exact_run = _exact_single_qubit_run(normalized_run)
+    if exact_run is not None:
+        return exact_run, _ImportCompileStats(exact_dyadic_phase_count=phase_gate_count)
+
+    if all(_phase_angle_from_gate(gate) is not None for gate in normalized_run):
+        total_angle = 0.0
+        for gate in normalized_run:
+            phase_angle = _phase_angle_from_gate(gate)
+            if phase_angle is None:  # pragma: no cover - guarded above
+                raise ValueError(f"Unsupported diagonal gate {gate!r}.")
+            total_angle = _normalize_phase_angle(total_angle + phase_angle)
+        return _ApproximationRunTask(
+            qubit=qubit,
+            exact_unitary=_unitary_key(_phase_gate_matrix(total_angle)),
+            skeleton=((_TEMP_PHASE_GATE, qubit, total_angle),),
+            global_phase_radians=0.0,
+            approximated_phase_count=1,
+        )
+
+    unitary = _one_qubit_run_unitary(normalized_run)
+    decomposed = _qiskit_one_qubit_psx_decomposer()(unitary)
+    raw_gates, phase = _qiskit_circuit_to_raw_gates(
+        decomposed,
+        qubits=(qubit,),
+        compile_mode=_RZ_COMPILE_MODE_APPROX_DYADIC,
+        tolerance=tolerance,
+    )
+    skeleton = tuple(
+        gate if gate[0] == _TEMP_PHASE_GATE else _normalize_gate(gate)
+        for gate in raw_gates
+    )
+    approximated_phase_count = sum(1 for gate in skeleton if gate[0] == _TEMP_PHASE_GATE)
+    return _ApproximationRunTask(
+        qubit=qubit,
+        exact_unitary=_unitary_key(unitary),
+        skeleton=skeleton,
+        global_phase_radians=_normalize_global_phase_radians(float(phase)),
+        approximated_phase_count=approximated_phase_count,
+    )
+
+
+def _cluster_approximation_angles(
+    angles: Sequence[float],
+    *,
+    tolerance: float,
+) -> _ApproximationClusterPlan:
+    if not angles:
+        return _ApproximationClusterPlan(assignments=(), basis_size=0)
+    if tolerance <= 0.0:
+        raise ValueError(
+            "approx_dyadic mode requires positive rz_tolerance for non-dyadic single-qubit runs."
+        )
+
+    cluster_radius = 0.5 * tolerance
+    clusters: list[list[int]] = []
+    centers: list[float] = []
+
+    for idx, angle in enumerate(angles):
+        best_cluster = -1
+        best_distance = math.inf
+        for cluster_idx, center in enumerate(centers):
+            distance = _periodic_angle_distance(angle, center)
+            if distance <= cluster_radius and distance < best_distance:
+                best_cluster = cluster_idx
+                best_distance = distance
+        if best_cluster < 0:
+            clusters.append([idx])
+            centers.append(angle)
+        else:
+            clusters[best_cluster].append(idx)
+            centers[best_cluster] = _circular_mean([angles[item] for item in clusters[best_cluster]])
+
+    assignments: list[_ApproximationAngleAssignment | None] = [None] * len(angles)
+    pending_singletons: list[int] = []
+
+    for cluster in clusters:
+        center = _circular_mean([angles[idx] for idx in cluster])
+        snapped_center, _center_error = _nearest_dyadic_phase(center)
+        member_errors = [_periodic_angle_distance(angles[idx], snapped_center) for idx in cluster]
+        if any(error > tolerance for error in member_errors):
+            pending_singletons.extend(cluster)
+            continue
+        for idx, error in zip(cluster, member_errors):
+            assignments[idx] = _ApproximationAngleAssignment(snapped_angle=snapped_center, angle_error=error)
+
+    for idx in pending_singletons:
+        snapped_angle, error = _nearest_dyadic_phase(angles[idx])
+        if error > tolerance:
+            raise ValueError(
+                f"Nearest dyadic phase for angle {angles[idx]!r} exceeds tolerance {tolerance:.3e}: {error:.3e}."
+            )
+        assignments[idx] = _ApproximationAngleAssignment(snapped_angle=snapped_angle, angle_error=error)
+
+    finalized = tuple(
+        assignment if assignment is not None else _ApproximationAngleAssignment(0.0, 0.0)
+        for assignment in assignments
+    )
+    basis_size = len({assignment.snapped_angle for assignment in finalized})
+    return _ApproximationClusterPlan(assignments=finalized, basis_size=basis_size)
+
+
+def _compile_approximation_runs(
+    tasks: Sequence[_ApproximationRunTask],
+    *,
+    tolerance: float,
+) -> tuple[tuple[tuple[Gate, ...], ...], _ImportCompileStats]:
+    all_angles = tuple(
+        float(gate[2])
+        for task in tasks
+        for gate in task.skeleton
+        if gate[0] == _TEMP_PHASE_GATE
+    )
+    cluster_plan = _cluster_approximation_angles(all_angles, tolerance=tolerance)
+    compiled_runs: list[tuple[Gate, ...]] = []
+    stats = _ImportCompileStats(approximation_basis_size=cluster_plan.basis_size)
+    assignment_idx = 0
+
+    for task in tasks:
+        compiled: list[Gate] = []
+        angle_errors: list[float] = []
+        for gate in task.skeleton:
+            if gate[0] != _TEMP_PHASE_GATE:
+                compiled.append(gate)
+                continue
+            assignment = cluster_plan.assignments[assignment_idx]
+            assignment_idx += 1
+            compiled.extend(_phase_gates_from_snapped_angle(task.qubit, assignment.snapped_angle))
+            angle_errors.append(assignment.angle_error)
+        compiled_run = _rewrite_gate_sequence(tuple(compiled))
+        approx_unitary = _approximation_run_unitary(compiled_run, task.global_phase_radians)
+        exact_unitary = _matrix_from_key(task.exact_unitary)
+        run_fro_error = float(np.linalg.norm(exact_unitary - approx_unitary, ord="fro"))
+        compiled_runs.append(compiled_run)
+        stats.absorb(
+            _ImportCompileStats(
+                global_phase_radians=task.global_phase_radians,
+                approximated_phase_count=task.approximated_phase_count,
+                total_angle_error=sum(angle_errors),
+                max_angle_error=max(angle_errors, default=0.0),
+                approximation_run_count=1,
+                total_run_fro_error=run_fro_error,
+                max_run_fro_error=run_fro_error,
+            )
+        )
+    return tuple(compiled_runs), stats
 
 
 def _compile_one_qubit_run(
@@ -1457,8 +2021,12 @@ def _compile_import_gate_sequence(
     raw_gates: Sequence[Gate],
     *,
     tolerance: float,
+    compile_mode: str,
 ) -> tuple[tuple[Gate, ...], _ImportCompileStats]:
     merged_gates = _merge_import_diagonal_phases(raw_gates)
+    if compile_mode == _RZ_COMPILE_MODE_APPROX_DYADIC:
+        return _compile_import_gate_sequence_approx_dyadic(merged_gates, tolerance=tolerance)
+
     compiled: list[Gate] = []
     stats = _ImportCompileStats()
     pending_runs: dict[int, list[Gate]] = {}
@@ -1484,6 +2052,64 @@ def _compile_import_gate_sequence(
     for qubit in sorted(pending_runs):
         flush_qubit(qubit)
 
+    # Skip the global rewrite pass for large circuits: each qubit run was already
+    # locally rewritten inside _compile_one_qubit_run, and the O(n²) backward
+    # scan in _rewrite_gate_sequence is not worth it for cross-run merges.
+    if len(compiled) >= _FAST_IMPORT_GATE_COUNT_THRESHOLD:
+        return _rewrite_gate_sequence_local(compiled), stats
+    return _rewrite_gate_sequence(compiled), stats
+
+
+def _compile_import_gate_sequence_approx_dyadic(
+    merged_gates: Sequence[Gate],
+    *,
+    tolerance: float,
+) -> tuple[tuple[Gate, ...], _ImportCompileStats]:
+    sequence: list[Gate | _ApproximationRunTask | tuple[tuple[Gate, ...], _ImportCompileStats]] = []
+    pending_runs: dict[int, list[Gate]] = {}
+
+    def flush_qubit(qubit: int) -> None:
+        run = pending_runs.pop(qubit, None)
+        if not run:
+            return
+        sequence.append(_prepare_approximation_run_task(qubit, tuple(run), tolerance=tolerance))
+
+    for gate in merged_gates:
+        if _is_single_qubit_import_gate(gate):
+            qubit = _gate_qubits_import(gate)[0]
+            pending_runs.setdefault(qubit, []).append(gate)
+            continue
+        for qubit in sorted(_gate_qubits_import(gate)):
+            flush_qubit(qubit)
+        sequence.append(_normalize_gate(gate))
+
+    for qubit in sorted(pending_runs):
+        flush_qubit(qubit)
+
+    approx_tasks = [entry for entry in sequence if isinstance(entry, _ApproximationRunTask)]
+    compiled_task_runs: tuple[tuple[Gate, ...], ...] = ()
+    approx_stats = _ImportCompileStats()
+    if approx_tasks:
+        compiled_task_runs, approx_stats = _compile_approximation_runs(approx_tasks, tolerance=tolerance)
+    compiled: list[Gate] = []
+    stats = _ImportCompileStats()
+    task_idx = 0
+
+    for entry in sequence:
+        if isinstance(entry, tuple) and entry and isinstance(entry[0], tuple):
+            compiled_run, run_stats = entry
+            compiled.extend(compiled_run)
+            stats.absorb(run_stats)
+            continue
+        if isinstance(entry, _ApproximationRunTask):
+            compiled.extend(compiled_task_runs[task_idx])
+            task_idx += 1
+            continue
+        compiled.append(entry)
+
+    stats.absorb(approx_stats)
+    if len(compiled) >= _FAST_IMPORT_GATE_COUNT_THRESHOLD:
+        return _rewrite_gate_sequence_local(compiled), stats
     return _rewrite_gate_sequence(compiled), stats
 
 
@@ -1564,12 +2190,20 @@ payload = {
 }
 print(json.dumps(payload))
 """
-    completed = subprocess.run(
-        [sys.executable, "-c", script, kind, repr(angle), repr(epsilon)],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
+    def _run_subprocess(a: float):
+        return subprocess.run(
+            [sys.executable, "-c", script, kind, repr(a), repr(epsilon)],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+    completed = _run_subprocess(angle)
+    if completed.returncode != 0 and "panicked" in (completed.stderr or ""):
+        # rsgridsynth aborts (SIGABRT) for certain angles — nudge past the
+        # degenerate ring-arithmetic point and retry. The perturbation is
+        # negligible relative to the synthesis tolerance.
+        completed = _run_subprocess(angle + 1e-10)
     if completed.returncode != 0:
         stderr = (completed.stderr or "").strip()
         stdout = (completed.stdout or "").strip()
@@ -1805,6 +2439,34 @@ def _compile_phase_gate(
         is_exact_dyadic,
         angle_error,
     )
+
+
+def _compile_u3_gate_via_psx(
+    theta: float,
+    phi: float,
+    lam: float,
+    qubit: int,
+    *,
+    tolerance: float,
+) -> tuple[tuple[Gate, ...], float]:
+    compiled: list[Gate] = []
+    global_phase = 0.0
+    for rz_angle, add_sx in [
+        (lam - math.pi / 2, True),
+        (math.pi - theta, True),
+        (phi + math.pi / 2, False),
+    ]:
+        phase_gates, gate_phase, _is_exact_dyadic, _angle_error = _compile_phase_gate(
+            rz_angle,
+            qubit,
+            tolerance=tolerance,
+            source="Unsupported u3 angle",
+        )
+        compiled.extend(phase_gates)
+        global_phase = _normalize_global_phase_radians(global_phase + gate_phase)
+        if add_sx:
+            compiled.append(("sx", qubit))
+    return _rewrite_gate_sequence(tuple(compiled)), global_phase
 
 
 def _compile_qasm_rz_gate(

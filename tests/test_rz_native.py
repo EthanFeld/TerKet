@@ -5,6 +5,7 @@ import math
 from pathlib import Path
 import sys
 import unittest
+from unittest import mock
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -22,6 +23,8 @@ from terket.cubic_arithmetic import PhaseFunction
 from terket import engine
 from terket.benchmarking.head_to_head_cases import (
     SUPPORTED_BASIS as HEAD_TO_HEAD_SUPPORTED_BASIS,
+    build_approximate_qft,
+    build_repetition_magic_round,
     transpile_to_supported_basis as transpile_head_to_head,
 )
 from terket.benchmarking.structured_cases import (
@@ -83,6 +86,53 @@ class NativeRZImportTests(unittest.TestCase):
 
         self.assertTrue(any(gate[0].startswith("rz") for gate in native_spec.gates))
         self.assertLess(len(native_spec.gates) * 10, len(synthesized_spec.gates))
+
+    def test_parse_openqasm2_clifford_t_synthesizes_u3_directly(self):
+        qasm = """
+        OPENQASM 2.0;
+        include "qelib1.inc";
+        qreg q[1];
+        u3(0.73717103712378, 2.1071933827064955, -3.0042834966413654) q[0];
+        """
+        qc = QuantumCircuit(1)
+        qc.u(0.73717103712378, 2.1071933827064955, -3.0042834966413654, 0)
+
+        spec = parse_openqasm2(qasm, rz_compile_mode="clifford_t")
+
+        self.assertEqual(sum(gate[0] == "rz_arbitrary" for gate in spec.gates), 0)
+        self.assertEqual(sum(gate[0] == "sx" for gate in spec.gates), 0)
+
+        statevector = Statevector.from_instruction(qc).data
+        for bits in ((0,), (1,)):
+            amplitude, _info = compute_circuit_amplitude(spec, [0], bits, as_complex=True)
+            expected = complex(statevector[_bits_to_index(bits)])
+            self.assertAlmostEqual(amplitude.real, expected.real, places=4)
+            self.assertAlmostEqual(amplitude.imag, expected.imag, places=4)
+
+    def test_parse_openqasm2_approx_dyadic_reports_run_level_error(self):
+        qasm = """
+        OPENQASM 2.0;
+        include "qelib1.inc";
+        qreg q[1];
+        u3(0.73717103712378, 2.1071933827064955, -3.0042834966413654) q[0];
+        """
+        qc = QuantumCircuit(1)
+        qc.u(0.73717103712378, 2.1071933827064955, -3.0042834966413654, 0)
+
+        spec = parse_openqasm2(qasm, rz_compile_mode="approx_dyadic", rz_tolerance=1e-5)
+
+        self.assertEqual(sum(gate[0] == "rz_arbitrary" for gate in spec.gates), 0)
+        self.assertEqual(spec.metadata["approximation_mode"], "approx_dyadic")
+        self.assertGreater(spec.metadata["approximation_phase_count"], 0)
+        self.assertGreater(spec.metadata["approximation_run_count"], 0)
+        self.assertGreaterEqual(spec.metadata["approximation_total_run_fro_error"], 0.0)
+
+        statevector = Statevector.from_instruction(qc).data
+        for bits in ((0,), (1,)):
+            amplitude, _info = compute_circuit_amplitude(spec, [0], bits, as_complex=True)
+            expected = complex(statevector[_bits_to_index(bits)])
+            self.assertAlmostEqual(amplitude.real, expected.real, places=4)
+            self.assertAlmostEqual(amplitude.imag, expected.imag, places=4)
 
 
 class NativeRZCorrectnessTests(unittest.TestCase):
@@ -185,6 +235,63 @@ class NativeRZBenchmarkTranspileTests(unittest.TestCase):
         for spec in (transpile_head_to_head(qc), transpile_structured(qc)):
             self.assertTrue(any(gate[0].startswith("rz") for gate in spec.gates))
             self.assertLess(len(spec.gates), 100)
+
+
+class SubcircuitMacroTests(unittest.TestCase):
+    def _state_signature(self, state: engine.SchurState):
+        return (
+            state.n,
+            state.m,
+            tuple(state.eps),
+            tuple(state.eps0),
+            state.q.level,
+            state.q.q0,
+            tuple(state.q.q1),
+            tuple(sorted(state.q.q2.items())),
+            tuple(sorted(state.q.q3.items())),
+            state.scalar,
+            state.scalar_half_pow2,
+            tuple(state.output_refcount),
+            tuple(state._arbitrary_phases),
+        )
+
+    def _build_replayed_states(self, spec):
+        macro_state = engine.SchurState(spec.n_qubits)
+        linear_state = engine.SchurState(spec.n_qubits)
+        engine._SUBCIRCUIT_MACRO_PLAN_CACHE.clear()
+        with mock.patch.object(engine, "_SUBCIRCUIT_MACRO_MIN_TOTAL_GATES", 0):
+            seed_state = engine.SchurState(spec.n_qubits)
+            engine._apply_gate_sequence_to_state(seed_state, spec.gates)
+            engine._apply_gate_sequence_to_state(macro_state, spec.gates)
+        engine._apply_gate_sequence_to_state_linear(linear_state, spec.gates)
+        macro_state._flush_pending_dead_variables()
+        linear_state._flush_pending_dead_variables()
+        return macro_state, linear_state
+
+    def test_repeated_allocation_free_subcircuits_match_linear_replay(self):
+        spec = build_repetition_magic_round(64)
+        macro_state, linear_state = self._build_replayed_states(spec)
+        self.assertEqual(self._state_signature(macro_state), self._state_signature(linear_state))
+
+    def test_repeated_fresh_variable_subcircuits_match_linear_replay(self):
+        spec = build_approximate_qft(64)
+        macro_state, linear_state = self._build_replayed_states(spec)
+        self.assertEqual(self._state_signature(macro_state), self._state_signature(linear_state))
+
+    def test_repeated_benchmark_subcircuits_compile_macro(self):
+        spec = build_approximate_qft(64)
+        state = engine.SchurState(spec.n_qubits)
+        engine._SUBCIRCUIT_MACRO_PLAN_CACHE.clear()
+        with mock.patch.object(engine, "_SUBCIRCUIT_MACRO_MIN_TOTAL_GATES", 0):
+            seed_state = engine.SchurState(spec.n_qubits)
+            engine._apply_gate_sequence_to_state(seed_state, spec.gates)
+        with mock.patch.object(engine, "_SUBCIRCUIT_MACRO_MIN_TOTAL_GATES", 0), mock.patch.object(
+            engine,
+            "_compile_subcircuit_macro",
+            wraps=engine._compile_subcircuit_macro,
+        ) as compile_macro:
+            engine._apply_gate_sequence_to_state(state, spec.gates)
+        self.assertGreater(compile_macro.call_count, 0)
 
 
 if __name__ == "__main__":

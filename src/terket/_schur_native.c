@@ -86,6 +86,12 @@ static PyMethodDef module_methods[] = {
         PyDoc_STR("Return the maximum induced scope size for a fixed elimination order."),
     },
     {
+        "rank_q3_free_cutset_extensions",
+        (PyCFunction) rank_q3_free_cutset_extensions_native,
+        METH_VARARGS,
+        PyDoc_STR("Rank q3-free cutset extensions by cheap order-aware surrogate width/work."),
+    },
+    {
         "sum_treewidth_dp_level3",
         (PyCFunction) sum_treewidth_dp_level3_native,
         METH_VARARGS,
@@ -104,10 +110,22 @@ static PyMethodDef module_methods[] = {
         PyDoc_STR("Evaluate a fixed level-3 cubic kernel with a reusable native treewidth plan."),
     },
     {
+        "sum_level3_treewidth_preplanned_batch_array",
+        (PyCFunction) sum_level3_treewidth_preplanned_batch_array_native,
+        METH_VARARGS,
+        PyDoc_STR("Evaluate a batch of level-3 cubic kernels with shared support using a reusable native treewidth plan."),
+    },
+    {
         "sum_factor_tables_scaled",
         (PyCFunction) sum_factor_tables_scaled_native,
         METH_VARARGS,
         PyDoc_STR("Sum generic scaled-complex factor tables by exact variable elimination."),
+    },
+    {
+        "build_phase_function_treewidth_support_plan",
+        (PyCFunction) build_phase_function_treewidth_support_plan_native,
+        METH_VARARGS,
+        PyDoc_STR("Build a reusable native treewidth plan for a fixed q2/q3 support pattern."),
     },
     {
         "build_scaled_factor_treewidth_plan",
@@ -120,6 +138,12 @@ static PyMethodDef module_methods[] = {
         (PyCFunction) sum_scaled_factor_treewidth_preplanned_native,
         METH_VARARGS,
         PyDoc_STR("Evaluate fixed scaled factor tables with a reusable native treewidth plan."),
+    },
+    {
+        "sum_phase_function_treewidth_preplanned_batch_scaled_array",
+        (PyCFunction) sum_phase_function_treewidth_preplanned_batch_scaled_array_native,
+        METH_VARARGS,
+        PyDoc_STR("Evaluate a batch of phase-function rows with shared q2/q3 support using a reusable native treewidth plan."),
     },
     {
         "build_q3_free_treewidth_plan",

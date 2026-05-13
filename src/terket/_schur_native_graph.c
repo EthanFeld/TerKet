@@ -519,3 +519,322 @@ error:
     Py_XDECREF(order_seq);
     return width_obj;
 }
+
+
+typedef struct {
+    Py_ssize_t candidate;
+    Py_ssize_t width;
+    unsigned long long work;
+} NativeCutsetExtensionScore;
+
+
+static int compare_cutset_extension_scores(const void *left_ptr, const void *right_ptr)
+{
+    const NativeCutsetExtensionScore *left = (const NativeCutsetExtensionScore *) left_ptr;
+    const NativeCutsetExtensionScore *right = (const NativeCutsetExtensionScore *) right_ptr;
+    if (left->width != right->width) {
+        return (left->width < right->width) ? -1 : 1;
+    }
+    if (left->work != right->work) {
+        return (left->work < right->work) ? -1 : 1;
+    }
+    if (left->candidate != right->candidate) {
+        return (left->candidate < right->candidate) ? -1 : 1;
+    }
+    return 0;
+}
+
+
+PyObject *rank_q3_free_cutset_extensions_native(PyObject *self, PyObject *args)
+{
+    Py_ssize_t nvars;
+    PyObject *q2;
+    PyObject *selected_obj;
+    PyObject *candidates_obj;
+    PyObject *order_hint_obj = Py_None;
+    PyObject *selected_seq = NULL;
+    PyObject *candidates_seq = NULL;
+    PyObject *order_hint_seq = NULL;
+    char *base_removed = NULL;
+    char *removed = NULL;
+    Py_ssize_t *edge_left = NULL;
+    Py_ssize_t *edge_right = NULL;
+    Py_ssize_t edge_count = 0;
+    Py_ssize_t edge_capacity = 0;
+    Py_ssize_t *hint_order = NULL;
+    Py_ssize_t *position_map = NULL;
+    long long *diff = NULL;
+    NativeCutsetExtensionScore *scores = NULL;
+    PyObject *results = NULL;
+    Py_ssize_t candidate_count;
+    Py_ssize_t idx;
+    PyObject *key;
+    PyObject *value;
+    Py_ssize_t pos;
+
+    (void) self;
+
+    if (!PyArg_ParseTuple(args, "nOOO|O", &nvars, &q2, &selected_obj, &candidates_obj, &order_hint_obj)) {
+        return NULL;
+    }
+    if (!PyDict_Check(q2)) {
+        PyErr_SetString(PyExc_TypeError, "q2 must be a dict.");
+        return NULL;
+    }
+    selected_seq = PySequence_Fast(selected_obj, "selected_vars must be a sequence.");
+    candidates_seq = PySequence_Fast(candidates_obj, "candidate_vars must be a sequence.");
+    if (selected_seq == NULL || candidates_seq == NULL) {
+        goto cleanup;
+    }
+    if (order_hint_obj != Py_None) {
+        order_hint_seq = PySequence_Fast(order_hint_obj, "order_hint must be a sequence.");
+        if (order_hint_seq == NULL) {
+            goto cleanup;
+        }
+        if (PySequence_Fast_GET_SIZE(order_hint_seq) != nvars) {
+            PyErr_SetString(PyExc_ValueError, "order_hint must have length nvars.");
+            goto cleanup;
+        }
+    }
+
+    candidate_count = PySequence_Fast_GET_SIZE(candidates_seq);
+    results = PyList_New(candidate_count);
+    if (results == NULL) {
+        goto cleanup;
+    }
+    if (candidate_count == 0) {
+        goto cleanup;
+    }
+
+    base_removed = PyMem_Calloc((size_t) (nvars > 0 ? nvars : 1), sizeof(char));
+    removed = PyMem_Calloc((size_t) (nvars > 0 ? nvars : 1), sizeof(char));
+    position_map = PyMem_Malloc((size_t) (nvars > 0 ? nvars : 1) * sizeof(Py_ssize_t));
+    diff = PyMem_Malloc((size_t) (nvars > 0 ? nvars : 1) * sizeof(long long));
+    scores = PyMem_Malloc((size_t) candidate_count * sizeof(NativeCutsetExtensionScore));
+    edge_capacity = PyDict_Size(q2);
+    if (edge_capacity < 1) {
+        edge_capacity = 1;
+    }
+    edge_left = PyMem_Malloc((size_t) edge_capacity * sizeof(Py_ssize_t));
+    edge_right = PyMem_Malloc((size_t) edge_capacity * sizeof(Py_ssize_t));
+    if (
+        base_removed == NULL || removed == NULL || position_map == NULL ||
+        diff == NULL || scores == NULL || edge_left == NULL || edge_right == NULL
+    ) {
+        PyErr_NoMemory();
+        goto cleanup;
+    }
+
+    if (order_hint_seq != NULL) {
+        hint_order = PyMem_Malloc((size_t) nvars * sizeof(Py_ssize_t));
+        if (hint_order == NULL) {
+            PyErr_NoMemory();
+            goto cleanup;
+        }
+        for (idx = 0; idx < nvars; ++idx) {
+            Py_ssize_t var = PyLong_AsSsize_t(PySequence_Fast_GET_ITEM(order_hint_seq, idx));
+            if (var == -1 && PyErr_Occurred()) {
+                goto cleanup;
+            }
+            if (var < 0 || var >= nvars) {
+                PyErr_SetString(PyExc_ValueError, "order_hint contains an out-of-range variable.");
+                goto cleanup;
+            }
+            hint_order[idx] = var;
+        }
+    }
+
+    for (idx = 0; idx < PySequence_Fast_GET_SIZE(selected_seq); ++idx) {
+        Py_ssize_t var = PyLong_AsSsize_t(PySequence_Fast_GET_ITEM(selected_seq, idx));
+        if (var == -1 && PyErr_Occurred()) {
+            goto cleanup;
+        }
+        if (var < 0 || var >= nvars) {
+            PyErr_SetString(PyExc_ValueError, "selected_vars contains an out-of-range variable.");
+            goto cleanup;
+        }
+        base_removed[var] = 1;
+    }
+
+    pos = 0;
+    while (PyDict_Next(q2, &pos, &key, &value)) {
+        Py_ssize_t left;
+        Py_ssize_t right;
+        long long coeff;
+        if (parse_pair_key(key, &left, &right) < 0) {
+            goto cleanup;
+        }
+        coeff = PyLong_AsLongLong(value);
+        if (coeff == -1 && PyErr_Occurred()) {
+            goto cleanup;
+        }
+        if (coeff == 0) {
+            continue;
+        }
+        edge_left[edge_count] = left;
+        edge_right[edge_count] = right;
+        ++edge_count;
+    }
+
+    for (idx = 0; idx < candidate_count; ++idx) {
+        Py_ssize_t candidate = PyLong_AsSsize_t(PySequence_Fast_GET_ITEM(candidates_seq, idx));
+        Py_ssize_t best_width = PY_SSIZE_T_MAX;
+        unsigned long long best_work = (unsigned long long) -1;
+        int mode;
+        if (candidate == -1 && PyErr_Occurred()) {
+            goto cleanup;
+        }
+        if (candidate < 0 || candidate >= nvars) {
+            PyErr_SetString(PyExc_ValueError, "candidate_vars contains an out-of-range variable.");
+            goto cleanup;
+        }
+
+        memcpy(removed, base_removed, (size_t) nvars * sizeof(char));
+        removed[candidate] = 1;
+
+        for (mode = 0; mode < (order_hint_seq != NULL ? 3 : 2); ++mode) {
+            Py_ssize_t remaining_count = 0;
+            Py_ssize_t edge_idx;
+            Py_ssize_t max_cut = 0;
+            long long running = 0;
+            unsigned long long work;
+
+            if (mode == 0 && order_hint_seq != NULL) {
+                for (edge_idx = 0; edge_idx < nvars; ++edge_idx) {
+                    position_map[edge_idx] = -1;
+                }
+                for (edge_idx = 0; edge_idx < nvars; ++edge_idx) {
+                    Py_ssize_t var = hint_order[edge_idx];
+                    if (!removed[var]) {
+                        position_map[var] = remaining_count++;
+                    }
+                }
+            } else if ((mode == 0 && order_hint_seq == NULL) || mode == 1) {
+                for (edge_idx = 0; edge_idx < nvars; ++edge_idx) {
+                    position_map[edge_idx] = -1;
+                }
+                for (edge_idx = 0; edge_idx < nvars; ++edge_idx) {
+                    if (!removed[edge_idx]) {
+                        position_map[edge_idx] = remaining_count++;
+                    }
+                }
+            } else {
+                for (edge_idx = 0; edge_idx < nvars; ++edge_idx) {
+                    position_map[edge_idx] = -1;
+                }
+                for (edge_idx = nvars - 1; edge_idx >= 0; --edge_idx) {
+                    if (!removed[edge_idx]) {
+                        position_map[edge_idx] = remaining_count++;
+                    }
+                    if (edge_idx == 0) {
+                        break;
+                    }
+                }
+            }
+
+            if (remaining_count <= 0) {
+                best_width = 0;
+                best_work = 1ULL;
+                continue;
+            }
+            memset(diff, 0, (size_t) remaining_count * sizeof(long long));
+            work = 0ULL;
+
+            for (edge_idx = 0; edge_idx < edge_count; ++edge_idx) {
+                Py_ssize_t left = edge_left[edge_idx];
+                Py_ssize_t right = edge_right[edge_idx];
+                Py_ssize_t left_pos;
+                Py_ssize_t right_pos;
+                if (removed[left] || removed[right]) {
+                    continue;
+                }
+                left_pos = position_map[left];
+                right_pos = position_map[right];
+                if (left_pos < 0 || right_pos < 0 || left_pos == right_pos) {
+                    continue;
+                }
+                if (left_pos > right_pos) {
+                    Py_ssize_t tmp = left_pos;
+                    left_pos = right_pos;
+                    right_pos = tmp;
+                }
+                diff[left_pos] += 1;
+                diff[right_pos] -= 1;
+                if (work != (unsigned long long) -1) {
+                    work += 1ULL;
+                }
+            }
+
+            for (edge_idx = 0; edge_idx + 1 < remaining_count; ++edge_idx) {
+                running += diff[edge_idx];
+                if ((Py_ssize_t) running > max_cut) {
+                    max_cut = (Py_ssize_t) running;
+                }
+            }
+
+            {
+                Py_ssize_t width = max_cut + 1;
+                unsigned long long scale = (width >= (Py_ssize_t) (8 * sizeof(unsigned long long)))
+                    ? (unsigned long long) -1
+                    : (1ULL << (unsigned long long) width);
+                if (scale == (unsigned long long) -1 || work == (unsigned long long) -1) {
+                    work = (unsigned long long) -1;
+                } else {
+                    unsigned long long base = work + (unsigned long long) remaining_count;
+                    if (base > ((unsigned long long) -1) / scale) {
+                        work = (unsigned long long) -1;
+                    } else {
+                        work = base * scale;
+                    }
+                }
+                if (width < best_width || (width == best_width && work < best_work)) {
+                    best_width = width;
+                    best_work = work;
+                }
+            }
+        }
+
+        scores[idx].candidate = candidate;
+        scores[idx].width = best_width;
+        scores[idx].work = best_work;
+    }
+
+    qsort(scores, (size_t) candidate_count, sizeof(NativeCutsetExtensionScore), compare_cutset_extension_scores);
+    for (idx = 0; idx < candidate_count; ++idx) {
+        PyObject *item = PyTuple_New(3);
+        PyObject *cand_obj;
+        PyObject *width_obj;
+        PyObject *work_obj;
+        if (item == NULL) {
+            goto cleanup;
+        }
+        cand_obj = PyLong_FromSsize_t(scores[idx].candidate);
+        width_obj = PyLong_FromSsize_t(scores[idx].width);
+        work_obj = PyLong_FromUnsignedLongLong(scores[idx].work);
+        if (cand_obj == NULL || width_obj == NULL || work_obj == NULL) {
+            Py_XDECREF(cand_obj);
+            Py_XDECREF(width_obj);
+            Py_XDECREF(work_obj);
+            Py_DECREF(item);
+            goto cleanup;
+        }
+        PyTuple_SET_ITEM(item, 0, cand_obj);
+        PyTuple_SET_ITEM(item, 1, width_obj);
+        PyTuple_SET_ITEM(item, 2, work_obj);
+        PyList_SET_ITEM(results, idx, item);
+    }
+
+cleanup:
+    PyMem_Free(base_removed);
+    PyMem_Free(removed);
+    PyMem_Free(edge_left);
+    PyMem_Free(edge_right);
+    PyMem_Free(hint_order);
+    PyMem_Free(position_map);
+    PyMem_Free(diff);
+    PyMem_Free(scores);
+    Py_XDECREF(selected_seq);
+    Py_XDECREF(candidates_seq);
+    Py_XDECREF(order_hint_seq);
+    return results;
+}

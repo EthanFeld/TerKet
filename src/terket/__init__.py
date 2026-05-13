@@ -25,6 +25,7 @@ from .schur_engine import (
     compute_amplitude_scaled,
     compute_circuit_amplitude,
     compute_circuit_amplitude_scaled,
+    compute_circuit_pauli_expectations,
     reduce_and_sum,
 )
 
@@ -46,6 +47,7 @@ __all__ = [
     "compute_amplitude_scaled",
     "compute_circuit_amplitude",
     "compute_circuit_amplitude_scaled",
+    "compute_circuit_pauli_expectations",
     "from_qiskit",
     "lift_exact_dyadic_precision",
     "make_circuit",

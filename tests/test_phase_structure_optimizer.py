@@ -231,6 +231,46 @@ class PhaseStructureOptimizerTests(unittest.TestCase):
         self.assertTrue(changed)
         self.assertIs(optimized_q, structurally_better)
 
+    def test_q3_free_optimizer_skips_optional_structure_search_on_giant_kernel(self):
+        n = engine._Q3_FREE_OPTIONAL_REWRITE_MAX_VARS + 1
+        q = PhaseFunction(
+            n,
+            level=3,
+            q1=[4] * n,
+            q2={(idx, idx + 1): 2 for idx in range(n - 1)},
+            q3={},
+        )
+
+        with unittest.mock.patch.object(
+            engine,
+            "_optimize_phase_function_structure",
+            side_effect=AssertionError("giant q3-free kernel should skip optional structure search"),
+        ):
+            optimized_q, changed = engine._optimize_q3_free_phase(q, allow_tensor_contraction=False)
+
+        self.assertFalse(changed)
+        self.assertIs(optimized_q, q)
+
+    def test_half_phase_mediator_plan_skips_giant_kernel(self):
+        n = engine._Q3_FREE_OPTIONAL_REWRITE_MAX_VARS + 1
+        half_q1 = (1 << 3) // 2
+        q = PhaseFunction(
+            n,
+            level=3,
+            q1=[half_q1 + 1] * n,
+            q2={(idx, idx + 1): 2 for idx in range(n - 1)},
+            q3={},
+        )
+
+        with unittest.mock.patch.object(
+            engine,
+            "_min_fill_cubic_order",
+            side_effect=AssertionError("giant half-phase kernel should skip mediator ordering"),
+        ):
+            plan = engine._build_half_phase_mediator_plan(q)
+
+        self.assertIsNone(plan)
+
     def test_q3_free_optimizer_skips_when_one_shot_baseline_is_already_good(self):
         q = PhaseFunction(2, level=3, q1=[4, 0], q2={(0, 1): 2}, q3={})
 
@@ -314,6 +354,56 @@ class PhaseStructureOptimizerTests(unittest.TestCase):
             )
 
         optimize.assert_not_called()
+
+    def test_large_sparse_cubic_kernel_can_skip_exact_eliminations_for_direct_treewidth(self):
+        q = PhaseFunction(
+            300,
+            level=3,
+            q1=[0] * 300,
+            q2={(3, 4): 1, (4, 5): 1},
+            q3={(0, 1, 2): 1},
+        )
+
+        with unittest.mock.patch.object(
+            engine,
+            "_phase3_plan",
+            return_value=([0], list(range(300)), 16, 1, "treewidth_dp"),
+        ), unittest.mock.patch.object(
+            engine,
+            "_estimate_treewidth_dp_work",
+            return_value=2_375_618,
+        ), unittest.mock.patch.object(
+            engine,
+            "_apply_exact_eliminations",
+            side_effect=AssertionError("direct treewidth escape should skip exact eliminations"),
+        ), unittest.mock.patch.object(
+            engine,
+            "_sum_irreducible_cubic_core",
+            return_value=((1.0 + 0.0j, 0), {
+                "quad": 0,
+                "constraint": 0,
+                "branched": 0,
+                "remaining": 16,
+                "structural_obstruction": 1,
+                "gauss_obstruction": 1,
+                "cost_r": 16,
+                "phase_states": 0,
+                "phase_splits": 0,
+                "phase3_backend": "treewidth_dp",
+            }),
+        ) as sum_core:
+            total, info = engine._reduce_and_sum_scaled(
+                q,
+                context=engine._ReductionContext(
+                    preserve_scale=False,
+                    allow_tensor_contraction=False,
+                    extended_reductions="auto",
+                ),
+            )
+
+        self.assertEqual(total, (1.0 + 0.0j, 0))
+        self.assertEqual(info["phase3_backend"], "treewidth_dp")
+        sum_core.assert_called_once()
 
     def test_two_partner_constraint_elimination_preserves_sum_for_target_zero(self):
         q = PhaseFunction(

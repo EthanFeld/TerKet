@@ -104,9 +104,15 @@ typedef struct {
     Py_ssize_t slot_count;
     Py_ssize_t step_count;
     Py_ssize_t max_scope;
+    Py_ssize_t q2_support_count;
+    Py_ssize_t q3_support_count;
     Py_ssize_t *slot_arities;
     size_t *slot_table_sizes;
+    size_t *slot_workspace_offsets;
+    size_t initial_workspace_size;
     NativeScaledComplex **initial_tables;
+    unsigned char *slot_source_kinds;
+    Py_ssize_t *slot_source_indexes;
     NativeQ3FreePlanStep *steps;
 } NativeQ3FreeTreewidthPlan;
 
@@ -126,16 +132,27 @@ typedef struct {
     Py_ssize_t output_slot;
 } NativeLevel3PlanStep;
 
+enum {
+    NATIVE_LEVEL3_SLOT_SOURCE_NONE = 0,
+    NATIVE_LEVEL3_SLOT_SOURCE_Q1 = 1,
+    NATIVE_LEVEL3_SLOT_SOURCE_Q2 = 2,
+    NATIVE_LEVEL3_SLOT_SOURCE_Q3 = 3,
+};
+
 typedef struct {
     Py_ssize_t nvars;
     Py_ssize_t initial_slot_count;
     Py_ssize_t slot_count;
     Py_ssize_t step_count;
     Py_ssize_t max_scope;
+    Py_ssize_t q2_support_count;
+    Py_ssize_t q3_support_count;
     Py_ssize_t *slot_arities;
     size_t *slot_table_sizes;
     size_t *slot_workspace_offsets;
     NativeComplex **initial_tables;
+    unsigned char *slot_source_kinds;
+    Py_ssize_t *slot_source_indexes;
     NativeLevel3PlanStep *steps;
     NativeComplex *workspace;
     size_t workspace_size;
@@ -206,13 +223,17 @@ PyObject *solve_output_shift_masks_u64_native(PyObject *self, PyObject *args);
 PyObject *min_fill_cubic_order_native(PyObject *self, PyObject *args);
 PyObject *min_degree_cubic_order_native(PyObject *self, PyObject *args);
 PyObject *cubic_order_width_native(PyObject *self, PyObject *args);
+PyObject *rank_q3_free_cutset_extensions_native(PyObject *self, PyObject *args);
 PyObject *sum_treewidth_dp_level3_native(PyObject *self, PyObject *args);
 PyObject *build_level3_treewidth_plan_native(PyObject *self, PyObject *args);
 PyObject *sum_level3_treewidth_preplanned_native(PyObject *self, PyObject *args);
+PyObject *sum_level3_treewidth_preplanned_batch_array_native(PyObject *self, PyObject *args);
 PyObject *sum_factor_tables_scaled_native(PyObject *self, PyObject *args);
+PyObject *build_phase_function_treewidth_support_plan_native(PyObject *self, PyObject *args);
 PyObject *build_q3_free_treewidth_plan_native(PyObject *self, PyObject *args);
 PyObject *build_scaled_factor_treewidth_plan_native(PyObject *self, PyObject *args);
 PyObject *sum_scaled_factor_treewidth_preplanned_native(PyObject *self, PyObject *args);
+PyObject *sum_phase_function_treewidth_preplanned_batch_scaled_array_native(PyObject *self, PyObject *args);
 PyObject *sum_q3_free_treewidth_preplanned_batch_scaled_native(PyObject *self, PyObject *args);
 PyObject *sum_q3_free_treewidth_preplanned_batch_scaled_array_native(PyObject *self, PyObject *args);
 PyObject *q3_free_treewidth_dp_work_native(PyObject *self, PyObject *args);

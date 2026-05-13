@@ -25,6 +25,7 @@ from .engine import (
     compute_amplitudes,
     compute_circuit_amplitude,
     compute_circuit_amplitude_scaled,
+    compute_circuit_pauli_expectations,
     reduce_and_sum,
 )
 
@@ -49,5 +50,6 @@ __all__ = [
     "compute_amplitudes",
     "compute_circuit_amplitude",
     "compute_circuit_amplitude_scaled",
+    "compute_circuit_pauli_expectations",
     "reduce_and_sum",
 ]
