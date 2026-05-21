@@ -36,8 +36,13 @@ class BenchmarkCase:
 
 
 def transpile_to_supported_basis(qc: QuantumCircuit, optimization_level: int = 0):
-    transpiled = transpile(qc, basis_gates=SUPPORTED_BASIS, optimization_level=optimization_level)
-    return from_qiskit(transpiled, rz_compile_mode="dyadic")
+    # Legacy helper name: native import already lowers supported logical
+    # circuits directly, so avoid an eager Qiskit transpile unless import fails.
+    try:
+        return from_qiskit(qc, rz_compile_mode="dyadic")
+    except ValueError:
+        transpiled = transpile(qc, basis_gates=SUPPORTED_BASIS, optimization_level=optimization_level)
+        return from_qiskit(transpiled, rz_compile_mode="dyadic")
 
 
 def _append_controlled_s(qc: QuantumCircuit, control: int, target: int):
@@ -230,8 +235,7 @@ def draper_fixed_input_output(
 
 def build_draper_qft_adder_supported(problem_size: int, *, optimization_level: int = 1):
     logical = DraperQFTAdder(problem_size, kind="fixed")
-    lowered = transpile(logical, basis_gates=["h", "p", "cx"], optimization_level=optimization_level)
-    return from_qiskit(lowered, rz_compile_mode="dyadic")
+    return transpile_to_supported_basis(logical, optimization_level=optimization_level)
 
 
 def _zero_query(builder: Callable[[int], object], n_qubits: int, *, metadata: dict[str, Any] | None = None) -> AmplitudeQuery:

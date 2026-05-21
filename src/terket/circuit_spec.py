@@ -27,6 +27,7 @@ SUPPORTED_GATES = {
     "cnot",
     "cz",
     "rzz_dyadic",
+    "pauli_expbox",
     "rz_arbitrary",
     "rz_dyadic",
     "rz_pi_16",
@@ -75,6 +76,8 @@ _RZ_COMPILE_MODES = {
 }
 _FAST_IMPORT_NATIVE_GATES = frozenset(SUPPORTED_GATES)
 _FAST_IMPORT_GATE_COUNT_THRESHOLD = 4096
+_QiskitRawTemplate = tuple[tuple[Gate, ...], float]
+_QiskitOperationTemplateCache = dict[tuple[object, ...], _QiskitRawTemplate]
 
 
 @dataclass(frozen=True, slots=True)
@@ -362,11 +365,10 @@ def parse_openqasm2(
             if len(qubit_tokens) != 1:
                 raise ValueError(f"OpenQASM u3 gate expects one qubit, got {len(qubit_tokens)}.")
             qubit = _parse_qasm_qubit(qubit_tokens[0], offsets, qregs)
-            op_gates, op_phase = _compile_u3_gate(
-                theta,
-                phi,
-                lam,
-                qubit,
+            op_gates, op_phase = _qiskit_operation_to_raw_gates(
+                _qiskit_u_gate(theta, phi, lam),
+                [qubit],
+                compile_mode=compile_mode,
                 tolerance=rz_tolerance,
             )
             raw_gates.extend(op_gates)
@@ -553,6 +555,7 @@ def from_qiskit(
         )
     )
     qubit_indices = {qubit: idx for idx, qubit in enumerate(circuit.qubits)}
+    template_cache: _QiskitOperationTemplateCache = {}
     for instruction in _qiskit_unitary_data(circuit):
         qubits = [qubit_indices[qubit] for qubit in instruction.qubits]
         op_gates, op_phase = _qiskit_operation_to_raw_gates(
@@ -560,6 +563,7 @@ def from_qiskit(
             qubits,
             compile_mode=compile_mode,
             tolerance=rz_tolerance,
+            template_cache=template_cache,
         )
         raw_gates.extend(op_gates)
         global_phase_radians = _normalize_global_phase_radians(global_phase_radians + op_phase)
@@ -625,6 +629,78 @@ def _qiskit_unitary_data(circuit: Any) -> Sequence[Any]:
                 "unitary circuits plus optional trailing measurements."
             )
     return kept
+
+
+def _retarget_qiskit_raw_gate_template(
+    template_gates: Sequence[Gate],
+    qubits: Sequence[int],
+) -> list[Gate]:
+    retargeted: list[Gate] = []
+    for gate in template_gates:
+        name = gate[0]
+        if name == "rzz_dyadic":
+            retargeted.append(
+                ("rzz_dyadic", int(qubits[int(gate[1])]), int(qubits[int(gate[2])]), int(gate[3]), int(gate[4]))
+            )
+            continue
+        if name in {"cnot", "cz"}:
+            retargeted.append((name, int(qubits[int(gate[1])]), int(qubits[int(gate[2])])))
+            continue
+
+        qubit = int(qubits[int(gate[1])])
+        if name == "rz_dyadic":
+            retargeted.append(("rz_dyadic", qubit, int(gate[2]), int(gate[3])))
+        elif name in {"rz_arbitrary", _TEMP_PHASE_GATE}:
+            retargeted.append((name, qubit, gate[2]))
+        else:
+            retargeted.append((name, qubit))
+    return retargeted
+
+
+def _compile_qiskit_circuit_template(
+    circuit: Any,
+    *,
+    compile_mode: str,
+    tolerance: float,
+    template_cache: _QiskitOperationTemplateCache,
+) -> _QiskitRawTemplate:
+    return _qiskit_circuit_to_raw_gates(
+        circuit,
+        qubits=tuple(range(len(circuit.qubits))),
+        compile_mode=compile_mode,
+        tolerance=tolerance,
+        template_cache=template_cache,
+    )
+
+
+def _qiskit_cached_circuit_template(
+    cache_key: tuple[object, ...],
+    circuit: Any,
+    *,
+    compile_mode: str,
+    tolerance: float,
+    template_cache: _QiskitOperationTemplateCache | None,
+) -> _QiskitRawTemplate:
+    if template_cache is None:
+        return _compile_qiskit_circuit_template(
+            circuit,
+            compile_mode=compile_mode,
+            tolerance=tolerance,
+            template_cache={},
+        )
+
+    cached = template_cache.get(cache_key)
+    if cached is not None:
+        return cached
+
+    cached = _compile_qiskit_circuit_template(
+        circuit,
+        compile_mode=compile_mode,
+        tolerance=tolerance,
+        template_cache=template_cache,
+    )
+    template_cache[cache_key] = cached
+    return cached
 
 
 def _phase_gate_raw_gates(
@@ -817,6 +893,7 @@ def _qiskit_operation_to_raw_gates(
     *,
     compile_mode: str,
     tolerance: float,
+    template_cache: _QiskitOperationTemplateCache | None = None,
 ) -> tuple[list[Gate], float]:
     op_name = operation.name.lower()
     name = _QASM_GATE_MAP.get(op_name)
@@ -930,14 +1007,14 @@ def _qiskit_operation_to_raw_gates(
                 tolerance=tolerance,
             )
             return list(compiled_gates), compiled_phase
-        decomposer = _qiskit_one_qubit_psx_decomposer()
-        decomposed = decomposer(operation)
-        return _qiskit_circuit_to_raw_gates(
-            decomposed,
-            qubits=qubits,
+        template_gates, template_phase = _qiskit_cached_circuit_template(
+            ("qiskit_psx_decompose", id(operation), compile_mode, tolerance),
+            _qiskit_one_qubit_psx_decomposer()(operation),
             compile_mode=compile_mode,
             tolerance=tolerance,
+            template_cache=template_cache,
         )
+        return _retarget_qiskit_raw_gate_template(template_gates, qubits), template_phase
     if op_name == "rzz":
         if len(qubits) != 2:
             raise ValueError(f"Unsupported Qiskit gate arity for {operation.name!r}.")
@@ -959,20 +1036,24 @@ def _qiskit_operation_to_raw_gates(
 
     definition = getattr(operation, "definition", None)
     if definition is not None:
-        return _qiskit_circuit_to_raw_gates(
+        template_gates, template_phase = _qiskit_cached_circuit_template(
+            ("qiskit_definition", id(definition), compile_mode, tolerance),
             definition,
-            qubits=qubits,
             compile_mode=compile_mode,
             tolerance=tolerance,
+            template_cache=template_cache,
         )
+        return _retarget_qiskit_raw_gate_template(template_gates, qubits), template_phase
 
     synthesized = _synthesize_qiskit_operation(operation, len(qubits))
-    return _qiskit_circuit_to_raw_gates(
+    template_gates, template_phase = _qiskit_cached_circuit_template(
+        ("qiskit_synthesized", id(operation), compile_mode, tolerance),
         synthesized,
-        qubits=qubits,
         compile_mode=compile_mode,
         tolerance=tolerance,
+        template_cache=template_cache,
     )
+    return _retarget_qiskit_raw_gate_template(template_gates, qubits), template_phase
 
 
 def _qiskit_circuit_to_raw_gates(
@@ -981,6 +1062,7 @@ def _qiskit_circuit_to_raw_gates(
     qubits: Sequence[int],
     compile_mode: str,
     tolerance: float,
+    template_cache: _QiskitOperationTemplateCache | None = None,
 ) -> tuple[list[Gate], float]:
     qubit_indices = {qubit: idx for idx, qubit in enumerate(circuit.qubits)}
     raw_gates: list[Gate] = []
@@ -997,6 +1079,7 @@ def _qiskit_circuit_to_raw_gates(
             mapped_qubits,
             compile_mode=compile_mode,
             tolerance=tolerance,
+            template_cache=template_cache,
         )
         raw_gates.extend(op_gates)
         global_phase_radians = _normalize_global_phase_radians(global_phase_radians + op_phase)
@@ -1161,6 +1244,8 @@ def _gate_qubits(gate: Gate) -> tuple[int, ...]:
         return (gate[1],)
     if name == "rzz_dyadic":
         return int(gate[1]), int(gate[2])
+    if name == "pauli_expbox":
+        return tuple(int(qubit) for qubit in gate[2])
     return tuple(int(qubit) for qubit in gate[1:])
 
 
@@ -1404,6 +1489,12 @@ def _normalize_gate(gate: Gate) -> Gate:
     name = str(gate[0]).lower()
     if name == "cx":
         name = "cnot"
+    if name == "pauli_expbox":
+        if len(gate) != 4:
+            return (name, *gate[1:])
+        paulis = tuple(str(pauli).upper() for pauli in gate[1])
+        qubits = tuple(int(qubit) for qubit in gate[2])
+        return (name, paulis, qubits, gate[3])
     return (name, *gate[1:])
 
 
@@ -1416,6 +1507,8 @@ def _validate_gates(n_qubits: int, gates: Sequence[Gate]) -> None:
             arity = 2
         elif name == "rzz_dyadic":
             arity = 4
+        elif name == "pauli_expbox":
+            arity = 3
         elif name == "rz_dyadic":
             arity = 3
         elif name == "rz_arbitrary":
@@ -1424,7 +1517,25 @@ def _validate_gates(n_qubits: int, gates: Sequence[Gate]) -> None:
             arity = 1
         if len(gate) != arity + 1:
             raise ValueError(f"Gate {gate!r} has the wrong arity.")
-        qubits = gate[1:2] if name in {"rz_dyadic", "rz_arbitrary"} else gate[1:3] if name == "rzz_dyadic" else gate[1:]
+        qubits = (
+            gate[1:2]
+            if name in {"rz_dyadic", "rz_arbitrary"}
+            else gate[1:3]
+            if name == "rzz_dyadic"
+            else gate[2]
+            if name == "pauli_expbox"
+            else gate[1:]
+        )
+        if name == "pauli_expbox":
+            paulis = gate[1]
+            if not isinstance(paulis, tuple):
+                raise TypeError(f"Gate {gate!r} uses a non-tuple Pauli string.")
+            if len(paulis) != len(gate[2]):
+                raise ValueError(f"Gate {gate!r} has mismatched Pauli/qubit lengths.")
+            for pauli in paulis:
+                if pauli not in {"I", "X", "Y", "Z"}:
+                    raise ValueError(f"Gate {gate!r} uses unsupported Pauli {pauli!r}.")
+            _coerce_finite_radians(gate[3], source="Unsupported PauliExpBox angle")
         for qubit in qubits:
             if not isinstance(qubit, int):
                 raise TypeError(f"Gate {gate!r} uses a non-integer qubit index.")

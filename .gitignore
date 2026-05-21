@@ -15,3 +15,5 @@ results/
 benchmarks/targeted/
 *.qasm
 /tmp
+tools/quantinuum_public_mvsp_probe.py
+tools/quantinuum_public_qec_probe.py

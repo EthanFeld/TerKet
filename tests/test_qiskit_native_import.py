@@ -18,6 +18,7 @@ from qiskit import QuantumCircuit, qasm2
 from qiskit.circuit.library import QFTGate, U2Gate, U3Gate
 from qiskit.quantum_info import Statevector
 
+import terket.circuit_spec as circuit_spec
 from terket import compute_circuit_amplitude
 from terket.circuit_spec import (
     _FAST_IMPORT_GATE_COUNT_THRESHOLD,
@@ -244,6 +245,34 @@ class QiskitNativeImportTests(unittest.TestCase):
         expected = complex(Statevector.from_instruction(qc).data[0])
         self.assertAlmostEqual(amplitude.real, expected.real, places=12)
         self.assertAlmostEqual(amplitude.imag, expected.imag, places=12)
+
+    def test_repeated_custom_subcircuit_definition_reuses_import_template(self):
+        block = QuantumCircuit(2, name="block")
+        block.h(0)
+        block.cp(math.pi / 8.0, 0, 1)
+        block.rz(-math.pi / 16.0, 1)
+        block.cx(0, 1)
+        gate = block.to_gate()
+
+        qc = QuantumCircuit(4)
+        qc.append(gate, [0, 1])
+        qc.append(gate, [2, 3])
+        qc.append(gate, [1, 2])
+
+        with patch(
+            "terket.circuit_spec._compile_qiskit_circuit_template",
+            wraps=circuit_spec._compile_qiskit_circuit_template,
+        ) as compile_template:
+            spec = from_qiskit(qc)
+
+        self.assertEqual(compile_template.call_count, 1)
+
+        statevector = Statevector.from_instruction(qc).data
+        for bits in ((0, 0, 0, 0), (1, 0, 1, 0), (1, 1, 1, 1)):
+            amplitude, _info = compute_circuit_amplitude(spec, [0, 0, 0, 0], bits, as_complex=True)
+            expected = complex(statevector[_bits_to_index(bits)])
+            self.assertAlmostEqual(amplitude.real, expected.real, places=12)
+            self.assertAlmostEqual(amplitude.imag, expected.imag, places=12)
 
     def test_u3_clifford_t_import_uses_direct_unitary_synthesis(self):
         gate = U3Gate(0.73717103712378, 2.1071933827064955, -3.0042834966413654)

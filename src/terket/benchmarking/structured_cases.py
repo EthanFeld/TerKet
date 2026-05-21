@@ -35,8 +35,13 @@ class StructuredCase:
 
 
 def transpile_to_supported_basis(qc: QuantumCircuit, optimization_level: int = 2):
-    transpiled = transpile(qc, basis_gates=SUPPORTED_BASIS, optimization_level=optimization_level)
-    return from_qiskit(transpiled, rz_compile_mode="dyadic")
+    # Legacy helper name: native import already lowers supported logical
+    # circuits directly, so avoid an eager Qiskit transpile unless import fails.
+    try:
+        return from_qiskit(qc, rz_compile_mode="dyadic")
+    except ValueError:
+        transpiled = transpile(qc, basis_gates=SUPPORTED_BASIS, optimization_level=optimization_level)
+        return from_qiskit(transpiled, rz_compile_mode="dyadic")
 
 
 def _disjoint_triples(width: int) -> tuple[tuple[int, int, int], ...]:

@@ -45,7 +45,7 @@ import platform
 import struct
 import sys
 from types import MappingProxyType
-from typing import Any, Callable, Literal, Protocol, Sequence, TypedDict, overload
+from typing import Any, Callable, Literal, Mapping, Protocol, Sequence, TypedDict, overload
 
 import numpy as np
 
@@ -154,6 +154,8 @@ _Q3_TREEWIDTH_DP_MAX_WIDTH = 18
 # it by the actual DP work estimate instead of width alone.
 _Q3_TREEWIDTH_DP_PEELED_MAX_WIDTH = 24
 _Q3_TREEWIDTH_DP_PEELED_MAX_WORK = 30_000_000_000
+_Q3_TREEWIDTH_CUTSET_MAX_SIZE = 8
+_Q3_TREEWIDTH_CUTSET_MAX_CANDIDATES = 12
 # Some large sparse cubic kernels become much worse after exact eliminations:
 # the eliminator removes many q1/q2-only variables, but densifies the tiny q3
 # support into a small hard core that then falls back to q3-cover recursion.
@@ -235,12 +237,32 @@ _Q3_FREE_DENSE_PLAN_MIN_DENSITY = 0.20
 # Small dense residual kernels are the only ones where quimb contraction
 # planning is consistently cheaper than branching or pure-Python DP.
 _Q3_TENSOR_CONTRACTION_MAX_VARS = 24
-# Arbitrary-phase branching iterates 2^K branches; beyond this the computation
-# is infeasible regardless of other circuit properties.
-_MAX_ARBITRARY_PHASE_BRANCH_DIMENSION = 30
+_MAX_ARBITRARY_PHASE_FACTOR_SCOPE = 24
+_MAX_ARBITRARY_PATH_SUM_PY_WIDTH = 24
+_MAX_ARBITRARY_PATH_SUM_NATIVE_WIDTH = 26
+_MAX_ARBITRARY_PATH_SUM_WORK = 30_000_000_000
+_MAX_ARBITRARY_PATH_SUM_TABLE_ENTRIES = 1 << 25
+_MAX_ARBITRARY_PATH_SUM_CUTSET_SIZE = 16
+_MAX_ARBITRARY_PATH_SUM_CUTSET_CANDIDATES = 16
+_ARBITRARY_BP_MAX_ITERS = 50
+_ARBITRARY_FACTOR_BP_MAX_ITERS = 25
+_ARBITRARY_FACTOR_BP_LARGE_EDGE_THRESHOLD = 250_000
+_ARBITRARY_FACTOR_BP_LARGE_MAX_ITERS = 8
+_ARBITRARY_BP_DAMPING = 0.5
+_ARBITRARY_BP_TOL = 1e-8
+_ARBITRARY_BP_DIRECT_PROB_LOG2_TOL = 1e-6
+_ARBITRARY_BP_HEURISTIC_SCHEDULES = (
+    (50, 0.5),
+    (50, 0.8),
+    (100, 0.5),
+)
+_ARBITRARY_BP_HEURISTIC_MAX_LOG2_ABS_SPREAD = 2.0
+_ARBITRARY_BP_HEURISTIC_MAX_PHASE_SPREAD = 0.5
+_ARBITRARY_BP_HEURISTIC_BOUND_LOG2_TOL = 1e-6
 _Q3_TENSOR_CONTRACTION_OPTIMIZE = "greedy"
 _Q3_HYBRID_CONTRACTION_MAX_VARS = 60
 _Q3_HYBRID_CONTRACTION_MAX_WIDTH = 25
+_PAULI_EXPBOX_FINAL_DEAD_FLUSH_MAX_CANDIDATES = 1024
 # Below this width, the Python treewidth DP typically beats contraction-planner
 # overhead on the same reduced cubic core.
 _Q3_TENSOR_CONTRACTION_TREEWIDTH_CROSSOVER = 5
@@ -317,10 +339,10 @@ _INV_SQRT2 = 1.0 / _SQRT2
 
 @dataclass(frozen=True, slots=True)
 class SolverConfig:
-    """User-tunable solver preference knobs for TerKet's exact phase-sum backends.
+    """User-tunable solver preference knobs for TerKet's phase-sum backends.
 
-    All parameters are preferences only — changing them never affects correctness,
-    only the trade-off between runtime and search quality.
+    By default TerKet uses exact backends. Approximate BP/MPS paths are opt-in
+    through ``allow_approximate`` because they can affect correctness.
 
     Parameters
     ----------
@@ -355,6 +377,15 @@ class SolverConfig:
         Minimum component size before the tensor-hint path is attempted (default 128).
     tensor_hint_max_vars:
         Maximum component size for the tensor-hint path (default 384).
+    allow_approximate:
+        If true, allow approximate arbitrary-angle BP/MPS fallbacks after exact
+        direct/cutset paths are exhausted, and allow the observable MPS shortcut.
+    bp_heuristic_max_log2_abs_spread:
+        Maximum log2-amplitude spread across loopy-BP schedules before rejection.
+    bp_heuristic_max_phase_spread:
+        Maximum phase spread in radians across loopy-BP schedules before rejection.
+    bp_heuristic_bound_log2_tol:
+        Maximum tolerated log2 probability above the quantum bound before rejection.
     """
 
     cutset_max_size: int = _Q3_FREE_CUTSET_MAX_SIZE
@@ -370,6 +401,10 @@ class SolverConfig:
     tensor_hint_max_time: float = _Q3_FREE_CUTSET_TENSOR_HINT_MAX_TIME
     tensor_hint_min_vars: int = _Q3_FREE_CUTSET_TENSOR_HINT_MIN_VARS
     tensor_hint_max_vars: int = _Q3_FREE_CUTSET_TENSOR_HINT_MAX_VARS
+    allow_approximate: bool = False
+    bp_heuristic_max_log2_abs_spread: float = _ARBITRARY_BP_HEURISTIC_MAX_LOG2_ABS_SPREAD
+    bp_heuristic_max_phase_spread: float = _ARBITRARY_BP_HEURISTIC_MAX_PHASE_SPREAD
+    bp_heuristic_bound_log2_tol: float = _ARBITRARY_BP_HEURISTIC_BOUND_LOG2_TOL
 
 
 _DEFAULT_SOLVER_CONFIG = SolverConfig()
@@ -687,13 +722,14 @@ class _ArbitraryPhaseTerm:
 
 
 @dataclass(frozen=True, slots=True)
-class _ArbitraryPhaseBranchPlan:
-    """Independent branch basis for deferred arbitrary affine phases."""
+class _ArbitraryFactorCutsetPlan:
+    """Slicing plan for arbitrary-angle factor path sums."""
 
-    basis_masks: tuple[int, ...]
-    term_dependency_masks: tuple[int, ...]
-    term_offsets: tuple[int, ...]
-    term_angles: tuple[float, ...]
+    cutset: tuple[int, ...]
+    residual_order: tuple[int, ...]
+    residual_width: int
+    residual_work: int
+    residual_table_entries: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -1100,49 +1136,6 @@ def _coalesce_arbitrary_phase_terms(
     return tuple(coalesced)
 
 
-def _build_arbitrary_phase_branch_plan(
-    terms: Sequence[_ArbitraryPhaseTerm],
-) -> _ArbitraryPhaseBranchPlan:
-    if not terms:
-        return _ArbitraryPhaseBranchPlan((), (), (), ())
-
-    basis_by_pivot: dict[int, int] = {}
-    for term in terms:
-        reduced = int(term.row_mask)
-        for pivot in sorted(basis_by_pivot, reverse=True):
-            if (reduced >> pivot) & 1:
-                reduced ^= basis_by_pivot[pivot]
-        if reduced:
-            basis_by_pivot[reduced.bit_length() - 1] = reduced
-
-    ordered_pivots = tuple(sorted(basis_by_pivot, reverse=True))
-    basis_masks = tuple(basis_by_pivot[pivot] for pivot in ordered_pivots)
-    dependency_masks: list[int] = []
-    offsets: list[int] = []
-    angles: list[float] = []
-
-    for term in terms:
-        reduced = int(term.row_mask)
-        dependency_mask = 0
-        for basis_idx, basis_mask in enumerate(basis_masks):
-            pivot = basis_mask.bit_length() - 1
-            if (reduced >> pivot) & 1:
-                reduced ^= basis_mask
-                dependency_mask ^= 1 << basis_idx
-        if reduced:  # pragma: no cover - internal consistency guard
-            raise RuntimeError("Failed to express arbitrary-phase mask in its branch basis.")
-        dependency_masks.append(dependency_mask)
-        offsets.append(int(term.offset) & 1)
-        angles.append(float(term.angle))
-
-    return _ArbitraryPhaseBranchPlan(
-        basis_masks=basis_masks,
-        term_dependency_masks=tuple(dependency_masks),
-        term_offsets=tuple(offsets),
-        term_angles=tuple(angles),
-    )
-
-
 def _arbitrary_phase_terms_are_unary(
     terms: Sequence[_ArbitraryPhaseTerm],
 ) -> bool:
@@ -1416,6 +1409,1086 @@ def _sum_q3_free_with_unary_arbitrary_phases_scaled(
     return _sum_q3_free_with_unary_factor_tables_scaled(q, unary_tables)
 
 
+def _arbitrary_phase_factor_table(term: _ArbitraryPhaseTerm) -> tuple[tuple[int, ...], list[ScaledComplex], ScaledComplex]:
+    """Return a dense factor for one arbitrary phase of an affine parity."""
+    row_mask = int(term.row_mask)
+    phase = _make_scaled_complex(cmath.exp(1j * float(term.angle)))
+    if row_mask == 0:
+        return (), [], phase if (int(term.offset) & 1) else _ONE_SCALED
+
+    scope = _support_from_mask(row_mask)
+    if len(scope) > _MAX_ARBITRARY_PHASE_FACTOR_SCOPE:
+        raise RuntimeError(
+            f"Cannot compute amplitude directly: arbitrary-angle factor has scope {len(scope)}, "
+            f"above limit {_MAX_ARBITRARY_PHASE_FACTOR_SCOPE}."
+        )
+
+    table = [_ONE_SCALED] * (1 << len(scope))
+    offset = int(term.offset) & 1
+    for assignment in range(len(table)):
+        if (assignment.bit_count() & 1) ^ offset:
+            table[assignment] = phase
+    return scope, table, _ONE_SCALED
+
+
+def _add_arbitrary_phase_factors_scaled(
+    factors: dict[tuple[int, ...], Sequence[ScaledComplex]],
+    terms: Sequence[_ArbitraryPhaseTerm],
+) -> ScaledComplex:
+    """Attach arbitrary affine phase factors without branching on their rank."""
+    scalar = _ONE_SCALED
+    for term in terms:
+        scope, table, term_scalar = _arbitrary_phase_factor_table(term)
+        scalar = _mul_scaled_complex(scalar, term_scalar)
+        if scope:
+            scalar = _mul_scaled_complex(
+                scalar,
+                _combine_factor_scaled(factors, scope, table),
+            )
+    return scalar
+
+
+def _restrict_scaled_factor_table(
+    scope: tuple[int, ...],
+    table: Sequence[ScaledComplex],
+    fixed: dict[int, int],
+    remap: dict[int, int],
+) -> tuple[tuple[int, ...], list[ScaledComplex], ScaledComplex]:
+    fixed_positions = [
+        (idx, int(fixed[var]) & 1)
+        for idx, var in enumerate(scope)
+        if var in fixed
+    ]
+    if not fixed_positions:
+        return tuple(remap[var] for var in scope), list(table), _ONE_SCALED
+
+    remaining = tuple(var for var in scope if var not in fixed)
+    if not remaining:
+        full_assignment = 0
+        for pos, bit in fixed_positions:
+            full_assignment |= bit << pos
+        return (), [], table[full_assignment]
+
+    residual_scope = tuple(remap[var] for var in remaining)
+    remaining_positions = tuple(scope.index(var) for var in remaining)
+    restricted = [_ZERO_SCALED] * (1 << len(remaining))
+    for residual_assignment in range(len(restricted)):
+        full_assignment = 0
+        for residual_pos, full_pos in enumerate(remaining_positions):
+            full_assignment |= ((residual_assignment >> residual_pos) & 1) << full_pos
+        for full_pos, bit in fixed_positions:
+            full_assignment |= bit << full_pos
+        restricted[residual_assignment] = table[full_assignment]
+    return residual_scope, restricted, _ONE_SCALED
+
+
+def _sum_factor_tables_with_cutset_scaled(
+    n_vars: int,
+    factors: Mapping[tuple[int, ...], Sequence[ScaledComplex]],
+    plan: _ArbitraryFactorCutsetPlan,
+    *,
+    scalar: ScaledComplex,
+    require_native: bool,
+) -> tuple[ScaledComplex, int]:
+    cutset = tuple(int(var) for var in plan.cutset)
+    cutset_set = set(cutset)
+    remaining_original = tuple(var for var in range(n_vars) if var not in cutset_set)
+    remap = {var: idx for idx, var in enumerate(remaining_original)}
+    total = _ZERO_SCALED
+    max_scope = len(cutset)
+
+    for mask in range(1 << len(cutset)):
+        fixed = {var: (mask >> idx) & 1 for idx, var in enumerate(cutset)}
+        branch_scalar = scalar
+        branch_factors: dict[tuple[int, ...], Sequence[ScaledComplex]] = {}
+        for scope, table in factors.items():
+            residual_scope, residual_table, residual_scalar = _restrict_scaled_factor_table(
+                tuple(scope),
+                table,
+                fixed,
+                remap,
+            )
+            branch_scalar = _mul_scaled_complex(branch_scalar, residual_scalar)
+            if residual_scope:
+                branch_scalar = _mul_scaled_complex(
+                    branch_scalar,
+                    _combine_factor_scaled(branch_factors, residual_scope, residual_table),
+                )
+        branch_total, branch_scope = _sum_factor_tables_scaled(
+            len(remaining_original),
+            branch_factors,
+            plan.residual_order,
+            scalar=branch_scalar,
+            require_native=require_native,
+        )
+        total = _add_scaled_complex(total, branch_total)
+        max_scope = max(max_scope, len(cutset) + int(branch_scope))
+
+    return total, max_scope
+
+
+def _scaled_to_plain_complex(value: ScaledComplex) -> complex:
+    return complex(value[0]) * (2.0 ** (int(value[1]) / 2.0))
+
+
+def _complex_logsum(values: Sequence[complex]) -> complex:
+    if not values:
+        return complex(float("-inf"), 0.0)
+    pivot = max(values, key=abs)
+    if pivot == 0j:
+        return complex(float("-inf"), 0.0)
+    return cmath.log(pivot) + cmath.log(sum(value / pivot for value in values))
+
+
+def _scaled_from_complex_log(log_value: complex) -> ScaledComplex:
+    if not math.isfinite(log_value.real):
+        return _ZERO_SCALED
+    half_pow2 = int(round((2.0 * log_value.real) / math.log(2.0)))
+    value = cmath.exp(log_value - (0.5 * half_pow2 * math.log(2.0)))
+    return _normalize_scaled_complex(value, half_pow2)
+
+
+def _scaled_complex_log(value: ScaledComplex) -> complex | None:
+    scalar, half_pow2 = value
+    if scalar == 0j:
+        return None
+    return cmath.log(scalar) + 0.5 * int(half_pow2) * math.log(2.0)
+
+
+def _scaled_probability_log2(value: ScaledComplex) -> float:
+    scalar, half_pow2 = value
+    if scalar == 0j:
+        return -math.inf
+    return 2.0 * math.log2(abs(scalar)) + float(half_pow2)
+
+
+def _arbitrary_bp_backend(backend: str | None) -> bool:
+    if backend is None:
+        return False
+    name = str(backend)
+    name = name.removesuffix("_invalid_scale")
+    name = name.removesuffix("_heuristic")
+    return name in {
+        "arbitrary_bethe_bp",
+        "arbitrary_factor_bethe_bp",
+        "arbitrary_sparse_parity_bethe_bp",
+        "arbitrary_bethe_bp_normalized",
+    }
+
+
+def _mark_invalid_arbitrary_bp_info(info: ReductionInfo, scaled_amp: ScaledComplex) -> None:
+    backend = str(info.get("phase3_backend"))
+    if not backend.endswith("_invalid_scale"):
+        info["phase3_backend"] = f"{backend}_invalid_scale"
+    info["bp_invalid_reason"] = "implied_probability_exceeds_one"  # type: ignore[typeddict-unknown-key]
+    info["bp_log2_probability"] = _scaled_probability_log2(scaled_amp)  # type: ignore[typeddict-unknown-key]
+
+
+def _raise_if_invalid_arbitrary_bp_amplitude(info: ReductionInfo, scaled_amp: ScaledComplex) -> None:
+    if not _arbitrary_bp_backend(info.get("phase3_backend")):
+        return
+    log2_probability = _scaled_probability_log2(scaled_amp)
+    if log2_probability <= _ARBITRARY_BP_DIRECT_PROB_LOG2_TOL:
+        return
+    _mark_invalid_arbitrary_bp_info(info, scaled_amp)
+    raise RuntimeError(
+        "Unreliable arbitrary-angle BP estimate: implied output probability "
+        f"2^{log2_probability:.3g} exceeds the quantum bound. Use an exact path, "
+        "a normalized observable estimator, or a fidelity-validated approximate backend."
+    )
+
+
+def _sum_pairwise_factor_graph_bethe_scaled(
+    n_vars: int,
+    factors: Mapping[tuple[int, ...], Sequence[ScaledComplex]],
+    *,
+    scalar: ScaledComplex,
+    max_iters: int | None = None,
+    damping: float | None = None,
+    require_forest: bool = True,
+) -> tuple[ScaledComplex, int] | None:
+    """Approximate complex pairwise factor graph partition fn via loopy BP."""
+    unary = [[1.0 + 0.0j, 1.0 + 0.0j] for _ in range(n_vars)]
+    pair_tables: dict[tuple[int, int], list[complex]] = {}
+    scalar_scaled = scalar
+
+    for scope, table in factors.items():
+        scope = tuple(int(var) for var in scope)
+        if len(scope) == 0:
+            scalar_scaled = _mul_scaled_complex(scalar_scaled, table[0])
+        elif len(scope) == 1:
+            var = scope[0]
+            unary[var][0] *= _scaled_to_plain_complex(table[0])
+            unary[var][1] *= _scaled_to_plain_complex(table[1])
+        elif len(scope) == 2:
+            left, right = scope
+            key = (left, right) if left < right else (right, left)
+            table_complex = [_scaled_to_plain_complex(entry) for entry in table]
+            if left > right:
+                table_complex = [table_complex[0], table_complex[2], table_complex[1], table_complex[3]]
+            existing = pair_tables.get(key)
+            if existing is None:
+                pair_tables[key] = table_complex
+            else:
+                pair_tables[key] = [a * b for a, b in zip(existing, table_complex)]
+        else:
+            return None
+
+    if not pair_tables:
+        total = scalar_scaled
+        for phi0, phi1 in unary:
+            total = _mul_scaled_complex(total, _make_scaled_complex(phi0 + phi1))
+        return total, 0
+
+    neighbors = [set() for _ in range(n_vars)]
+    for left, right in pair_tables:
+        neighbors[left].add(right)
+        neighbors[right].add(left)
+    if require_forest and not _factor_graph_is_forest(n_vars, tuple(pair_tables)):
+        return None
+    neighbor_lists = [tuple(sorted(neighbor_set)) for neighbor_set in neighbors]
+    messages: dict[tuple[int, int], list[complex]] = {}
+    for left, right in pair_tables:
+        messages[(left, right)] = [1.0 + 0.0j, 1.0 + 0.0j]
+        messages[(right, left)] = [1.0 + 0.0j, 1.0 + 0.0j]
+
+    damping_value = float(_ARBITRARY_BP_DAMPING if damping is None else damping)
+    iter_limit = int(_ARBITRARY_BP_MAX_ITERS if max_iters is None else max_iters)
+    for _iter in range(iter_limit):
+        max_delta = 0.0
+        new_messages: dict[tuple[int, int], list[complex]] = {}
+        for src, src_neighbors in enumerate(neighbor_lists):
+            count = len(src_neighbors)
+            if not count:
+                continue
+            prefix0 = [unary[src][0]] * (count + 1)
+            prefix1 = [unary[src][1]] * (count + 1)
+            for idx, nbr in enumerate(src_neighbors):
+                incoming = messages[(nbr, src)]
+                prefix0[idx + 1] = prefix0[idx] * incoming[0]
+                prefix1[idx + 1] = prefix1[idx] * incoming[1]
+            suffix0 = [1.0 + 0.0j] * (count + 1)
+            suffix1 = [1.0 + 0.0j] * (count + 1)
+            for idx in range(count - 1, -1, -1):
+                incoming = messages[(src_neighbors[idx], src)]
+                suffix0[idx] = suffix0[idx + 1] * incoming[0]
+                suffix1[idx] = suffix1[idx + 1] * incoming[1]
+            for idx, dst in enumerate(src_neighbors):
+                prod0 = prefix0[idx] * suffix0[idx + 1]
+                prod1 = prefix1[idx] * suffix1[idx + 1]
+                key = (src, dst) if src < dst else (dst, src)
+                psi = pair_tables[key]
+                if src < dst:
+                    raw0 = prod0 * psi[0] + prod1 * psi[1]
+                    raw1 = prod0 * psi[2] + prod1 * psi[3]
+                else:
+                    raw0 = prod0 * psi[0] + prod1 * psi[2]
+                    raw1 = prod0 * psi[1] + prod1 * psi[3]
+                scale = max(abs(raw0), abs(raw1), 1e-300)
+                msg = [raw0 / scale, raw1 / scale]
+                old = messages[(src, dst)]
+                damped = [
+                    (1.0 - damping_value) * msg[0] + damping_value * old[0],
+                    (1.0 - damping_value) * msg[1] + damping_value * old[1],
+                ]
+                norm = max(abs(damped[0]), abs(damped[1]), 1e-300)
+                damped = [damped[0] / norm, damped[1] / norm]
+                max_delta = max(max_delta, abs(damped[0] - old[0]), abs(damped[1] - old[1]))
+                new_messages[(src, dst)] = damped
+        messages = new_messages
+        if max_delta <= _ARBITRARY_BP_TOL:
+            break
+
+    scalar_log = _scaled_complex_log(scalar_scaled)
+    if scalar_log is None:
+        return _ZERO_SCALED, max(1, max(len(neighbors[var]) for var in range(n_vars)))
+    log_z = scalar_log
+    log_z_vars: list[complex] = []
+    for var in range(n_vars):
+        b0 = unary[var][0]
+        b1 = unary[var][1]
+        for nbr in neighbors[var]:
+            incoming = messages[(nbr, var)]
+            b0 *= incoming[0]
+            b1 *= incoming[1]
+        log_z_vars.append(_complex_logsum((b0, b1)))
+
+    for (left, right), psi in pair_tables.items():
+        edge_terms = []
+        for left_bit in (0, 1):
+            left_weight = unary[left][left_bit]
+            for nbr in neighbors[left]:
+                if nbr != right:
+                    left_weight *= messages[(nbr, left)][left_bit]
+            for right_bit in (0, 1):
+                right_weight = unary[right][right_bit]
+                for nbr in neighbors[right]:
+                    if nbr != left:
+                        right_weight *= messages[(nbr, right)][right_bit]
+                edge_terms.append(left_weight * right_weight * psi[left_bit | (right_bit << 1)])
+        log_z += _complex_logsum(edge_terms)
+
+    for var in range(n_vars):
+        log_z += (1 - len(neighbors[var])) * log_z_vars[var]
+
+    max_degree = max((len(neighbor_set) for neighbor_set in neighbors), default=0)
+    return _scaled_from_complex_log(log_z), max(1, max_degree + 1)
+
+
+def _sum_factor_graph_bethe_scaled(
+    n_vars: int,
+    factors: Mapping[tuple[int, ...], Sequence[ScaledComplex]],
+    *,
+    scalar: ScaledComplex,
+    max_iters: int | None = None,
+    damping: float | None = None,
+    require_forest: bool = True,
+) -> tuple[ScaledComplex, int] | None:
+    """Approximate a bounded-scope complex factor graph partition fn via BP."""
+    factor_items: list[tuple[tuple[int, ...], list[complex], dict[int, int]]] = []
+    scalar_scaled = scalar
+    unary = [[1.0 + 0.0j, 1.0 + 0.0j] for _ in range(n_vars)]
+    max_scope = 0
+    for scope, table in factors.items():
+        scope = tuple(int(var) for var in scope)
+        if not scope:
+            scalar_scaled = _mul_scaled_complex(scalar_scaled, table[0])
+            continue
+        if len(scope) > 8:
+            return None
+        max_scope = max(max_scope, len(scope))
+        if len(scope) == 1:
+            var = scope[0]
+            unary[var][0] *= _scaled_to_plain_complex(table[0])
+            unary[var][1] *= _scaled_to_plain_complex(table[1])
+            continue
+        factor_items.append((
+            scope,
+            [_scaled_to_plain_complex(entry) for entry in table],
+            {var: pos for pos, var in enumerate(scope)},
+        ))
+
+    scalar_log = _scaled_complex_log(scalar_scaled)
+    if scalar_log is None:
+        return _ZERO_SCALED, max(1, max_scope)
+    if not factor_items:
+        log_z = scalar_log
+        for prior in unary:
+            log_z += _complex_logsum((prior[0], prior[1]))
+        return _scaled_from_complex_log(log_z), 1 if n_vars else 0
+    if require_forest and not _factor_graph_is_forest(n_vars, tuple(scope for scope, _table, _positions in factor_items)):
+        return None
+
+    var_factors: list[list[int]] = [[] for _ in range(n_vars)]
+    for factor_idx, (scope, _table, _positions) in enumerate(factor_items):
+        for var in scope:
+            var_factors[var].append(factor_idx)
+
+    msg_vf: dict[tuple[int, int], list[complex]] = {}
+    msg_fv: dict[tuple[int, int], list[complex]] = {}
+    message_edge_count = 0
+    for factor_idx, (scope, _table, _positions) in enumerate(factor_items):
+        for var in scope:
+            message_edge_count += 1
+            msg_vf[(var, factor_idx)] = [1.0 + 0.0j, 1.0 + 0.0j]
+            msg_fv[(factor_idx, var)] = [1.0 + 0.0j, 1.0 + 0.0j]
+
+    damping_value = float(_ARBITRARY_BP_DAMPING if damping is None else damping)
+    max_iters = (
+        int(_ARBITRARY_FACTOR_BP_LARGE_MAX_ITERS if max_iters is None else max_iters)
+        if message_edge_count >= _ARBITRARY_FACTOR_BP_LARGE_EDGE_THRESHOLD
+        else int(_ARBITRARY_FACTOR_BP_MAX_ITERS if max_iters is None else max_iters)
+    )
+    for _iter in range(max_iters):
+        max_delta = 0.0
+        new_msg_fv: dict[tuple[int, int], list[complex]] = {}
+        for factor_idx, (scope, table, positions) in enumerate(factor_items):
+            incoming = [msg_vf[(var, factor_idx)] for var in scope]
+            for var in scope:
+                var_pos = positions[var]
+                raw = [0.0 + 0.0j, 0.0 + 0.0j]
+                for assignment, table_value in enumerate(table):
+                    bit = (assignment >> var_pos) & 1
+                    weight = table_value
+                    for other_pos, other_msg in enumerate(incoming):
+                        if other_pos == var_pos:
+                            continue
+                        weight *= other_msg[(assignment >> other_pos) & 1]
+                    raw[bit] += weight
+                scale = max(abs(raw[0]), abs(raw[1]), 1e-300)
+                msg = [raw[0] / scale, raw[1] / scale]
+                old = msg_fv[(factor_idx, var)]
+                damped = [
+                    (1.0 - damping_value) * msg[0] + damping_value * old[0],
+                    (1.0 - damping_value) * msg[1] + damping_value * old[1],
+                ]
+                norm = max(abs(damped[0]), abs(damped[1]), 1e-300)
+                damped = [damped[0] / norm, damped[1] / norm]
+                max_delta = max(max_delta, abs(damped[0] - old[0]), abs(damped[1] - old[1]))
+                new_msg_fv[(factor_idx, var)] = damped
+
+        new_msg_vf: dict[tuple[int, int], list[complex]] = {}
+        for var, incident in enumerate(var_factors):
+            count = len(incident)
+            prefix0 = [unary[var][0]] * (count + 1)
+            prefix1 = [unary[var][1]] * (count + 1)
+            for idx, other_factor in enumerate(incident):
+                incoming = new_msg_fv[(other_factor, var)]
+                prefix0[idx + 1] = prefix0[idx] * incoming[0]
+                prefix1[idx + 1] = prefix1[idx] * incoming[1]
+            suffix0 = [1.0 + 0.0j] * (count + 1)
+            suffix1 = [1.0 + 0.0j] * (count + 1)
+            for idx in range(count - 1, -1, -1):
+                incoming = new_msg_fv[(incident[idx], var)]
+                suffix0[idx] = suffix0[idx + 1] * incoming[0]
+                suffix1[idx] = suffix1[idx + 1] * incoming[1]
+            for idx, factor_idx in enumerate(incident):
+                prod0 = prefix0[idx] * suffix0[idx + 1]
+                prod1 = prefix1[idx] * suffix1[idx + 1]
+                scale = max(abs(prod0), abs(prod1), 1e-300)
+                msg = [prod0 / scale, prod1 / scale]
+                old = msg_vf[(var, factor_idx)]
+                damped = [
+                    (1.0 - damping_value) * msg[0] + damping_value * old[0],
+                    (1.0 - damping_value) * msg[1] + damping_value * old[1],
+                ]
+                norm = max(abs(damped[0]), abs(damped[1]), 1e-300)
+                damped = [damped[0] / norm, damped[1] / norm]
+                max_delta = max(max_delta, abs(damped[0] - old[0]), abs(damped[1] - old[1]))
+                new_msg_vf[(var, factor_idx)] = damped
+        msg_fv = new_msg_fv
+        msg_vf = new_msg_vf
+        if max_delta <= _ARBITRARY_BP_TOL:
+            break
+
+    log_z = scalar_log
+    for factor_idx, (scope, table, _positions) in enumerate(factor_items):
+        terms = []
+        for assignment, table_value in enumerate(table):
+            weight = table_value
+            for pos, var in enumerate(scope):
+                weight *= msg_vf[(var, factor_idx)][(assignment >> pos) & 1]
+            terms.append(weight)
+        log_z += _complex_logsum(terms)
+
+    for var, incident in enumerate(var_factors):
+        b0 = unary[var][0]
+        b1 = unary[var][1]
+        for factor_idx in incident:
+            incoming = msg_fv[(factor_idx, var)]
+            b0 *= incoming[0]
+            b1 *= incoming[1]
+        log_z += _complex_logsum((b0, b1))
+
+    for factor_idx, (scope, _table, _positions) in enumerate(factor_items):
+        for var in scope:
+            log_z -= _complex_logsum((
+                msg_vf[(var, factor_idx)][0] * msg_fv[(factor_idx, var)][0],
+                msg_vf[(var, factor_idx)][1] * msg_fv[(factor_idx, var)][1],
+            ))
+
+    return _scaled_from_complex_log(log_z), max(1, max_scope)
+
+
+def _sum_factor_graph_with_sparse_parity_bethe_scaled(
+    n_vars: int,
+    factors: Mapping[tuple[int, ...], Sequence[ScaledComplex]],
+    terms: Sequence[_ArbitraryPhaseTerm],
+    *,
+    scalar: ScaledComplex,
+    max_iters: int | None = None,
+    damping: float | None = None,
+    require_forest: bool = True,
+) -> tuple[ScaledComplex, int] | None:
+    """Approximate factor graph BP with wide affine-parity phase factors kept sparse."""
+    dense_items: list[tuple[tuple[int, ...], list[complex], dict[int, int]]] = []
+    parity_items: list[tuple[tuple[int, ...], complex, int]] = []
+    scalar_scaled = scalar
+    unary = [[1.0 + 0.0j, 1.0 + 0.0j] for _ in range(n_vars)]
+    max_scope = 0
+
+    for scope, table in factors.items():
+        scope = tuple(int(var) for var in scope)
+        if not scope:
+            scalar_scaled = _mul_scaled_complex(scalar_scaled, table[0])
+            continue
+        if len(scope) > 8:
+            return None
+        max_scope = max(max_scope, len(scope))
+        if len(scope) == 1:
+            var = scope[0]
+            unary[var][0] *= _scaled_to_plain_complex(table[0])
+            unary[var][1] *= _scaled_to_plain_complex(table[1])
+            continue
+        dense_items.append((
+            scope,
+            [_scaled_to_plain_complex(entry) for entry in table],
+            {var: pos for pos, var in enumerate(scope)},
+        ))
+
+    for term in terms:
+        row_mask = int(term.row_mask)
+        phase = cmath.exp(1j * float(term.angle))
+        offset = int(term.offset) & 1
+        if row_mask == 0:
+            if offset:
+                scalar_scaled = _mul_scaled_complex(scalar_scaled, _make_scaled_complex(phase))
+            continue
+        scope = _support_from_mask(row_mask)
+        max_scope = max(max_scope, len(scope))
+        parity_items.append((scope, phase, offset))
+
+    scalar_log = _scaled_complex_log(scalar_scaled)
+    if scalar_log is None:
+        return _ZERO_SCALED, max(1, max_scope)
+    sparse_scopes = tuple(scope for scope, _table, _positions in dense_items) + tuple(
+        scope for scope, _phase, _offset in parity_items
+    )
+    if require_forest and not _factor_graph_is_forest(n_vars, sparse_scopes):
+        return None
+
+    var_factors: list[list[tuple[str, int]]] = [[] for _ in range(n_vars)]
+    for factor_idx, (scope, _table, _positions) in enumerate(dense_items):
+        for var in scope:
+            var_factors[var].append(("d", factor_idx))
+    for factor_idx, (scope, _phase, _offset) in enumerate(parity_items):
+        for var in scope:
+            var_factors[var].append(("p", factor_idx))
+
+    message_edge_count = sum(len(scope) for scope, _table, _positions in dense_items)
+    message_edge_count += sum(len(scope) for scope, _phase, _offset in parity_items)
+    if message_edge_count == 0:
+        log_z = scalar_log
+        for prior in unary:
+            log_z += _complex_logsum((prior[0], prior[1]))
+        return _scaled_from_complex_log(log_z), 1 if n_vars else 0
+
+    msg_vf: dict[tuple[int, str, int], list[complex]] = {}
+    msg_fv: dict[tuple[str, int, int], list[complex]] = {}
+    for factor_idx, (scope, _table, _positions) in enumerate(dense_items):
+        for var in scope:
+            msg_vf[(var, "d", factor_idx)] = [1.0 + 0.0j, 1.0 + 0.0j]
+            msg_fv[("d", factor_idx, var)] = [1.0 + 0.0j, 1.0 + 0.0j]
+    for factor_idx, (scope, _phase, _offset) in enumerate(parity_items):
+        for var in scope:
+            msg_vf[(var, "p", factor_idx)] = [1.0 + 0.0j, 1.0 + 0.0j]
+            msg_fv[("p", factor_idx, var)] = [1.0 + 0.0j, 1.0 + 0.0j]
+
+    damping_value = float(_ARBITRARY_BP_DAMPING if damping is None else damping)
+    max_iters = (
+        int(_ARBITRARY_FACTOR_BP_LARGE_MAX_ITERS if max_iters is None else max_iters)
+        if message_edge_count >= _ARBITRARY_FACTOR_BP_LARGE_EDGE_THRESHOLD
+        else int(_ARBITRARY_FACTOR_BP_MAX_ITERS if max_iters is None else max_iters)
+    )
+    for _iter in range(max_iters):
+        max_delta = 0.0
+        new_msg_fv: dict[tuple[str, int, int], list[complex]] = {}
+
+        for factor_idx, (scope, table, positions) in enumerate(dense_items):
+            incoming = [msg_vf[(var, "d", factor_idx)] for var in scope]
+            for var in scope:
+                var_pos = positions[var]
+                raw = [0.0 + 0.0j, 0.0 + 0.0j]
+                for assignment, table_value in enumerate(table):
+                    bit = (assignment >> var_pos) & 1
+                    weight = table_value
+                    for other_pos, other_msg in enumerate(incoming):
+                        if other_pos != var_pos:
+                            weight *= other_msg[(assignment >> other_pos) & 1]
+                    raw[bit] += weight
+                scale = max(abs(raw[0]), abs(raw[1]), 1e-300)
+                msg = [raw[0] / scale, raw[1] / scale]
+                old = msg_fv[("d", factor_idx, var)]
+                damped = [
+                    (1.0 - damping_value) * msg[0] + damping_value * old[0],
+                    (1.0 - damping_value) * msg[1] + damping_value * old[1],
+                ]
+                norm = max(abs(damped[0]), abs(damped[1]), 1e-300)
+                damped = [damped[0] / norm, damped[1] / norm]
+                max_delta = max(max_delta, abs(damped[0] - old[0]), abs(damped[1] - old[1]))
+                new_msg_fv[("d", factor_idx, var)] = damped
+
+        for factor_idx, (scope, phase, offset) in enumerate(parity_items):
+            incoming = [msg_vf[(var, "p", factor_idx)] for var in scope]
+            count = len(scope)
+            prefix_sum = [1.0 + 0.0j] * (count + 1)
+            prefix_diff = [1.0 + 0.0j] * (count + 1)
+            for idx, msg in enumerate(incoming):
+                prefix_sum[idx + 1] = prefix_sum[idx] * (msg[0] + msg[1])
+                prefix_diff[idx + 1] = prefix_diff[idx] * (msg[0] - msg[1])
+            suffix_sum = [1.0 + 0.0j] * (count + 1)
+            suffix_diff = [1.0 + 0.0j] * (count + 1)
+            for idx in range(count - 1, -1, -1):
+                msg = incoming[idx]
+                suffix_sum[idx] = suffix_sum[idx + 1] * (msg[0] + msg[1])
+                suffix_diff[idx] = suffix_diff[idx + 1] * (msg[0] - msg[1])
+            phase_delta = phase - 1.0
+            for idx, var in enumerate(scope):
+                other_sum = prefix_sum[idx] * suffix_sum[idx + 1]
+                other_diff = prefix_diff[idx] * suffix_diff[idx + 1]
+                even = 0.5 * (other_sum + other_diff)
+                odd = 0.5 * (other_sum - other_diff)
+                raw = [0.0 + 0.0j, 0.0 + 0.0j]
+                for bit in (0, 1):
+                    trigger_even = ((1 ^ bit ^ offset) == 0)
+                    phase_sum = even if trigger_even else odd
+                    raw[bit] = other_sum + phase_delta * phase_sum
+                scale = max(abs(raw[0]), abs(raw[1]), 1e-300)
+                msg = [raw[0] / scale, raw[1] / scale]
+                old = msg_fv[("p", factor_idx, var)]
+                damped = [
+                    (1.0 - damping_value) * msg[0] + damping_value * old[0],
+                    (1.0 - damping_value) * msg[1] + damping_value * old[1],
+                ]
+                norm = max(abs(damped[0]), abs(damped[1]), 1e-300)
+                damped = [damped[0] / norm, damped[1] / norm]
+                max_delta = max(max_delta, abs(damped[0] - old[0]), abs(damped[1] - old[1]))
+                new_msg_fv[("p", factor_idx, var)] = damped
+
+        new_msg_vf: dict[tuple[int, str, int], list[complex]] = {}
+        for var, incident in enumerate(var_factors):
+            count = len(incident)
+            prefix0 = [unary[var][0]] * (count + 1)
+            prefix1 = [unary[var][1]] * (count + 1)
+            for idx, (kind, factor_idx) in enumerate(incident):
+                incoming = new_msg_fv[(kind, factor_idx, var)]
+                prefix0[idx + 1] = prefix0[idx] * incoming[0]
+                prefix1[idx + 1] = prefix1[idx] * incoming[1]
+            suffix0 = [1.0 + 0.0j] * (count + 1)
+            suffix1 = [1.0 + 0.0j] * (count + 1)
+            for idx in range(count - 1, -1, -1):
+                kind, factor_idx = incident[idx]
+                incoming = new_msg_fv[(kind, factor_idx, var)]
+                suffix0[idx] = suffix0[idx + 1] * incoming[0]
+                suffix1[idx] = suffix1[idx + 1] * incoming[1]
+            for idx, (kind, factor_idx) in enumerate(incident):
+                prod0 = prefix0[idx] * suffix0[idx + 1]
+                prod1 = prefix1[idx] * suffix1[idx + 1]
+                scale = max(abs(prod0), abs(prod1), 1e-300)
+                msg = [prod0 / scale, prod1 / scale]
+                old = msg_vf[(var, kind, factor_idx)]
+                damped = [
+                    (1.0 - damping_value) * msg[0] + damping_value * old[0],
+                    (1.0 - damping_value) * msg[1] + damping_value * old[1],
+                ]
+                norm = max(abs(damped[0]), abs(damped[1]), 1e-300)
+                damped = [damped[0] / norm, damped[1] / norm]
+                max_delta = max(max_delta, abs(damped[0] - old[0]), abs(damped[1] - old[1]))
+                new_msg_vf[(var, kind, factor_idx)] = damped
+
+        msg_fv = new_msg_fv
+        msg_vf = new_msg_vf
+        if max_delta <= _ARBITRARY_BP_TOL:
+            break
+
+    log_z = scalar_log
+    for factor_idx, (scope, table, _positions) in enumerate(dense_items):
+        terms_for_log = []
+        for assignment, table_value in enumerate(table):
+            weight = table_value
+            for pos, var in enumerate(scope):
+                weight *= msg_vf[(var, "d", factor_idx)][(assignment >> pos) & 1]
+            terms_for_log.append(weight)
+        log_z += _complex_logsum(terms_for_log)
+
+    for factor_idx, (scope, phase, offset) in enumerate(parity_items):
+        prod_sum = 1.0 + 0.0j
+        prod_diff = 1.0 + 0.0j
+        for var in scope:
+            msg = msg_vf[(var, "p", factor_idx)]
+            prod_sum *= msg[0] + msg[1]
+            prod_diff *= msg[0] - msg[1]
+        even = 0.5 * (prod_sum + prod_diff)
+        odd = 0.5 * (prod_sum - prod_diff)
+        phase_sum = even if offset else odd
+        value = prod_sum + (phase - 1.0) * phase_sum
+        if value == 0j:
+            return _ZERO_SCALED, max(1, max_scope)
+        log_z += cmath.log(value)
+
+    for var, incident in enumerate(var_factors):
+        b0 = unary[var][0]
+        b1 = unary[var][1]
+        for kind, factor_idx in incident:
+            incoming = msg_fv[(kind, factor_idx, var)]
+            b0 *= incoming[0]
+            b1 *= incoming[1]
+        log_z += _complex_logsum((b0, b1))
+
+    for factor_idx, (scope, _table, _positions) in enumerate(dense_items):
+        for var in scope:
+            log_z -= _complex_logsum((
+                msg_vf[(var, "d", factor_idx)][0] * msg_fv[("d", factor_idx, var)][0],
+                msg_vf[(var, "d", factor_idx)][1] * msg_fv[("d", factor_idx, var)][1],
+            ))
+    for factor_idx, (scope, _phase, _offset) in enumerate(parity_items):
+        for var in scope:
+            log_z -= _complex_logsum((
+                msg_vf[(var, "p", factor_idx)][0] * msg_fv[("p", factor_idx, var)][0],
+                msg_vf[(var, "p", factor_idx)][1] * msg_fv[("p", factor_idx, var)][1],
+            ))
+
+    return _scaled_from_complex_log(log_z), max(1, max_scope)
+
+
+def _scaled_complex_ratio_to_plain(
+    numerator: ScaledComplex,
+    denominator: ScaledComplex,
+) -> complex | None:
+    num_value, num_half_pow2 = numerator
+    den_value, den_half_pow2 = denominator
+    if num_value == 0j:
+        return 0j
+    if den_value == 0j:
+        return None
+    log_ratio = (
+        cmath.log(num_value)
+        - cmath.log(den_value)
+        + 0.5 * (int(num_half_pow2) - int(den_half_pow2)) * math.log(2.0)
+    )
+    if not (math.isfinite(log_ratio.real) and math.isfinite(log_ratio.imag)):
+        return None
+    if log_ratio.real > 700.0:
+        return None
+    if log_ratio.real < -745.0:
+        return 0j
+    return cmath.exp(log_ratio)
+
+
+def _factor_graph_is_forest(n_vars: int, factor_scopes: Sequence[Sequence[int]]) -> bool:
+    """Return true when the bipartite factor graph is acyclic, where BP is exact."""
+    parent = list(range(max(0, int(n_vars)) + len(factor_scopes)))
+
+    def find(node: int) -> int:
+        while parent[node] != node:
+            parent[node] = parent[parent[node]]
+            node = parent[node]
+        return node
+
+    def union(left: int, right: int) -> bool:
+        root_left = find(left)
+        root_right = find(right)
+        if root_left == root_right:
+            return False
+        parent[root_right] = root_left
+        return True
+
+    for factor_idx, scope in enumerate(factor_scopes):
+        factor_node = int(n_vars) + factor_idx
+        for var in scope:
+            if not union(int(var), factor_node):
+                return False
+    return True
+
+
+def _scaled_log2_abs(value: ScaledComplex) -> float:
+    scalar, half_pow2 = value
+    if scalar == 0j:
+        return -math.inf
+    return math.log2(abs(scalar)) + 0.5 * float(half_pow2)
+
+
+def _scaled_phase(value: ScaledComplex) -> float | None:
+    scalar, _half_pow2 = value
+    if scalar == 0j:
+        return None
+    return math.atan2(scalar.imag, scalar.real)
+
+
+def _phase_distance(left: float, right: float) -> float:
+    return abs(math.atan2(math.sin(left - right), math.cos(left - right)))
+
+
+def _arbitrary_bp_heuristic_candidate(
+    n_vars: int,
+    dense_factors: Mapping[tuple[int, ...], Sequence[ScaledComplex]] | None,
+    dense_scalar: ScaledComplex,
+    base_factors: Mapping[tuple[int, ...], Sequence[ScaledComplex]],
+    terms: Sequence[_ArbitraryPhaseTerm],
+    base_scalar: ScaledComplex,
+    *,
+    max_iters: int,
+    damping: float,
+) -> tuple[ScaledComplex, int, str] | None:
+    if dense_factors is not None:
+        candidate = _sum_pairwise_factor_graph_bethe_scaled(
+            n_vars,
+            dense_factors,
+            scalar=dense_scalar,
+            max_iters=max_iters,
+            damping=damping,
+            require_forest=False,
+        )
+        if candidate is not None:
+            total, max_scope = candidate
+            return total, max_scope, "arbitrary_bethe_bp_heuristic"
+        candidate = _sum_factor_graph_bethe_scaled(
+            n_vars,
+            dense_factors,
+            scalar=dense_scalar,
+            max_iters=max_iters,
+            damping=damping,
+            require_forest=False,
+        )
+        if candidate is not None:
+            total, max_scope = candidate
+            return total, max_scope, "arbitrary_factor_bethe_bp_heuristic"
+
+    candidate = _sum_factor_graph_with_sparse_parity_bethe_scaled(
+        n_vars,
+        base_factors,
+        terms,
+        scalar=base_scalar,
+        max_iters=max_iters,
+        damping=damping,
+        require_forest=False,
+    )
+    if candidate is None:
+        return None
+    total, max_scope = candidate
+    return total, max_scope, "arbitrary_sparse_parity_bethe_bp_heuristic"
+
+
+def _sum_arbitrary_bp_heuristic_ensemble_scaled(
+    n_vars: int,
+    dense_factors: Mapping[tuple[int, ...], Sequence[ScaledComplex]] | None,
+    dense_scalar: ScaledComplex,
+    base_factors: Mapping[tuple[int, ...], Sequence[ScaledComplex]],
+    terms: Sequence[_ArbitraryPhaseTerm],
+    base_scalar: ScaledComplex,
+) -> tuple[ScaledComplex, int, str, dict[str, object]] | None:
+    config = _get_solver_config()
+    candidates: list[tuple[ScaledComplex, int, str, int, float]] = []
+    for max_iters, damping in _ARBITRARY_BP_HEURISTIC_SCHEDULES:
+        candidate = _arbitrary_bp_heuristic_candidate(
+            n_vars,
+            dense_factors,
+            dense_scalar,
+            base_factors,
+            terms,
+            base_scalar,
+            max_iters=max_iters,
+            damping=damping,
+        )
+        if candidate is not None:
+            total, max_scope, backend = candidate
+            candidates.append((total, max_scope, backend, int(max_iters), float(damping)))
+
+    if len(candidates) < 2:
+        return None
+
+    log2_probabilities = [_scaled_probability_log2(total) for total, _scope, _backend, _iters, _damping in candidates]
+    max_log2_probability = max(log2_probabilities)
+    if max_log2_probability > float(config.bp_heuristic_bound_log2_tol):
+        return None
+
+    log2_abs_values = [_scaled_log2_abs(total) for total, _scope, _backend, _iters, _damping in candidates]
+    finite_log2_abs = [value for value in log2_abs_values if math.isfinite(value)]
+    if len(finite_log2_abs) != len(log2_abs_values):
+        if finite_log2_abs:
+            return None
+        log2_abs_spread = 0.0
+    else:
+        log2_abs_spread = max(finite_log2_abs) - min(finite_log2_abs)
+    if log2_abs_spread > float(config.bp_heuristic_max_log2_abs_spread):
+        return None
+
+    phases = [phase for total, _scope, _backend, _iters, _damping in candidates if (phase := _scaled_phase(total)) is not None]
+    phase_spread = 0.0
+    for idx, left in enumerate(phases):
+        for right in phases[idx + 1:]:
+            phase_spread = max(phase_spread, _phase_distance(left, right))
+    if phase_spread > float(config.bp_heuristic_max_phase_spread):
+        return None
+
+    if finite_log2_abs:
+        median_log2_abs = sorted(finite_log2_abs)[len(finite_log2_abs) // 2]
+        selected_idx = min(
+            range(len(candidates)),
+            key=lambda idx: abs(log2_abs_values[idx] - median_log2_abs),
+        )
+    else:
+        selected_idx = 0
+    total, max_scope, backend, _iters, _damping = candidates[selected_idx]
+    metadata: dict[str, object] = {
+        "bp_heuristic_ensemble_size": len(candidates),
+        "bp_heuristic_log2_abs_spread": float(log2_abs_spread),
+        "bp_heuristic_phase_spread": float(phase_spread),
+        "bp_heuristic_max_log2_probability": float(max_log2_probability),
+    }
+    return total, max_scope, backend, metadata
+
+
+def _arbitrary_factor_graph_for_state_output(
+    state: "SchurState",
+    output_bits: BitSequence,
+    context: "_ReductionContext",
+) -> tuple[int, dict[tuple[int, ...], Sequence[ScaledComplex]], ScaledComplex] | None:
+    cache = state._prepare_echelon()
+    solved = state._solve_for_output(cache, output_bits)
+    if solved is None:
+        return None
+    shift_mask, _, gamma, n_free = solved
+    q_free = _aff_compose_cached(state.q, shift_mask, gamma, n_free, context=context)
+    arbitrary_scalar, arbitrary_terms = state._transform_arbitrary_phases(shift_mask, gamma)
+    scalar, factors = _build_cubic_factors_scaled(q_free)
+    scalar = _mul_scaled_complex(
+        scalar,
+        _make_scaled_complex(complex(state.scalar) * arbitrary_scalar),
+    )
+    scalar = _scale_scaled_complex(scalar, int(state.scalar_half_pow2))
+    scalar = _mul_scaled_complex(scalar, _add_arbitrary_phase_factors_scaled(factors, arbitrary_terms))
+    return q_free.n, factors, scalar
+
+
+def _sum_with_arbitrary_phases_scaled(
+    q: PhaseFunction,
+    terms: Sequence[_ArbitraryPhaseTerm],
+    *,
+    allow_approximate: bool = False,
+) -> tuple[ScaledComplex, int, str, dict[str, object]]:
+    """Exact path-sum with arbitrary affine phases represented as factors."""
+    scalar, factors = _build_cubic_factors_scaled(q)
+    base_scalar = scalar
+    base_factors = dict(factors)
+    wide_arbitrary = any(
+        int(term.row_mask).bit_count() > _MAX_ARBITRARY_PHASE_FACTOR_SCOPE
+        for term in terms
+    )
+    if wide_arbitrary:
+        heuristic_attempted = False
+        sparse_factor_scopes = tuple(factors) + tuple(_support_from_mask(int(term.row_mask)) for term in terms if int(term.row_mask))
+        if allow_approximate and _factor_graph_is_forest(q.n, sparse_factor_scopes):
+            approximate = _sum_factor_graph_with_sparse_parity_bethe_scaled(
+                q.n,
+                factors,
+                terms,
+                scalar=scalar,
+            )
+            if approximate is not None:
+                total, max_scope = approximate
+                return total, int(max_scope), "arbitrary_sparse_parity_bethe_bp", {}
+        if allow_approximate:
+            heuristic = _sum_arbitrary_bp_heuristic_ensemble_scaled(
+                q.n,
+                None,
+                scalar,
+                base_factors,
+                terms,
+                base_scalar,
+            )
+            if heuristic is not None:
+                total, max_scope, backend, metadata = heuristic
+                return total, int(max_scope), backend, metadata
+            heuristic_attempted = True
+        max_term_scope = max(int(term.row_mask).bit_count() for term in terms)
+        heuristic_note = " Loopy BP heuristic failed acceptance thresholds." if heuristic_attempted else ""
+        raise RuntimeError(
+            f"Cannot compute amplitude directly: arbitrary-angle factor has scope {max_term_scope}, "
+            f"above limit {_MAX_ARBITRARY_PHASE_FACTOR_SCOPE}.{heuristic_note}"
+        )
+    scalar = _mul_scaled_complex(scalar, _add_arbitrary_phase_factors_scaled(factors, terms))
+    factor_scopes = tuple(factors)
+    if factor_scopes:
+        order, width = _factor_scope_order(q.n, factor_scopes)
+    else:
+        order = list(range(q.n))
+        width = 1 if q.n else 0
+    work, max_table_entries = _estimate_factor_table_dp_cost(q.n, factor_scopes, order)
+    width_limit = (
+        _MAX_ARBITRARY_PATH_SUM_NATIVE_WIDTH
+        if _schur_native is not None and hasattr(_schur_native, "sum_factor_tables_scaled")
+        else _MAX_ARBITRARY_PATH_SUM_PY_WIDTH
+    )
+    over_limit = (
+        width > width_limit
+        or work > _MAX_ARBITRARY_PATH_SUM_WORK
+        or max_table_entries > _MAX_ARBITRARY_PATH_SUM_TABLE_ENTRIES
+    )
+    require_native = _schur_native is not None and hasattr(_schur_native, "sum_factor_tables_scaled")
+    if over_limit:
+        heuristic_attempted = False
+        cutset_plan = None
+        if width - _MAX_ARBITRARY_PATH_SUM_CUTSET_SIZE <= width_limit:
+            cutset_plan = _find_arbitrary_factor_cutset_plan(
+                q.n,
+                factor_scopes,
+                width_limit=width_limit,
+            )
+        if cutset_plan is not None:
+            total, max_scope = _sum_factor_tables_with_cutset_scaled(
+                q.n,
+                factors,
+                cutset_plan,
+                scalar=scalar,
+                require_native=require_native,
+            )
+            return total, int(max_scope), "arbitrary_path_sum_cutset", {}
+        if allow_approximate:
+            approximate = None
+            approximate_backend = "arbitrary_bethe_bp"
+            if _factor_graph_is_forest(q.n, factor_scopes):
+                approximate = _sum_pairwise_factor_graph_bethe_scaled(
+                    q.n,
+                    factors,
+                    scalar=scalar,
+                )
+                if approximate is None:
+                    approximate = _sum_factor_graph_bethe_scaled(
+                        q.n,
+                        factors,
+                        scalar=scalar,
+                    )
+                    approximate_backend = "arbitrary_factor_bethe_bp"
+            if approximate is not None:
+                total, max_scope = approximate
+                return total, int(max_scope), approximate_backend, {}
+            sparse_factor_scopes = tuple(base_factors) + tuple(
+                _support_from_mask(int(term.row_mask))
+                for term in terms
+                if int(term.row_mask)
+            )
+            if not _factor_graph_is_forest(q.n, sparse_factor_scopes):
+                sparse_factor_scopes = ()
+            approximate = _sum_factor_graph_with_sparse_parity_bethe_scaled(
+                q.n,
+                base_factors,
+                terms,
+                scalar=base_scalar,
+            ) if sparse_factor_scopes else None
+            if approximate is not None:
+                total, max_scope = approximate
+                return total, int(max_scope), "arbitrary_sparse_parity_bethe_bp", {}
+            heuristic = _sum_arbitrary_bp_heuristic_ensemble_scaled(
+                q.n,
+                factors,
+                scalar,
+                base_factors,
+                terms,
+                base_scalar,
+            )
+            if heuristic is not None:
+                total, max_scope, backend, metadata = heuristic
+                return total, int(max_scope), backend, metadata
+            heuristic_attempted = True
+        heuristic_note = " Loopy BP heuristic failed acceptance thresholds." if heuristic_attempted else ""
+        raise RuntimeError(
+            "Cannot compute amplitude directly: arbitrary-angle path-sum "
+            f"width {width}, work {work}, table entries {max_table_entries} exceed "
+            f"limits width {width_limit}, work {_MAX_ARBITRARY_PATH_SUM_WORK}, "
+            f"table entries {_MAX_ARBITRARY_PATH_SUM_TABLE_ENTRIES}; no exact cutset "
+            f"of size <= {_MAX_ARBITRARY_PATH_SUM_CUTSET_SIZE} lowered total work enough.{heuristic_note}"
+        )
+    total, max_scope = _sum_factor_tables_scaled(
+        q.n,
+        factors,
+        order,
+        scalar=scalar,
+        require_native=require_native,
+    )
+    return total, int(max_scope), "arbitrary_path_sum", {}
+
+
 # ==================================================================
 # Schur-state construction and output constraint solving
 # ==================================================================
@@ -1433,6 +2506,7 @@ class SchurState:
         self.output_refcount: list[int] = []
         self._arbitrary_phases: list[_ArbitraryPhaseTerm] = []
         self._pending_dead: set[int] = set()
+        self._defer_early_elim = False
         self._cached_classification_data = None
         self._cached_classification_q = None
 
@@ -1500,28 +2574,83 @@ class SchurState:
             new_mask |= 1 << (idx - shift)
         return new_mask
 
+    def _build_mask_remap_chunks(self, removed: Sequence[int]) -> tuple[list[int], list[int], list[int]]:
+        removed = tuple(sorted(int(idx) for idx in removed))
+        kept_starts: list[int] = []
+        old_starts: list[int] = []
+        lengths: list[int] = []
+        old = 0
+        kept = 0
+        for idx in removed:
+            if idx > old:
+                kept_starts.append(kept)
+                old_starts.append(old)
+                lengths.append(idx - old)
+                kept += idx - old
+            old = idx + 1
+        if old < self.m + len(removed):
+            kept_starts.append(kept)
+            old_starts.append(old)
+            lengths.append(self.m + len(removed) - old)
+        return kept_starts, old_starts, lengths
+
+    @staticmethod
+    def _remap_mask_after_removal_chunks(
+        mask: int,
+        kept_starts: Sequence[int],
+        old_starts: Sequence[int],
+        lengths: Sequence[int],
+    ) -> int:
+        if not mask:
+            return 0
+        new_mask = 0
+        for kept_start, old_start, length in zip(kept_starts, old_starts, lengths):
+            chunk = (mask >> old_start) & ((1 << length) - 1)
+            if chunk:
+                new_mask |= chunk << kept_start
+        return new_mask
+
     def _apply_elimination_result(self, new_q, half_pow2, removed):
+        old_m = self.m
+        old_output_refcount = self.output_refcount
         self.q = new_q
         self.m = new_q.n
         self.scalar_half_pow2 += half_pow2
         self._invalidate_classification_cache()
         removed = sorted(removed)
-        self.eps = [self._remap_mask_after_removal(mask, removed) for mask in self.eps]
+        if removed:
+            kept_starts, old_starts, lengths = self._build_mask_remap_chunks(removed)
+            remap = self._remap_mask_after_removal_chunks
+            self.eps = [remap(mask, kept_starts, old_starts, lengths) for mask in self.eps]
+        else:
+            self.eps = list(self.eps)
         remapped_terms: list[_ArbitraryPhaseTerm] = []
         for term in self._arbitrary_phases:
-            remapped_mask = self._remap_mask_after_removal(term.row_mask, removed)
+            remapped_mask = (
+                self._remap_mask_after_removal_chunks(term.row_mask, kept_starts, old_starts, lengths)
+                if removed
+                else term.row_mask
+            )
             if remapped_mask:
                 remapped_terms.append(_ArbitraryPhaseTerm(remapped_mask, term.offset, term.angle))
             elif term.offset:
                 self.scalar *= cmath.exp(1j * term.angle)
         self._arbitrary_phases = remapped_terms
-        self._rebuild_output_refcount()
+        if removed:
+            removed_set = set(removed)
+            self.output_refcount = [
+                count
+                for idx, count in enumerate(old_output_refcount[:old_m])
+                if idx not in removed_set
+            ]
+        else:
+            self.output_refcount = list(old_output_refcount)
 
     def _queue_dead_candidates(self, candidates):
         if not candidates:
             return
         self._pending_dead.update(candidates)
-        if len(self._pending_dead) >= _build_early_elim_batch_size(self.q.level):
+        if not self._defer_early_elim and len(self._pending_dead) >= _build_early_elim_batch_size(self.q.level):
             self._flush_pending_dead_variables()
 
     def _flush_pending_dead_variables(self):
@@ -1564,6 +2693,28 @@ class SchurState:
                 dead = {idx for idx, count in enumerate(self.output_refcount) if count == 0}
                 changed = True
                 continue
+
+            batch_quadratic = [
+                var
+                for var in ordered_dead
+                if (
+                    self.q.level == 3
+                    and not self.q.q3
+                    and classification_entries[var][0] == _CLASS_QUADRATIC
+                    and not bool(classification_entries[var][2])
+                )
+            ]
+            if len(batch_quadratic) >= 8:
+                new_q, half_pow2, removed = _elim_sparse_dead_quadratics_batch(
+                    self.q,
+                    batch_quadratic,
+                    classification_data=classification_data,
+                )
+                if removed:
+                    self._apply_elimination_result(new_q, half_pow2, removed)
+                    dead = {idx for idx, count in enumerate(self.output_refcount) if count == 0}
+                    changed = True
+                    continue
 
             for var in ordered_dead:
                 entry = classification_entries[var]
@@ -1854,6 +3005,79 @@ class SchurState:
             )
             self._invalidate_classification_cache()
 
+    def pauli_expbox(self, paulis: Sequence[str], qubits: Sequence[int], angle: float) -> None:
+        """Apply ``exp(-0.5j * angle * P)`` for a Pauli string ``P``.
+
+        After local X/Y basis changes this is one arbitrary phase on the XOR
+        parity of all active Z-basis qubits. This keeps the operation inside
+        Schur's affine phase representation instead of materializing a CNOT
+        parity ladder.
+        """
+        angle_value = float(angle)
+        if not math.isfinite(angle_value):
+            raise ValueError(f"pauli_expbox angle must be finite, received {angle!r}.")
+
+        active: list[tuple[str, int]] = []
+        for pauli, qubit in zip(paulis, qubits):
+            pauli_char = str(pauli).upper()
+            if pauli_char == "I":
+                continue
+            if pauli_char not in {"X", "Y", "Z"}:
+                raise ValueError(f"Unsupported PauliExpBox Pauli {pauli!r}.")
+            active.append((pauli_char, int(qubit)))
+
+        if not active:
+            self.scalar *= cmath.exp(-0.5j * angle_value)
+            return
+
+        if math.isclose(math.remainder(angle_value, 2.0 * math.pi), 0.0, rel_tol=0.0, abs_tol=1e-15):
+            return
+
+        for pauli_char, qubit in active:
+            if pauli_char == "X":
+                self.h(qubit)
+            elif pauli_char == "Y":
+                self.sdg(qubit)
+                self.h(qubit)
+
+        row_mask = 0
+        offset = 0
+        for _pauli_char, qubit in active:
+            row_mask ^= self.eps[qubit]
+            offset ^= self.eps0[qubit] & 1
+        self.scalar *= cmath.exp(-0.5j * angle_value)
+        snap_level = _pauli_expbox_dyadic_snap_level()
+        if snap_level is not None:
+            modulus = 1 << snap_level
+            coeff = int(round(angle_value * modulus / (2.0 * math.pi)))
+            snapped = 2.0 * math.pi * coeff / modulus
+            self.scalar *= cmath.exp(0.5j * (angle_value - snapped))
+            coeff %= modulus
+            if row_mask and coeff:
+                self._ensure_phase_precision(snap_level)
+                _apply_diag_phase_in_place(
+                    self.q,
+                    row_mask,
+                    offset,
+                    self._lift_linear_coeff(coeff, snap_level),
+                )
+                self._invalidate_classification_cache()
+            elif offset and coeff:
+                self.scalar *= cmath.exp(1j * snapped)
+        else:
+            if row_mask:
+                self._arbitrary_phases.append(_ArbitraryPhaseTerm(row_mask, offset, angle_value))
+                self._update_reference_mask(0, row_mask)
+            elif offset:
+                self.scalar *= cmath.exp(1j * angle_value)
+
+        for pauli_char, qubit in reversed(active):
+            if pauli_char == "X":
+                self.h(qubit)
+            elif pauli_char == "Y":
+                self.h(qubit)
+                self.s(qubit)
+
     def h(self, qubit: int) -> None:                         # [BL26 Eq.284]
         k=qubit
         old_mask = self.eps[k]
@@ -1958,6 +3182,7 @@ class SchurState:
         preserve_scale: bool = False,
         allow_tensor_contraction: bool = True,
         extended_reductions: ExtendedReductionMode | str = "auto",
+        allow_unbounded_bp_result: bool = False,
     ) -> tuple[ScaledAmplitude | complex, ReductionInfo]:
         if len(output_bits) != self.n:
             raise ValueError(f"Expected {self.n} output bits, received {len(output_bits)}.")
@@ -1991,119 +3216,29 @@ class SchurState:
         arbitrary_scalar, arbitrary_terms = self._transform_arbitrary_phases(shift_mask, gamma)
 
         if arbitrary_terms:
-            if not q_free.q3 and _arbitrary_phase_terms_are_unary(arbitrary_terms):
-                result = _sum_q3_free_with_unary_arbitrary_phases_scaled(
-                    q_free,
-                    arbitrary_terms,
-                )
-                elim_info = {
-                    'quad': 0,
-                    'constraint': 0,
-                    'branched': 0,
-                    'remaining': 0,
-                    'structural_obstruction': 0,
-                    'gauss_obstruction': _gauss_obstruction(q_free, 0),
-                    'cost_r': 0,
-                    'phase_states': 0,
-                    'phase_splits': 0,
-                    'phase3_backend': _q3_free_phase3_backend_name(q_free),
-                }
-            else:
-                branch_plan = _build_arbitrary_phase_branch_plan(arbitrary_terms)
-                _k = len(branch_plan.basis_masks)
-                if _k > _MAX_ARBITRARY_PHASE_BRANCH_DIMENSION:
-                    raise RuntimeError(
-                        f"Cannot compute amplitude: {_k} linearly-independent arbitrary-angle "
-                        f"phase terms require 2^{_k} branches after CZ entanglement. "
-                        "Load the circuit with rz_compile_mode='clifford_t' to synthesize "
-                        "arbitrary angles into Clifford+T gates before running the engine."
-                    )
-                branch_cache = _prepare_affine_constraint_cache(
-                    len(branch_plan.basis_masks),
-                    k,
-                    branch_plan.basis_masks,
-                )
-                result = _make_scaled_complex(0j)
-                quad_eliminated = 0
-                constraint_eliminated = 0
-                max_remaining = 0
-                max_structural = 0
-                max_gauss = 0
-                max_cost_r = 0
-                max_branched = 0
-                phase_states = 0
-                phase_splits = 0
-                phase3_backend: str | None = None
-                phase3_backend_cost_r = -1
-
-                for assignment_mask in range(1 << len(branch_plan.basis_masks)):
-                    branch_phase = 1.0 + 0.0j
-
-                    for dependency_mask, offset, angle in zip(
-                        branch_plan.term_dependency_masks,
-                        branch_plan.term_offsets,
-                        branch_plan.term_angles,
-                    ):
-                        if _parity(dependency_mask & assignment_mask) ^ offset:
-                            branch_phase *= cmath.exp(1j * angle)
-
-                    extra_shift_mask = _solve_echelon_rhs(branch_cache, assignment_mask)
-                    if extra_shift_mask is None:
-                        continue
-
-                    q_branch = _aff_compose_cached(
-                        q_free,
-                        extra_shift_mask,
-                        branch_cache.gamma_masks,
-                        branch_cache.n_free,
-                        context=context,
-                    )
-                    branch_result, branch_info = _reduce_and_sum_scaled(q_branch, context=context)
-                    result = _add_scaled_complex(
-                        result,
-                        _mul_scaled_complex(_make_scaled_complex(branch_phase), branch_result),
-                    )
-
-                    quad_eliminated += branch_info['quad']
-                    constraint_eliminated += branch_info['constraint']
-                    max_branched = max(max_branched, branch_info['branched'])
-                    max_remaining = max(max_remaining, branch_info['remaining'])
-                    max_structural = max(
-                        max_structural,
-                        branch_info.get('structural_obstruction', branch_info['remaining']),
-                    )
-                    max_gauss = max(
-                        max_gauss,
-                        branch_info.get(
-                            'gauss_obstruction',
-                            branch_info.get('structural_obstruction', branch_info['remaining']),
-                        ),
-                    )
-                    branch_cost_r = branch_info.get('cost_r', branch_info['remaining'])
-                    max_cost_r = max(max_cost_r, branch_cost_r)
-                    phase_states += branch_info.get('phase_states', 0)
-                    phase_splits += branch_info.get('phase_splits', 0)
-
-                    branch_phase3_backend = branch_info.get('phase3_backend')
-                    if branch_phase3_backend is not None:
-                        if branch_cost_r > phase3_backend_cost_r:
-                            phase3_backend = branch_phase3_backend
-                            phase3_backend_cost_r = branch_cost_r
-                        elif branch_cost_r == phase3_backend_cost_r and phase3_backend is None:
-                            phase3_backend = branch_phase3_backend
-
-                elim_info = {
-                    'quad': quad_eliminated,
-                    'constraint': constraint_eliminated,
-                    'branched': len(branch_plan.basis_masks) + max_branched,
-                    'remaining': max_remaining,
-                    'structural_obstruction': max_structural,
-                    'gauss_obstruction': max_gauss,
-                    'cost_r': max_cost_r,
-                    'phase_states': phase_states,
-                    'phase_splits': phase_splits,
-                    'phase3_backend': phase3_backend,
-                }
+            result, max_scope, arbitrary_backend, arbitrary_metadata = _sum_with_arbitrary_phases_scaled(
+                q_free,
+                arbitrary_terms,
+                allow_approximate=bool(_get_solver_config().allow_approximate),
+            )
+            structural_obstruction = (
+                0
+                if not q_free.q3
+                else _phase3_plan(q_free, allow_tensor_contraction=allow_tensor_contraction)[3]
+            )
+            elim_info = {
+                'quad': 0,
+                'constraint': 0,
+                'branched': 0,
+                'remaining': max_scope,
+                'structural_obstruction': structural_obstruction,
+                'gauss_obstruction': _gauss_obstruction(q_free, structural_obstruction),
+                'cost_r': max_scope,
+                'phase_states': 0,
+                'phase_splits': 0,
+                'phase3_backend': arbitrary_backend,
+            }
+            elim_info.update(arbitrary_metadata)
         else:
             result, elim_info = _reduce_and_sum_scaled(q_free, context=context)
 
@@ -2111,8 +3246,7 @@ class SchurState:
             complex(self.scalar) * arbitrary_scalar * result[0],
             result[1] + self.scalar_half_pow2,
         )
-        amp = ScaledAmplitude.from_tuple(scaled_amp) if preserve_scale else _scaled_to_complex(scaled_amp)
-        return amp, _info(
+        info = _info(
             k,
             elim_info['quad'],
             elim_info['constraint'],
@@ -2129,6 +3263,24 @@ class SchurState:
             cost_model_r=elim_info.get('cost_r', elim_info['remaining']),
             phase3_backend=elim_info.get('phase3_backend'),
         )
+        for key in (
+            "bp_heuristic_ensemble_size",
+            "bp_heuristic_log2_abs_spread",
+            "bp_heuristic_phase_spread",
+            "bp_heuristic_max_log2_probability",
+        ):
+            if key in elim_info:
+                info[key] = elim_info[key]  # type: ignore[typeddict-unknown-key]
+        if _arbitrary_bp_backend(info.get("phase3_backend")):
+            log2_probability = _scaled_probability_log2(scaled_amp)
+            info["bp_log2_probability"] = log2_probability  # type: ignore[typeddict-unknown-key]
+            if log2_probability > _ARBITRARY_BP_DIRECT_PROB_LOG2_TOL:
+                if allow_unbounded_bp_result:
+                    _mark_invalid_arbitrary_bp_info(info, scaled_amp)
+                else:
+                    _raise_if_invalid_arbitrary_bp_amplitude(info, scaled_amp)
+        amp = ScaledAmplitude.from_tuple(scaled_amp) if preserve_scale else _scaled_to_complex(scaled_amp)
+        return amp, info
 
     @overload
     def amplitude(
@@ -2851,6 +4003,8 @@ def _invert_native_gate(gate: Gate) -> Gate:
         return ("rz_arbitrary", int(gate[1]), -float(gate[2]))
     if name == "rzz_dyadic":
         return ("rzz_dyadic", int(gate[1]), int(gate[2]), -int(gate[3]), int(gate[4]))
+    if name == "pauli_expbox":
+        return ("pauli_expbox", tuple(gate[1]), tuple(int(qubit) for qubit in gate[2]), -float(gate[3]))
     if name == "rz_pi_16":
         return ("rz_pi_16_dg", int(gate[1]))
     if name == "rz_pi_16_dg":
@@ -2882,6 +4036,7 @@ def _fork_state_for_extension(state: SchurState) -> SchurState:
     clone.output_refcount = list(state.output_refcount)
     clone._arbitrary_phases = list(state._arbitrary_phases)
     clone._pending_dead = set(state._pending_dead)
+    clone._defer_early_elim = bool(state._defer_early_elim)
     clone._cached_classification_data = state._cached_classification_data
     clone._cached_classification_q = state._cached_classification_q
     return clone
@@ -4241,6 +5396,11 @@ def _factor_scope_order(
         q2=dummy_q2,
         q3={},
     )
+    if n_vars >= _Q2_SEPARATOR_ORDER_MIN_VARS and dummy_q2:
+        separator_order = _pair_graph_separator_order(dummy_q)
+        if separator_order is not None:
+            order, width = separator_order
+            return list(order), int(width)
     order, width = _min_fill_cubic_order(dummy_q)
     separator_order = _pair_graph_separator_order(dummy_q)
     if separator_order is not None:
@@ -4248,6 +5408,205 @@ def _factor_scope_order(
         if candidate_width < width:
             order, width = candidate_order, candidate_width
     return list(order), int(width)
+
+
+def _estimate_factor_table_dp_cost(
+    n_vars: int,
+    factor_scopes: Sequence[Sequence[int]],
+    order: Sequence[int],
+) -> tuple[int, int]:
+    """Estimate generic factor bucket-elimination work and largest new table."""
+    factors = {tuple(sorted({int(var) for var in scope})) for scope in factor_scopes if scope}
+    work = 0
+    max_table_entries = 1
+
+    for var in order:
+        bucket_scopes = [scope for scope in factors if var in scope]
+        if not bucket_scopes:
+            work += 1
+            continue
+
+        for scope in bucket_scopes:
+            factors.remove(scope)
+        union_scope = tuple(sorted({vertex for scope in bucket_scopes for vertex in scope}))
+        new_scope = tuple(vertex for vertex in union_scope if vertex != var)
+        table_entries = 1 << len(new_scope)
+        max_table_entries = max(max_table_entries, table_entries)
+        work += max(1, len(bucket_scopes)) * (1 << len(union_scope))
+        if new_scope:
+            factors.add(new_scope)
+
+    return int(work), int(max_table_entries)
+
+
+def _factor_order_scope_sets(
+    n_vars: int,
+    factor_scopes: Sequence[Sequence[int]],
+    order: Sequence[int],
+) -> list[tuple[int, ...]]:
+    factors = {tuple(sorted({int(var) for var in scope})) for scope in factor_scopes if scope}
+    scopes: list[tuple[int, ...]] = []
+
+    for var in order:
+        bucket_scopes = [scope for scope in factors if var in scope]
+        if not bucket_scopes:
+            scopes.append((int(var),))
+            continue
+
+        for scope in bucket_scopes:
+            factors.remove(scope)
+        union_scope = tuple(sorted({vertex for scope in bucket_scopes for vertex in scope}))
+        scopes.append(union_scope)
+        new_scope = tuple(vertex for vertex in union_scope if vertex != var)
+        if new_scope:
+            factors.add(new_scope)
+
+    return scopes
+
+
+def _factor_cutset_residual_scopes(
+    n_vars: int,
+    factor_scopes: Sequence[Sequence[int]],
+    cutset: Sequence[int],
+) -> tuple[int, tuple[int, ...], tuple[tuple[int, ...], ...]]:
+    cutset_set = set(int(var) for var in cutset)
+    remaining_original = tuple(var for var in range(n_vars) if var not in cutset_set)
+    remap = {var: idx for idx, var in enumerate(remaining_original)}
+    residual_scopes = []
+    for scope in factor_scopes:
+        residual_scope = tuple(remap[int(var)] for var in scope if int(var) in remap)
+        if residual_scope:
+            residual_scopes.append(residual_scope)
+    return len(remaining_original), remaining_original, tuple(residual_scopes)
+
+
+def _factor_cutset_candidates(
+    n_vars: int,
+    factor_scopes: Sequence[Sequence[int]],
+    residual_order: Sequence[int],
+    remaining_original: Sequence[int],
+) -> tuple[int, ...]:
+    del n_vars
+    scopes = _factor_order_scope_sets(len(remaining_original), factor_scopes, residual_order)
+    hotspot_scopes = sorted(scopes, key=lambda scope: (len(scope), -sum(scope)), reverse=True)[
+        :_MAX_ARBITRARY_PATH_SUM_CUTSET_CANDIDATES
+    ]
+    counts: dict[int, int] = {}
+    degrees: dict[int, int] = {}
+    for scope in factor_scopes:
+        unique_scope = tuple(sorted({int(var) for var in scope}))
+        for residual_var in unique_scope:
+            original_var = int(remaining_original[residual_var])
+            degrees[original_var] = degrees.get(original_var, 0) + max(0, len(unique_scope) - 1)
+    for scope in hotspot_scopes:
+        if len(scope) <= 1:
+            continue
+        for residual_var in scope:
+            original_var = int(remaining_original[residual_var])
+            counts[original_var] = counts.get(original_var, 0) + 1
+    if not counts:
+        return ()
+    ranked = sorted(
+        counts,
+        key=lambda var: (counts[var], degrees.get(var, 0), -var),
+        reverse=True,
+    )
+    return tuple(ranked[:_MAX_ARBITRARY_PATH_SUM_CUTSET_CANDIDATES])
+
+
+def _find_arbitrary_factor_cutset_plan(
+    n_vars: int,
+    factor_scopes: Sequence[Sequence[int]],
+    *,
+    width_limit: int,
+) -> _ArbitraryFactorCutsetPlan | None:
+    selected: list[int] = []
+    best_plan: _ArbitraryFactorCutsetPlan | None = None
+
+    for _ in range(_MAX_ARBITRARY_PATH_SUM_CUTSET_SIZE + 1):
+        residual_n, remaining_original, residual_scopes = _factor_cutset_residual_scopes(
+            n_vars,
+            factor_scopes,
+            selected,
+        )
+        residual_order, residual_width = _factor_scope_order(residual_n, residual_scopes)
+        residual_work, residual_table_entries = _estimate_factor_table_dp_cost(
+            residual_n,
+            residual_scopes,
+            residual_order,
+        )
+        total_work = (1 << len(selected)) * max(1, int(residual_work))
+        if (
+            selected
+            and residual_width <= width_limit
+            and total_work <= _MAX_ARBITRARY_PATH_SUM_WORK
+            and residual_table_entries <= _MAX_ARBITRARY_PATH_SUM_TABLE_ENTRIES
+        ):
+            return _ArbitraryFactorCutsetPlan(
+                cutset=tuple(selected),
+                residual_order=tuple(residual_order),
+                residual_width=int(residual_width),
+                residual_work=int(residual_work),
+                residual_table_entries=int(residual_table_entries),
+            )
+
+        candidate_plan = _ArbitraryFactorCutsetPlan(
+            cutset=tuple(selected),
+            residual_order=tuple(residual_order),
+            residual_width=int(residual_width),
+            residual_work=int(residual_work),
+            residual_table_entries=int(residual_table_entries),
+        )
+        if best_plan is None or (
+            candidate_plan.residual_width,
+            (1 << len(candidate_plan.cutset)) * max(1, candidate_plan.residual_work),
+        ) < (
+            best_plan.residual_width,
+            (1 << len(best_plan.cutset)) * max(1, best_plan.residual_work),
+        ):
+            best_plan = candidate_plan
+
+        if len(selected) >= _MAX_ARBITRARY_PATH_SUM_CUTSET_SIZE:
+            break
+
+        candidates = _factor_cutset_candidates(
+            n_vars,
+            residual_scopes,
+            residual_order,
+            remaining_original,
+        )
+        best_candidate = None
+        best_score = None
+        for candidate in candidates:
+            if candidate in selected:
+                continue
+            trial_cutset = selected + [candidate]
+            trial_n, _trial_remaining, trial_scopes = _factor_cutset_residual_scopes(
+                n_vars,
+                factor_scopes,
+                trial_cutset,
+            )
+            trial_order, trial_width = _factor_scope_order(trial_n, trial_scopes)
+            trial_work, trial_table_entries = _estimate_factor_table_dp_cost(
+                trial_n,
+                trial_scopes,
+                trial_order,
+            )
+            trial_total_work = (1 << len(trial_cutset)) * max(1, int(trial_work))
+            score = (
+                int(trial_width),
+                int(trial_total_work),
+                int(trial_table_entries),
+                int(candidate),
+            )
+            if best_score is None or score < best_score:
+                best_candidate = int(candidate)
+                best_score = score
+        if best_candidate is None:
+            break
+        selected.append(best_candidate)
+
+    return None
 
 
 def _factor_scope_degeneracy(n_vars: int, factor_scopes: Sequence[Sequence[int]]) -> int:
@@ -5785,6 +7144,7 @@ _STRUCTURE_Q3_FREE_BLOCK_CUT_PLAN_CACHE = _BoundedMemoCache(_STRUCTURE_PHASE3_CA
 _STRUCTURE_Q3_FREE_REFINED_ORDER_CACHE = _BoundedMemoCache(_STRUCTURE_PHASE3_CACHE_MAX)
 _STRUCTURE_PHASE3_REFINED_ORDER_CACHE = _BoundedMemoCache(_STRUCTURE_PHASE3_CACHE_MAX)
 _STRUCTURE_INTERACTION_GRAPH_CACHE = _BoundedMemoCache(_STRUCTURE_PHASE3_CACHE_MAX)
+_STRUCTURE_PHASE3_TREEWIDTH_CUTSET_CACHE = _BoundedMemoCache(_STRUCTURE_PHASE3_CACHE_MAX)
 
 
 def _build_early_elim_batch_size(level: int) -> int:
@@ -10927,6 +12287,7 @@ def _sum_factor_tables_scaled(
     order: Sequence[int],
     *,
     scalar: ScaledComplex = _ONE_SCALED,
+    require_native: bool = False,
 ):
     """Exact scaled bucket elimination over generic binary factor tables."""
     if _schur_native is not None:
@@ -10938,8 +12299,11 @@ def _sum_factor_tables_scaled(
                 scalar,
             )
             return (complex(value), int(half_pow2_exp)), int(max_scope)
-        except Exception:
-            pass
+        except Exception as exc:
+            if require_native:
+                raise RuntimeError("Native factor-table path-sum backend failed.") from exc
+    elif require_native:
+        raise RuntimeError("Native factor-table path-sum backend is unavailable.")
 
     factors = dict(factors)
     scalar = scalar
@@ -13054,6 +14418,28 @@ def _treewidth_order_scope_trace(q, order):
     return scopes
 
 
+def _treewidth_order_scope_sets(q, order):
+    """Return bucket scopes induced by ``order`` on ``q``."""
+    factors = _build_factor_scopes(q)
+    scopes: list[tuple[int, ...]] = []
+
+    for var in order:
+        bucket_scopes = [scope for scope in factors if var in scope]
+        if not bucket_scopes:
+            scopes.append((var,))
+            continue
+
+        for scope in bucket_scopes:
+            factors.remove(scope)
+        union_scope = tuple(sorted({vertex for scope in bucket_scopes for vertex in scope}))
+        scopes.append(union_scope)
+        new_scope = tuple(vertex for vertex in union_scope if vertex != var)
+        if new_scope:
+            factors.add(new_scope)
+
+    return scopes
+
+
 def _q3_free_treewidth_width_limit() -> int:
     """Return the q3-free treewidth width limit for the current exact backend."""
     if _schur_native is not None:
@@ -13941,6 +15327,189 @@ def _estimate_q3_separator_work(q, separator: Sequence[int]) -> int:
     return (1 << len(separator)) * max(1, branch_cost)
 
 
+def _phase3_treewidth_cutset_width_limit(fully_peeled: bool) -> int:
+    return (
+        _Q3_TREEWIDTH_DP_PEELED_MAX_WIDTH
+        if fully_peeled
+        else _Q3_TREEWIDTH_DP_MAX_WIDTH
+    )
+
+
+def _phase3_residual_after_cutset(q, cutset: Sequence[int]):
+    if not cutset:
+        return q, tuple(range(q.n))
+    cutset_set = set(int(var) for var in cutset)
+    remaining_original = tuple(var for var in range(q.n) if var not in cutset_set)
+    residual_q = _fix_variables(q, tuple(sorted(cutset_set)), [1] * len(cutset_set))
+    return residual_q, remaining_original
+
+
+def _phase3_cutset_worst_residual(q, cutset: Sequence[int]) -> tuple[list[int], int, int]:
+    """Return the worst residual treewidth/work over every cutset assignment."""
+    cutset = tuple(int(var) for var in cutset)
+    if not cutset:
+        order, width = _min_fill_cubic_order(q)
+        if q.q3:
+            order, width = _finalize_phase3_treewidth_order(q, order)
+        return list(order), int(width), max(1, int(_estimate_treewidth_dp_work(q, order)))
+
+    worst_order: list[int] = []
+    worst_width = -1
+    worst_work = -1
+    for mask in range(1 << len(cutset)):
+        fixed_values = [(mask >> idx) & 1 for idx in range(len(cutset))]
+        residual_q = _fix_variables(q, cutset, fixed_values)
+        residual_order, residual_width = _min_fill_cubic_order(residual_q)
+        if residual_q.q3:
+            residual_order, residual_width = _finalize_phase3_treewidth_order(
+                residual_q,
+                residual_order,
+            )
+        residual_work = max(1, int(_estimate_treewidth_dp_work(residual_q, residual_order)))
+        if (int(residual_width), int(residual_work)) > (worst_width, worst_work):
+            worst_order = list(residual_order)
+            worst_width = int(residual_width)
+            worst_work = int(residual_work)
+
+    return worst_order, worst_width, worst_work
+
+
+def _phase3_treewidth_cutset_candidates(q, residual_q, residual_order, remaining_original):
+    scopes = _treewidth_order_scope_sets(residual_q, residual_order)
+    hotspot_scopes = sorted(scopes, key=lambda scope: (len(scope), -sum(scope)), reverse=True)[
+        :_Q3_TREEWIDTH_CUTSET_MAX_CANDIDATES
+    ]
+    counts: dict[int, int] = {}
+    for scope in hotspot_scopes:
+        if len(scope) <= 1:
+            continue
+        for residual_var in scope:
+            original_var = remaining_original[residual_var]
+            counts[original_var] = counts.get(original_var, 0) + 1
+    if not counts:
+        return ()
+
+    adjacency = _interaction_graph(q)
+    ranked = sorted(
+        counts,
+        key=lambda var: (counts[var], len(adjacency[var]), -var),
+        reverse=True,
+    )
+    return tuple(ranked[:_Q3_TREEWIDTH_CUTSET_MAX_CANDIDATES])
+
+
+def _find_q3_treewidth_cutset(
+    q,
+    *,
+    order: Sequence[int],
+    width: int,
+    fully_peeled: bool,
+) -> tuple[tuple[int, ...], list[int], int, int] | None:
+    """Greedily find variables whose conditioning lowers Phase-3 DP width."""
+    cache_key = (
+        _q_phase3_structure_key(q),
+        tuple(int(var) for var in order),
+        int(width),
+        bool(fully_peeled),
+    )
+    cached = _STRUCTURE_PHASE3_TREEWIDTH_CUTSET_CACHE.get(cache_key)
+    if cached is not None:
+        if cached == ():
+            return None
+        cutset, residual_order, residual_width, residual_work = cached
+        return tuple(cutset), list(residual_order), int(residual_width), int(residual_work)
+
+    def cache_result(result):
+        if result is None:
+            _STRUCTURE_PHASE3_TREEWIDTH_CUTSET_CACHE[cache_key] = ()
+            return None
+        cutset, residual_order, residual_width, residual_work = result
+        cached_result = (
+            tuple(int(var) for var in cutset),
+            tuple(int(var) for var in residual_order),
+            int(residual_width),
+            int(residual_work),
+        )
+        _STRUCTURE_PHASE3_TREEWIDTH_CUTSET_CACHE[cache_key] = cached_result
+        return cached_result[0], list(cached_result[1]), cached_result[2], cached_result[3]
+
+    if not q.q3:
+        return cache_result(None)
+    width_limit = _phase3_treewidth_cutset_width_limit(fully_peeled)
+    if width <= width_limit:
+        return cache_result(None)
+
+    selected: list[int] = []
+    best_residual_order = list(order)
+    best_residual_width = int(width)
+    best_residual_work = max(1, int(_estimate_treewidth_dp_work(q, order)))
+
+    for _ in range(_Q3_TREEWIDTH_CUTSET_MAX_SIZE):
+        residual_q, remaining_original = _phase3_residual_after_cutset(q, selected)
+        if not residual_q.q3:
+            residual_order, residual_width = _min_fill_cubic_order(residual_q)
+        else:
+            residual_order, residual_width = _min_fill_cubic_order(residual_q)
+            residual_order, residual_width = _finalize_phase3_treewidth_order(
+                residual_q,
+                residual_order,
+            )
+        residual_work = max(1, int(_estimate_treewidth_dp_work(residual_q, residual_order)))
+        if residual_width < best_residual_width or (
+            residual_width == best_residual_width and residual_work < best_residual_work
+        ):
+            best_residual_order = list(residual_order)
+            best_residual_width = int(residual_width)
+            best_residual_work = int(residual_work)
+        if residual_width <= width_limit and selected:
+            worst_order, worst_width, worst_work = _phase3_cutset_worst_residual(q, selected)
+            if worst_width <= width_limit:
+                return cache_result(
+                    (tuple(selected), list(worst_order), int(worst_width), int(worst_work))
+                )
+
+        candidates = _phase3_treewidth_cutset_candidates(
+            q,
+            residual_q,
+            residual_order,
+            remaining_original,
+        )
+        if not candidates:
+            break
+
+        best_candidate = None
+        best_candidate_score = None
+        for candidate in candidates:
+            if candidate in selected:
+                continue
+            trial_cutset = selected + [candidate]
+            trial_q, _trial_remaining = _phase3_residual_after_cutset(q, trial_cutset)
+            trial_order, trial_width = _min_fill_cubic_order(trial_q)
+            if trial_q.q3:
+                trial_order, trial_width = _finalize_phase3_treewidth_order(trial_q, trial_order)
+            trial_work = max(1, int(_estimate_treewidth_dp_work(trial_q, trial_order)))
+            score = (int(trial_width), int(trial_work), candidate)
+            if best_candidate_score is None or score < best_candidate_score:
+                best_candidate = candidate
+                best_candidate_score = score
+        if best_candidate is None:
+            break
+        selected.append(best_candidate)
+
+    if selected and best_residual_width <= width_limit:
+        worst_order, worst_width, worst_work = _phase3_cutset_worst_residual(q, selected)
+        if worst_width <= width_limit:
+            return cache_result((tuple(selected), worst_order, worst_width, worst_work))
+    return cache_result(None)
+
+
+def _estimate_q3_treewidth_cutset_work(q, cutset_plan) -> int:
+    if cutset_plan is None:
+        return 1 << 62
+    cutset, _residual_order, _residual_width, residual_work = cutset_plan
+    return (1 << len(cutset)) * max(1, int(residual_work))
+
+
 def _prefer_treewidth_phase3(
     q,
     cover,
@@ -14092,6 +15661,17 @@ def _phase3_backend_runtime_score(
         separator_size = len(tuple(separator or ()))
         work = max(1, int(_estimate_q3_separator_work(q, tuple(separator or ()))))
         return (3, work, separator_size, len(cover), int(structural_obstruction))
+    if backend == "q3_treewidth_cutset":
+        cutset_plan = _find_q3_treewidth_cutset(
+            q,
+            order=order,
+            width=width,
+            fully_peeled=fully_peeled,
+        )
+        cutset_size = len(cutset_plan[0]) if cutset_plan is not None else len(cover)
+        residual_width = cutset_plan[2] if cutset_plan is not None else int(width)
+        work = max(1, int(_estimate_q3_treewidth_cutset_work(q, cutset_plan)))
+        return (3, work, cutset_size + residual_width, len(cover), int(structural_obstruction))
     if backend == "q3_cover":
         work = max(1, int(_estimate_q3_cover_work(q, len(cover))))
         return (3, work, len(cover), len(cover), int(structural_obstruction))
@@ -14185,6 +15765,27 @@ def _choose_phase3_backend(
             ),
             "q3_separator",
             tuple(separator),
+        ))
+
+    cutset_plan = _find_q3_treewidth_cutset(
+        q,
+        order=order,
+        width=width,
+        fully_peeled=fully_peeled,
+    )
+    if cutset_plan is not None and len(cutset_plan[0]) < len(cover):
+        candidates.append((
+            _phase3_backend_runtime_score(
+                q,
+                cover,
+                order,
+                width,
+                structural_obstruction,
+                "q3_treewidth_cutset",
+                fully_peeled=fully_peeled,
+            ),
+            "q3_treewidth_cutset",
+            None,
         ))
 
     candidates.append((
@@ -15220,6 +16821,68 @@ def _sum_via_q3_separator(q, separator, context=None, *, structural_obstruction=
     }
 
 
+def _sum_via_q3_treewidth_cutset(q, cutset, context=None, *, structural_obstruction=None):
+    """Branch on a cutset so each residual avoids high-width Phase-3 DP."""
+    total = _make_scaled_complex(0j)
+    total_quad = total_constraint = 0
+    max_branched = 0
+    max_remaining = 0
+    max_structural = 0
+    max_gauss = 0
+    max_cost_r = 0
+    phase_states = phase_splits = 0
+    phase3_backend = None
+    phase3_backend_cost_r = -1
+
+    cutset = tuple(int(var) for var in cutset)
+    for mask in range(1 << len(cutset)):
+        fixed_values = [(mask >> idx) & 1 for idx in range(len(cutset))]
+        branch_q = _fix_variables(q, cutset, fixed_values, context=context)
+        branch_total, branch_info = _reduce_and_sum_scaled(branch_q, context=context)
+
+        total = _add_scaled_complex(total, branch_total)
+        total_quad += branch_info['quad']
+        total_constraint += branch_info['constraint']
+        max_branched = max(max_branched, branch_info['branched'])
+        max_remaining = max(max_remaining, branch_info['remaining'])
+        max_structural = max(
+            max_structural,
+            branch_info.get('structural_obstruction', branch_info['remaining']),
+        )
+        max_gauss = max(
+            max_gauss,
+            branch_info.get(
+                'gauss_obstruction',
+                branch_info.get('structural_obstruction', branch_info['remaining']),
+            ),
+        )
+        branch_cost_r = len(cutset) + branch_info.get('cost_r', branch_info['remaining'])
+        max_cost_r = max(max_cost_r, branch_cost_r)
+        phase_states += branch_info.get('phase_states', 0)
+        phase_splits += branch_info.get('phase_splits', 0)
+        branch_backend = branch_info.get('phase3_backend')
+        if branch_backend is not None:
+            if branch_cost_r > phase3_backend_cost_r:
+                phase3_backend = branch_backend
+                phase3_backend_cost_r = branch_cost_r
+            elif branch_cost_r == phase3_backend_cost_r and branch_backend != phase3_backend:
+                phase3_backend = "mixed"
+
+    cubic_obstruction = len(cutset) if structural_obstruction is None else structural_obstruction
+    return total, {
+        'quad': total_quad,
+        'constraint': total_constraint,
+        'branched': len(cutset) + max_branched,
+        'remaining': max(max_remaining, max_cost_r),
+        'structural_obstruction': max(cubic_obstruction, max_structural),
+        'gauss_obstruction': max(_gauss_obstruction(q, cubic_obstruction), max_gauss),
+        'cost_r': max_cost_r,
+        'phase_states': phase_states,
+        'phase_splits': phase_splits,
+        'phase3_backend': 'q3_treewidth_cutset' if phase3_backend is not None else 'q3_treewidth_cutset',
+    }
+
+
 @dataclass(frozen=True, slots=True)
 class Q3FreeBranchTemplate:
     """Shared residue updates for exact q3-cover branch batching."""
@@ -15721,6 +17384,23 @@ def _sum_irreducible_cubic_core(
                 structural_obstruction=structural_obstruction,
             )
         return _sum_via_q3_cover(q, context=context, structural_obstruction=structural_obstruction)
+    if backend == "q3_treewidth_cutset":
+        core_vars, peel_order = _q3_hypergraph_2core(q)
+        fully_peeled = bool(peel_order) and not core_vars
+        cutset_plan = _find_q3_treewidth_cutset(
+            q,
+            order=order,
+            width=width,
+            fully_peeled=fully_peeled,
+        )
+        if cutset_plan is not None and len(cutset_plan[0]) < len(cover):
+            return _sum_via_q3_treewidth_cutset(
+                q,
+                cutset_plan[0],
+                context=context,
+                structural_obstruction=structural_obstruction,
+            )
+        return _sum_via_q3_cover(q, context=context, structural_obstruction=structural_obstruction)
     if backend is not None:
         raise ValueError(f"Unknown Phase-3 backend {backend!r}.")
 
@@ -15751,6 +17431,21 @@ def _sum_irreducible_cubic_core(
             context=context,
             structural_obstruction=structural_obstruction,
         )
+
+    if selected_backend == "q3_treewidth_cutset":
+        cutset_plan = _find_q3_treewidth_cutset(
+            q,
+            order=order,
+            width=width,
+            fully_peeled=fully_peeled,
+        )
+        if cutset_plan is not None:
+            return _sum_via_q3_treewidth_cutset(
+                q,
+                cutset_plan[0],
+                context=context,
+                structural_obstruction=structural_obstruction,
+            )
 
     if selected_backend == "q3_cover":
         return _sum_via_q3_cover(q, context=context, structural_obstruction=structural_obstruction)
@@ -16064,6 +17759,116 @@ def _incident_quadratic_couplings(q, k: int):
                 yield left, residue
 
 
+def _elim_sparse_dead_quadratics_batch(q, candidates, *, classification_data=None):
+    """Batch-eliminate sparse dead quadratic pivots with one q2 compaction.
+
+    This targets build-time PauliExpBox states where thousands of pending dead
+    variables are degree-2 quadratic pivots. The old path rebuilt and remapped
+    q2 once per pivot; this mutates an adjacency map in old coordinates and
+    compacts only once.
+    """
+    if int(q.level) != 3 or q.q3:
+        return q, 0, ()
+    if classification_data is None:
+        classification_data = _build_classification_data(q)
+    _cubic_incidence, odd_bilinear, _parity_partners = classification_data
+
+    candidate_set = {int(var) for var in candidates if 0 <= int(var) < q.n}
+    adjacency: dict[int, dict[int, int]] = {var: {} for var in range(q.n)}
+    for (left, right), coeff in q.q2.items():
+        residue = int(coeff) % q.mod_q2
+        if not residue:
+            continue
+        adjacency[left][right] = residue
+        adjacency[right][left] = residue
+
+    q1 = list(q.q1)
+    q0 = q.q0
+    removed: list[int] = []
+    removed_set: set[int] = set()
+    threshold = _quadratic_residue_threshold(q)
+
+    def remove_edge(left: int, right: int) -> None:
+        adjacency[left].pop(right, None)
+        adjacency[right].pop(left, None)
+
+    def add_edge(left: int, right: int, value: int) -> None:
+        if left == right:
+            return
+        if left > right:
+            left, right = right, left
+        value %= q.mod_q2
+        if value:
+            adjacency[left][right] = value
+            adjacency[right][left] = value
+        else:
+            remove_edge(left, right)
+
+    for var in sorted(candidate_set):
+        if var in removed_set or odd_bilinear[var]:
+            continue
+        coupled = [(neighbor, coeff) for neighbor, coeff in adjacency[var].items() if neighbor not in removed_set]
+        if len(coupled) > 2:
+            continue
+        c = (q1[var] // threshold) % 4
+        const_phase = Fraction(1, 8) if c % 4 == 1 else Fraction(7, 8)
+        sign = -1 if c % 4 == 1 else +1
+        q0 = (q0 + const_phase) % 1
+        for neighbor, coupling in coupled:
+            q1[neighbor] = (q1[neighbor] + sign * coupling) % q.mod_q1
+        for left_pos in range(len(coupled)):
+            left_var, left_coeff = coupled[left_pos]
+            for right_pos in range(left_pos + 1, len(coupled)):
+                right_var, right_coeff = coupled[right_pos]
+                correction = _quadratic_pair_correction(q, left_coeff, right_coeff)
+                if correction:
+                    left = min(left_var, right_var)
+                    right = max(left_var, right_var)
+                    add_edge(left, right, adjacency[left].get(right, 0) + correction)
+        for neighbor, _coupling in coupled:
+            remove_edge(var, neighbor)
+        removed.append(var)
+        removed_set.add(var)
+
+    if not removed:
+        return q, 0, ()
+
+    remap: dict[int, int] = {}
+    new_q1: list[int] = []
+    for idx, coeff in enumerate(q1):
+        if idx in removed_set:
+            continue
+        remap[idx] = len(new_q1)
+        new_q1.append(coeff)
+
+    new_q2: dict[tuple[int, int], int] = {}
+    for left, neighbors in adjacency.items():
+        if left in removed_set:
+            continue
+        new_left = remap[left]
+        for right, coeff in neighbors.items():
+            if right in removed_set or left >= right:
+                continue
+            new_right = remap[right]
+            edge = (new_left, new_right) if new_left < new_right else (new_right, new_left)
+            residue = int(coeff) % q.mod_q2
+            if residue:
+                new_q2[edge] = residue
+
+    return (
+        _phase_function_from_parts_mutable(
+            len(new_q1),
+            level=q.level,
+            q0=q0,
+            q1=new_q1,
+            q2=new_q2,
+            q3={},
+        ),
+        len(removed),
+        tuple(removed),
+    )
+
+
 def _elim_quadratic(q, k, *, classification_data=None):
     """Gaussian sum over variable k at the current dyadic precision level."""
     nf = q.n
@@ -16081,31 +17886,34 @@ def _elim_quadratic(q, k, *, classification_data=None):
     else:
         coupled = list(_incident_quadratic_couplings(q, k))
 
-    remap = [-1] * nf
-    new_q1 = []
-    next_idx = 0
-    for var, coeff in enumerate(q.q1):
-        if var == k:
-            continue
-        remap[var] = next_idx
-        new_q1.append(coeff)
-        next_idx += 1
+    def remap_var(var: int) -> int:
+        return int(var) - (1 if int(var) > k else 0)
 
     nn = nf - 1
-    new_q2 = {(remap[i], remap[j]): value for (i, j), value in q.q2.items() if k not in (i, j)}
-    new_q3 = {
-        (remap[i], remap[j], remap[l]): value
-        for (i, j, l), value in q.q3.items()
-        if k not in (i, j, l)
+    new_q1 = list(q.q1[:k])
+    new_q1.extend(q.q1[k + 1 :])
+    new_q2 = {
+        (remap_var(i), remap_var(j)): value
+        for (i, j), value in q.q2.items()
+        if i != k and j != k
     }
+    if q.q3:
+        new_q3 = {
+            (remap_var(i), remap_var(j), remap_var(l)): value
+            for (i, j, l), value in q.q3.items()
+            if i != k and j != k and l != k
+        }
+    else:
+        new_q3 = {}
     for var, coupling in coupled:                              # linear corr
-        new_q1[remap[var]] = (new_q1[remap[var]] + sign * coupling) % q.mod_q1
+        mapped_var = remap_var(var)
+        new_q1[mapped_var] = (new_q1[mapped_var] + sign * coupling) % q.mod_q1
     for left_pos in range(len(coupled)):                       # [BL26 Eq.194]
         left_var, left_coeff = coupled[left_pos]
         for right_pos in range(left_pos + 1, len(coupled)):
             right_var, right_coeff = coupled[right_pos]
-            new_left = remap[left_var]
-            new_right = remap[right_var]
+            new_left = remap_var(left_var)
+            new_right = remap_var(right_var)
             if new_left > new_right:
                 new_left, new_right = new_right, new_left
             corr = _quadratic_pair_correction(q, left_coeff, right_coeff)
@@ -16783,7 +18591,13 @@ def build_state(
         gate_sequence = _rewrite_gate_sequence(gates)
     else:
         gate_sequence = tuple(gates)
-    _apply_gate_sequence_to_state(state, gate_sequence)
+    defer_early_elim = any(str(gate[0]) == "pauli_expbox" for gate in gate_sequence)
+    if defer_early_elim:
+        state._defer_early_elim = True
+    try:
+        _apply_gate_sequence_to_state(state, gate_sequence)
+    finally:
+        state._defer_early_elim = False
     state._flush_pending_dead_variables()
     return state
 
@@ -16943,6 +18757,9 @@ def _apply_gate_sequence_to_state(
     if len(gates) < _SUBCIRCUIT_MACRO_MIN_TOTAL_GATES:
         _apply_gate_sequence_to_state_linear(state, gates)
         return
+    if any(str(gate[0]) == "pauli_expbox" for gate in gates):
+        _apply_gate_sequence_to_state_linear(state, gates)
+        return
 
     gate_sequence = gates if isinstance(gates, tuple) else tuple(gates)
     cached_plan = _SUBCIRCUIT_MACRO_PLAN_CACHE.get(gate_sequence)
@@ -16987,14 +18804,15 @@ def _batch_query_state(
         for output_bits in output_list:
             amplitude, info = state._amplitude_internal(
                 output_bits,
-                preserve_scale=preserve_scale,
+                preserve_scale=True if analyze_only else preserve_scale,
                 allow_tensor_contraction=allow_tensor_contraction,
                 extended_reductions=extended_reductions,
+                allow_unbounded_bp_result=analyze_only,
             )
             results.append(info if analyze_only else (amplitude, info))
         return results
 
-    if not state.q.q3 and state.m:
+    if len(output_list) > 1 and not state.q.q3 and state.m:
         for output_bits in output_list:
             if len(output_bits) != state.n:
                 raise ValueError(f"Expected {state.n} output bits, received {len(output_bits)}.")
@@ -17183,9 +19001,8 @@ def compute_circuit_amplitude(
     By default this returns ``ScaledAmplitude`` so tiny nonzero amplitudes do
     not collapse to ``0j``. Pass ``as_complex=True`` to request the legacy
     complex-valued return. Set ``allow_tensor_contraction=False`` to disable
-    tensor-guided q3-free planning hints. Phase 3 currently stays on the
-    in-tree exact backends either way. Pass a ``SolverConfig`` to tune cutset
-    and tensor-hint preferences.
+    tensor-guided q3-free planning hints. Approximate arbitrary-angle BP/MPS
+    fallback is disabled unless ``SolverConfig.allow_approximate`` is true.
     """
     from .circuits import _circuit_global_phase_radians, normalize_circuit
 
@@ -17272,6 +19089,692 @@ def compute_amplitudes(
             _SOLVER_CONFIG_VAR.reset(_token)
 
 
+_NATIVE_MPS_APPROX_DEFAULT_BOND = 1
+_PAULI_BEAM_APPROX_DEFAULT_TERMS = 16
+_PAULI_BEAM_APPROX_LARGE_TERMS = 4096
+
+
+def _pauli_expbox_dyadic_snap_level() -> int | None:
+    raw = os.environ.get("TERKET_PAULI_EXPBOX_DYADIC_LEVEL")
+    if raw is None or raw == "":
+        return None
+    try:
+        level = int(raw)
+    except ValueError:
+        return None
+    return max(1, level)
+
+
+def _native_mps_approx_bond() -> int:
+    raw = os.environ.get("TERKET_APPROX_MPS_BOND")
+    if raw is None:
+        return _NATIVE_MPS_APPROX_DEFAULT_BOND
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        return _NATIVE_MPS_APPROX_DEFAULT_BOND
+
+
+def _approx_pauli_expectation_info(
+    spec: CircuitSpec,
+    backend: str,
+) -> ReductionInfo:
+    info = _info(
+        spec.n_qubits,
+        0,
+        0,
+        0,
+        _native_mps_approx_bond(),
+        structural_obstruction=spec.n_qubits,
+        gauss_obstruction=spec.n_qubits,
+        cost_model_r=_native_mps_approx_bond(),
+        phase3_backend=backend,
+    )
+    info["mps_max_bond"] = _native_mps_approx_bond()
+    info["pauli_beam_max_terms"] = _pauli_beam_approx_terms(spec)
+    return info
+
+
+def _pauli_beam_approx_terms(spec: CircuitSpec | None = None) -> int:
+    raw = os.environ.get("TERKET_APPROX_PAULI_BEAM")
+    if raw is None:
+        if spec is not None and _pauli_beam_needs_large_default(spec):
+            return _PAULI_BEAM_APPROX_LARGE_TERMS
+        return _PAULI_BEAM_APPROX_DEFAULT_TERMS
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        return _PAULI_BEAM_APPROX_DEFAULT_TERMS
+
+
+def _pauli_beam_needs_large_default(spec: CircuitSpec) -> bool:
+    expbox_count = 0
+    has_entangling_expbox = False
+    for gate in spec.gates:
+        name = str(gate[0])
+        if name == "pauli_expbox":
+            expbox_count += 1
+            if len(tuple(gate[2])) > 1:
+                has_entangling_expbox = True
+            continue
+        if name not in {"x", "z"}:
+            return False
+    return has_entangling_expbox and expbox_count >= 512
+
+
+def _pauli_masks_from_string(pauli: str) -> tuple[int, int]:
+    x_mask = 0
+    z_mask = 0
+    for idx, char in enumerate(pauli):
+        if char == "I":
+            continue
+        if char == "X":
+            x_mask |= 1 << idx
+            continue
+        if char == "Z":
+            z_mask |= 1 << idx
+            continue
+        if char == "Y":
+            x_mask |= 1 << idx
+            z_mask |= 1 << idx
+            continue
+        raise ValueError(f"Observable must use only I/X/Y/Z characters, received {pauli!r}.")
+    return x_mask, z_mask
+
+
+def _pauli_masks_from_sparse(paulis: Sequence[str], qubits: Sequence[int]) -> tuple[int, int]:
+    x_mask = 0
+    z_mask = 0
+    for pauli, qubit in zip(paulis, qubits):
+        bit = 1 << int(qubit)
+        pauli_char = str(pauli).upper()
+        if pauli_char == "I":
+            continue
+        if pauli_char == "X":
+            x_mask |= bit
+            continue
+        if pauli_char == "Z":
+            z_mask |= bit
+            continue
+        if pauli_char == "Y":
+            x_mask |= bit
+            z_mask |= bit
+            continue
+        raise ValueError(f"Unsupported PauliExpBox Pauli {pauli!r}.")
+    return x_mask, z_mask
+
+
+_PAULI_PRODUCT_PHASE = {
+    (0, 0): 1.0 + 0.0j,
+    (0, 1): 1.0 + 0.0j,
+    (0, 2): 1.0 + 0.0j,
+    (0, 3): 1.0 + 0.0j,
+    (1, 0): 1.0 + 0.0j,
+    (2, 0): 1.0 + 0.0j,
+    (3, 0): 1.0 + 0.0j,
+    (1, 1): 1.0 + 0.0j,
+    (2, 2): 1.0 + 0.0j,
+    (3, 3): 1.0 + 0.0j,
+    (1, 2): 1.0j,
+    (2, 1): -1.0j,
+    (2, 3): 1.0j,
+    (3, 2): -1.0j,
+    (3, 1): 1.0j,
+    (1, 3): -1.0j,
+}
+
+
+def _pauli_code(x_mask: int, z_mask: int, bit: int) -> int:
+    return (1 if x_mask & bit else 0) | (2 if z_mask & bit else 0)
+
+
+def _pauli_product_phase(left: tuple[int, int], right: tuple[int, int]) -> complex:
+    lx, lz = left
+    rx, rz = right
+    left_x = lx & ~lz
+    left_z = lz & ~lx
+    left_y = lx & lz
+    right_x = rx & ~rz
+    right_z = rz & ~rx
+    right_y = rx & rz
+    positive = (
+        (left_x & right_z).bit_count()
+        + (left_z & right_y).bit_count()
+        + (left_y & right_x).bit_count()
+    )
+    negative = (
+        (left_z & right_x).bit_count()
+        + (left_y & right_z).bit_count()
+        + (left_x & right_y).bit_count()
+    )
+    return (1.0 + 0.0j, 1.0j, -1.0 + 0.0j, -1.0j)[(positive - negative) & 3]
+
+
+def _pauli_product_phase_left_parts(
+    left_x: int,
+    left_z: int,
+    left_y: int,
+    right: tuple[int, int],
+) -> complex:
+    rx, rz = right
+    right_x = rx & ~rz
+    right_z = rz & ~rx
+    right_y = rx & rz
+    positive = (
+        (left_x & right_z).bit_count()
+        + (left_z & right_y).bit_count()
+        + (left_y & right_x).bit_count()
+    )
+    negative = (
+        (left_z & right_x).bit_count()
+        + (left_y & right_z).bit_count()
+        + (left_x & right_y).bit_count()
+    )
+    return (1.0 + 0.0j, 1.0j, -1.0 + 0.0j, -1.0j)[(positive - negative) & 3]
+
+
+def _pauli_beam_prune(
+    terms: dict[tuple[int, int], complex],
+    max_terms: int,
+) -> dict[tuple[int, int], complex]:
+    weighted = [
+        (weight, key, value)
+        for key, value in terms.items()
+        if (weight := abs(value)) > 1e-15
+    ]
+    if len(weighted) <= max_terms:
+        return {key: value for _weight, key, value in weighted}
+    weighted.sort(key=lambda item: item[0], reverse=True)
+    return {key: value for _weight, key, value in weighted[:max_terms]}
+
+
+_PauliBeamOp = tuple[str, object]
+
+
+def _pauli_beam_reverse_ops(spec: CircuitSpec) -> list[_PauliBeamOp] | None:
+    ops: list[_PauliBeamOp] = []
+    for gate in reversed(spec.gates):
+        name = str(gate[0])
+        if name == "pauli_expbox":
+            q_masks = _pauli_masks_from_sparse(gate[1], gate[2])
+            qx, qz = q_masks
+            if qx == 0 and qz == 0:
+                continue
+            qx_only = qx & ~qz
+            qz_only = qz & ~qx
+            qy = qx & qz
+            ops.append((
+                "pauli_expbox",
+                (
+                    qx,
+                    qz,
+                    qx_only,
+                    qz_only,
+                    qy,
+                    math.cos(float(gate[3])),
+                    -1.0j * math.sin(float(gate[3])),
+                ),
+            ))
+            continue
+        if name == "x":
+            ops.append(("x", 1 << int(gate[1])))
+            continue
+        if name == "z":
+            ops.append(("z", 1 << int(gate[1])))
+            continue
+        if name in {"h", "s", "sdg"}:
+            ops.append((name, 1 << int(gate[1])))
+            continue
+        if name == "cnot":
+            ops.append(("cnot", (1 << int(gate[1]), 1 << int(gate[2]))))
+            continue
+        return None
+    return ops
+
+
+def _pauli_beam_approx_pauli_expectations(
+    spec: CircuitSpec,
+    input_bits: Sequence[int],
+    observables: Sequence[str],
+    *,
+    max_terms: int | None = None,
+) -> list[complex] | None:
+    limit = _pauli_beam_approx_terms(spec) if max_terms is None else max(1, int(max_terms))
+    input_mask = 0
+    for idx, bit in enumerate(input_bits):
+        if int(bit) & 1:
+            input_mask |= 1 << idx
+
+    reverse_ops = _pauli_beam_reverse_ops(spec)
+    if reverse_ops is None:
+        return None
+
+    results: list[complex] = []
+    for observable in observables:
+        terms: dict[tuple[int, int], complex] = {_pauli_masks_from_string(observable): 1.0 + 0.0j}
+        for name, payload in reverse_ops:
+            if name == "pauli_expbox":
+                qx, qz, qx_only, qz_only, qy, cos_angle, minus_i_sin = payload
+                updated: dict[tuple[int, int], complex] = {}
+                for p_masks, coeff in terms.items():
+                    px, pz = p_masks
+                    anticommutes = (((qx & pz) ^ (qz & px)).bit_count() & 1) != 0
+                    if not anticommutes:
+                        updated[p_masks] = updated.get(p_masks, 0j) + coeff
+                        continue
+                    updated[p_masks] = updated.get(p_masks, 0j) + coeff * cos_angle
+                    product_masks = (qx ^ px, qz ^ pz)
+                    px_only = px & ~pz
+                    pz_only = pz & ~px
+                    py = px & pz
+                    positive = (
+                        (qx_only & pz_only).bit_count()
+                        + (qz_only & py).bit_count()
+                        + (qy & px_only).bit_count()
+                    )
+                    negative = (
+                        (qz_only & px_only).bit_count()
+                        + (qy & pz_only).bit_count()
+                        + (qx_only & py).bit_count()
+                    )
+                    phase = (1.0 + 0.0j, 1.0j, -1.0 + 0.0j, -1.0j)[(positive - negative) & 3]
+                    product_coeff = coeff * minus_i_sin * phase
+                    updated[product_masks] = updated.get(product_masks, 0j) + product_coeff
+                terms = _pauli_beam_prune(updated, limit)
+                continue
+            if name == "x":
+                bit = int(payload)
+                terms = {key: (-value if key[1] & bit else value) for key, value in terms.items()}
+                continue
+            if name == "z":
+                bit = int(payload)
+                terms = {key: (-value if key[0] & bit else value) for key, value in terms.items()}
+                continue
+            if name == "h":
+                bit = int(payload)
+                updated = {}
+                for (x_mask, z_mask), coeff in terms.items():
+                    x_bit = x_mask & bit
+                    z_bit = z_mask & bit
+                    next_x = (x_mask & ~bit) | (bit if z_bit else 0)
+                    next_z = (z_mask & ~bit) | (bit if x_bit else 0)
+                    next_coeff = -coeff if x_bit and z_bit else coeff
+                    updated[(next_x, next_z)] = updated.get((next_x, next_z), 0j) + next_coeff
+                terms = _pauli_beam_prune(updated, limit)
+                continue
+            if name == "s":
+                bit = int(payload)
+                updated = {}
+                for (x_mask, z_mask), coeff in terms.items():
+                    x_bit = x_mask & bit
+                    z_bit = z_mask & bit
+                    next_x = x_mask
+                    next_z = z_mask ^ (bit if x_bit else 0)
+                    next_coeff = -coeff if x_bit and not z_bit else coeff
+                    updated[(next_x, next_z)] = updated.get((next_x, next_z), 0j) + next_coeff
+                terms = _pauli_beam_prune(updated, limit)
+                continue
+            if name == "sdg":
+                bit = int(payload)
+                updated = {}
+                for (x_mask, z_mask), coeff in terms.items():
+                    x_bit = x_mask & bit
+                    z_bit = z_mask & bit
+                    next_x = x_mask
+                    next_z = z_mask ^ (bit if x_bit else 0)
+                    next_coeff = -coeff if x_bit and z_bit else coeff
+                    updated[(next_x, next_z)] = updated.get((next_x, next_z), 0j) + next_coeff
+                terms = _pauli_beam_prune(updated, limit)
+                continue
+            if name == "cnot":
+                control_bit, target_bit = payload
+                updated = {}
+                for (x_mask, z_mask), coeff in terms.items():
+                    image_x = 0
+                    image_z = 0
+                    image_coeff = coeff
+                    control_code = _pauli_code(x_mask, z_mask, control_bit)
+                    target_code = _pauli_code(x_mask, z_mask, target_bit)
+                    for factor_x, factor_z in (
+                        {
+                            0: (0, 0),
+                            1: (control_bit | target_bit, 0),
+                            2: (0, control_bit),
+                            3: (control_bit | target_bit, control_bit),
+                        }[control_code],
+                        {
+                            0: (0, 0),
+                            1: (target_bit, 0),
+                            2: (0, control_bit | target_bit),
+                            3: (target_bit, control_bit | target_bit),
+                        }[target_code],
+                    ):
+                        if factor_x or factor_z:
+                            image_coeff *= _pauli_product_phase((image_x, image_z), (factor_x, factor_z))
+                            image_x ^= factor_x
+                            image_z ^= factor_z
+                    next_x = (x_mask & ~(control_bit | target_bit)) | image_x
+                    next_z = (z_mask & ~(control_bit | target_bit)) | image_z
+                    updated[(next_x, next_z)] = updated.get((next_x, next_z), 0j) + image_coeff
+                terms = _pauli_beam_prune(updated, limit)
+                continue
+
+        total = 0.0 + 0.0j
+        for (x_mask, z_mask), coeff in terms.items():
+            if x_mask:
+                continue
+            sign = -1.0 if ((z_mask & input_mask).bit_count() & 1) else 1.0
+            total += coeff * sign
+        results.append(total)
+    return results
+
+
+def _native_mps_one_qubit_matrix(name: str, gate: Gate) -> np.ndarray | None:
+    if name == "h":
+        return np.array([[1.0, 1.0], [1.0, -1.0]], dtype=np.complex128) / math.sqrt(2.0)
+    if name == "x":
+        return np.array([[0.0, 1.0], [1.0, 0.0]], dtype=np.complex128)
+    if name == "z":
+        return np.array([[1.0, 0.0], [0.0, -1.0]], dtype=np.complex128)
+    if name == "s":
+        return np.array([[1.0, 0.0], [0.0, 1.0j]], dtype=np.complex128)
+    if name == "sdg":
+        return np.array([[1.0, 0.0], [0.0, -1.0j]], dtype=np.complex128)
+    if name == "t":
+        return np.array([[1.0, 0.0], [0.0, cmath.exp(0.25j * math.pi)]], dtype=np.complex128)
+    if name == "tdg":
+        return np.array([[1.0, 0.0], [0.0, cmath.exp(-0.25j * math.pi)]], dtype=np.complex128)
+    if name == "sx":
+        return 0.5 * np.array(
+            [[1.0 + 1.0j, 1.0 - 1.0j], [1.0 - 1.0j, 1.0 + 1.0j]],
+            dtype=np.complex128,
+        )
+    if name == "sxdg":
+        return 0.5 * np.array(
+            [[1.0 - 1.0j, 1.0 + 1.0j], [1.0 + 1.0j, 1.0 - 1.0j]],
+            dtype=np.complex128,
+        )
+    if name == "rz_arbitrary":
+        return np.array([[1.0, 0.0], [0.0, cmath.exp(1j * float(gate[2]))]], dtype=np.complex128)
+    if name == "rz_dyadic":
+        angle = 2.0 * math.pi * (int(gate[2]) % (1 << int(gate[3]))) / float(1 << int(gate[3]))
+        return np.array([[1.0, 0.0], [0.0, cmath.exp(1j * angle)]], dtype=np.complex128)
+    return None
+
+
+_NATIVE_MPS_CNOT = np.array(
+    [[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 0.0, 1.0], [0.0, 0.0, 1.0, 0.0]],
+    dtype=np.complex128,
+).reshape(2, 2, 2, 2)
+_NATIVE_MPS_CZ = np.diag([1.0, 1.0, 1.0, -1.0]).astype(np.complex128).reshape(2, 2, 2, 2)
+_NATIVE_MPS_SWAP = np.array(
+    [[1.0, 0.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0], [0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 0.0, 1.0]],
+    dtype=np.complex128,
+).reshape(2, 2, 2, 2)
+
+
+class _NativeApproxMPS:
+    def __init__(self, n_qubits: int, input_bits: Sequence[int], max_bond: int) -> None:
+        self.max_bond = int(max_bond)
+        self.position_to_qubit = list(range(n_qubits))
+        self.qubit_to_position = list(range(n_qubits))
+        self.tensors: list[np.ndarray] = []
+        for bit in input_bits:
+            tensor = np.zeros((1, 2, 1), dtype=np.complex128)
+            tensor[0, int(bit) & 1, 0] = 1.0
+            self.tensors.append(tensor)
+
+    def apply_one(self, qubit: int, matrix: np.ndarray) -> None:
+        pos = self.qubit_to_position[int(qubit)]
+        self.tensors[pos] = np.einsum("ab,lbr->lar", matrix, self.tensors[pos], optimize=True)
+
+    def apply_adjacent_two(self, pos: int, matrix: np.ndarray) -> None:
+        left = self.tensors[pos]
+        right = self.tensors[pos + 1]
+        dl = left.shape[0]
+        dr = right.shape[2]
+        theta = np.einsum("lar,rbs->labs", left, right, optimize=True)
+        theta = np.einsum("abij,lijk->labk", matrix, theta, optimize=True)
+        flat = theta.reshape(dl * 2, 2 * dr)
+        u, singular, vh = np.linalg.svd(flat, full_matrices=False)
+        keep = min(self.max_bond, len(singular))
+        while keep > 1 and singular[keep - 1] <= 1e-12:
+            keep -= 1
+        u = u[:, :keep]
+        singular = singular[:keep]
+        vh = vh[:keep, :]
+        norm = float(np.linalg.norm(singular))
+        if norm > 0.0:
+            singular = singular / norm
+        self.tensors[pos] = u.reshape(dl, 2, keep)
+        self.tensors[pos + 1] = (singular[:, None] * vh).reshape(keep, 2, dr)
+
+    def swap_positions(self, pos: int) -> None:
+        self.apply_adjacent_two(pos, _NATIVE_MPS_SWAP)
+        left_qubit = self.position_to_qubit[pos]
+        right_qubit = self.position_to_qubit[pos + 1]
+        self.position_to_qubit[pos], self.position_to_qubit[pos + 1] = right_qubit, left_qubit
+        self.qubit_to_position[left_qubit], self.qubit_to_position[right_qubit] = pos + 1, pos
+
+    def apply_two(self, left_qubit: int, right_qubit: int, matrix: np.ndarray) -> None:
+        left_pos = self.qubit_to_position[int(left_qubit)]
+        right_pos = self.qubit_to_position[int(right_qubit)]
+        routed_matrix = matrix
+        if left_pos > right_pos:
+            left_pos, right_pos = right_pos, left_pos
+            routed_matrix = np.transpose(matrix, (1, 0, 3, 2))
+        for pos in range(right_pos - 1, left_pos, -1):
+            self.swap_positions(pos)
+        self.apply_adjacent_two(left_pos, routed_matrix)
+        for pos in range(left_pos + 1, right_pos):
+            self.swap_positions(pos)
+
+    def expectation(self, observable: str) -> complex:
+        pauli = {
+            "I": np.eye(2, dtype=np.complex128),
+            "X": np.array([[0.0, 1.0], [1.0, 0.0]], dtype=np.complex128),
+            "Y": np.array([[0.0, -1.0j], [1.0j, 0.0]], dtype=np.complex128),
+            "Z": np.array([[1.0, 0.0], [0.0, -1.0]], dtype=np.complex128),
+        }
+        env = np.array([[1.0 + 0.0j]], dtype=np.complex128)
+        for pos, tensor in enumerate(self.tensors):
+            op = pauli[observable[self.position_to_qubit[pos]]]
+            env = np.einsum("ab,ais,ij,bjt->st", env, tensor.conj(), op, tensor, optimize=True)
+        return complex(env[0, 0])
+
+    def norm(self) -> complex:
+        return self.expectation("I" * len(self.tensors))
+
+    def amplitude(self, bits: Sequence[int]) -> complex:
+        env = np.array([1.0 + 0.0j], dtype=np.complex128)
+        for pos, tensor in enumerate(self.tensors):
+            bit = int(bits[self.position_to_qubit[pos]]) & 1
+            env = np.einsum("l,lr->r", env, tensor[:, bit, :], optimize=True)
+        return complex(env[0])
+
+
+def _native_mps_rx_matrix(angle: float) -> np.ndarray:
+    return np.array(
+        [
+            [math.cos(0.5 * angle), -1.0j * math.sin(0.5 * angle)],
+            [-1.0j * math.sin(0.5 * angle), math.cos(0.5 * angle)],
+        ],
+        dtype=np.complex128,
+    )
+
+
+def _native_mps_rzz_matrix(angle: float) -> np.ndarray:
+    return np.diag([
+        cmath.exp(-0.5j * angle),
+        cmath.exp(0.5j * angle),
+        cmath.exp(0.5j * angle),
+        cmath.exp(-0.5j * angle),
+    ]).astype(np.complex128).reshape(2, 2, 2, 2)
+
+
+def _native_mps_apply_pauli_expbox(
+    mps: _NativeApproxMPS,
+    paulis: Sequence[str],
+    qubits: Sequence[int],
+    angle: float,
+) -> None:
+    active: list[tuple[str, int]] = []
+    for pauli, qubit in zip(paulis, qubits):
+        pauli_char = str(pauli).upper()
+        if pauli_char != "I":
+            active.append((pauli_char, int(qubit)))
+    if not active:
+        return
+
+    for pauli_char, qubit in active:
+        if pauli_char == "X":
+            mps.apply_one(qubit, _native_mps_one_qubit_matrix("h", ("h", qubit)))
+        elif pauli_char == "Y":
+            mps.apply_one(qubit, _native_mps_one_qubit_matrix("sdg", ("sdg", qubit)))
+            mps.apply_one(qubit, _native_mps_one_qubit_matrix("h", ("h", qubit)))
+
+    ordered_qubits = [
+        qubit
+        for _pauli, qubit in sorted(active, key=lambda item: mps.qubit_to_position[item[1]])
+    ]
+    for left, right in zip(ordered_qubits, ordered_qubits[1:]):
+        mps.apply_two(left, right, _NATIVE_MPS_CNOT)
+    target = ordered_qubits[-1]
+    mps.apply_one(target, _native_mps_one_qubit_matrix("rz_arbitrary", ("rz_arbitrary", target, angle)))
+    for left, right in reversed(tuple(zip(ordered_qubits, ordered_qubits[1:]))):
+        mps.apply_two(left, right, _NATIVE_MPS_CNOT)
+
+    for pauli_char, qubit in reversed(active):
+        if pauli_char == "X":
+            mps.apply_one(qubit, _native_mps_one_qubit_matrix("h", ("h", qubit)))
+        elif pauli_char == "Y":
+            mps.apply_one(qubit, _native_mps_one_qubit_matrix("h", ("h", qubit)))
+            mps.apply_one(qubit, _native_mps_one_qubit_matrix("s", ("s", qubit)))
+
+
+def _native_mps_approx_state(
+    spec: CircuitSpec,
+    input_bits: Sequence[int],
+    *,
+    max_bond: int | None = None,
+    use_rotation_macros: bool = True,
+) -> _NativeApproxMPS | None:
+    mps = _NativeApproxMPS(spec.n_qubits, input_bits, _native_mps_approx_bond() if max_bond is None else max_bond)
+    gate_idx = 0
+    while gate_idx < len(spec.gates):
+        gate = spec.gates[gate_idx]
+        name = str(gate[0])
+        if (
+            use_rotation_macros
+            and
+            gate_idx + 2 < len(spec.gates)
+            and name == "h"
+            and spec.gates[gate_idx + 1][0] == "rz_arbitrary"
+            and spec.gates[gate_idx + 2] == gate
+            and int(spec.gates[gate_idx + 1][1]) == int(gate[1])
+        ):
+            mps.apply_one(int(gate[1]), _native_mps_rx_matrix(float(spec.gates[gate_idx + 1][2])))
+            gate_idx += 3
+            continue
+        if (
+            use_rotation_macros
+            and
+            gate_idx + 2 < len(spec.gates)
+            and name == "cnot"
+            and spec.gates[gate_idx + 1][0] == "rz_arbitrary"
+            and spec.gates[gate_idx + 2] == gate
+            and int(spec.gates[gate_idx + 1][1]) == int(gate[2])
+        ):
+            mps.apply_two(
+                int(gate[1]),
+                int(gate[2]),
+                _native_mps_rzz_matrix(float(spec.gates[gate_idx + 1][2])),
+            )
+            gate_idx += 3
+            continue
+        one_qubit = _native_mps_one_qubit_matrix(name, gate)
+        if one_qubit is not None:
+            mps.apply_one(int(gate[1]), one_qubit)
+            gate_idx += 1
+            continue
+        if name == "cnot":
+            mps.apply_two(int(gate[1]), int(gate[2]), _NATIVE_MPS_CNOT)
+            gate_idx += 1
+            continue
+        if name == "cz":
+            mps.apply_two(int(gate[1]), int(gate[2]), _NATIVE_MPS_CZ)
+            gate_idx += 1
+            continue
+        if name == "rzz_dyadic":
+            angle = 2.0 * math.pi * (int(gate[3]) % (1 << int(gate[4]))) / float(1 << int(gate[4]))
+            mps.apply_two(int(gate[1]), int(gate[2]), _native_mps_rzz_matrix(angle))
+            gate_idx += 1
+            continue
+        if name == "pauli_expbox":
+            _native_mps_apply_pauli_expbox(mps, gate[1], gate[2], float(gate[3]))
+            gate_idx += 1
+            continue
+        return None
+    return mps
+
+
+def _native_mps_apply_gate(mps: _NativeApproxMPS, gate: Gate) -> bool:
+    name = str(gate[0])
+    one_qubit = _native_mps_one_qubit_matrix(name, gate)
+    if one_qubit is not None:
+        mps.apply_one(int(gate[1]), one_qubit)
+        return True
+    if name == "cnot":
+        mps.apply_two(int(gate[1]), int(gate[2]), _NATIVE_MPS_CNOT)
+        return True
+    if name == "cz":
+        mps.apply_two(int(gate[1]), int(gate[2]), _NATIVE_MPS_CZ)
+        return True
+    if name == "rzz_dyadic":
+        angle = 2.0 * math.pi * (int(gate[3]) % (1 << int(gate[4]))) / float(1 << int(gate[4]))
+        mps.apply_two(int(gate[1]), int(gate[2]), _native_mps_rzz_matrix(angle))
+        return True
+    if name == "pauli_expbox":
+        _native_mps_apply_pauli_expbox(mps, gate[1], gate[2], float(gate[3]))
+        return True
+    return False
+
+
+def _native_mps_approx_mirror_fidelity(
+    spec: CircuitSpec,
+    dagger_spec: CircuitSpec,
+    input_bits: Sequence[int],
+    *,
+    max_bond: int | None = None,
+) -> float | None:
+    mps = _NativeApproxMPS(spec.n_qubits, input_bits, _native_mps_approx_bond() if max_bond is None else max_bond)
+    if dagger_spec.n_qubits != spec.n_qubits:
+        return None
+    for gate in tuple(spec.gates) + tuple(dagger_spec.gates):
+        if not _native_mps_apply_gate(mps, gate):
+            return None
+    amplitude = mps.amplitude(input_bits)
+    return float(abs(amplitude) ** 2)
+
+
+def _native_mps_approx_pauli_expectations(
+    spec: CircuitSpec,
+    input_bits: Sequence[int],
+    observables: Sequence[str],
+    *,
+    max_bond: int | None = None,
+) -> list[complex] | None:
+    if not observables:
+        return []
+    mps = _native_mps_approx_state(spec, input_bits, max_bond=max_bond)
+    if mps is None:
+        return None
+    norm = mps.norm()
+    if abs(norm) <= 1e-300:
+        return None
+    return [mps.expectation(observable) / norm for observable in observables]
+
+
 def compute_circuit_pauli_expectations(
     circuit: CircuitInput,
     observables: Sequence[str],
@@ -17294,6 +19797,30 @@ def compute_circuit_pauli_expectations(
     if len(prepared_input) != spec.n_qubits:
         raise ValueError(f"Expected {spec.n_qubits} input bits, received {len(prepared_input)}.")
     normalized_observables = _validate_pauli_observables(observables, spec.n_qubits)
+
+    _token = _SOLVER_CONFIG_VAR.set(solver_config) if solver_config is not None else None
+    try:
+        allow_approximate = bool(_get_solver_config().allow_approximate)
+        if allow_approximate and any(str(gate[0]) == "pauli_expbox" for gate in spec.gates):
+            native_values = _pauli_beam_approx_pauli_expectations(
+                spec,
+                prepared_input,
+                normalized_observables,
+            )
+            backend = "pauli_beam_approx"
+            if native_values is not None:
+                info = _approx_pauli_expectation_info(spec, backend)
+                return [
+                    (
+                        value if as_complex else ScaledAmplitude.from_tuple(_make_scaled_complex(value)),
+                        dict(info),
+                    )
+                    for value in native_values
+                ]
+    finally:
+        if _token is not None:
+            _SOLVER_CONFIG_VAR.reset(_token)
+
     observable_gate_sets = tuple(_pauli_string_gates(observable) for observable in normalized_observables)
     inverse_gates = _invert_native_gates(spec.gates)
     # Global phase cancels in U P U†, so keep the reusable U prefix phase-neutral.
@@ -17307,6 +19834,7 @@ def compute_circuit_pauli_expectations(
 
     _token = _SOLVER_CONFIG_VAR.set(solver_config) if solver_config is not None else None
     try:
+        allow_approximate = bool(_get_solver_config().allow_approximate)
         context = _ReductionContext(
             preserve_scale=not as_complex,
             allow_tensor_contraction=allow_tensor_contraction,
@@ -17314,6 +19842,8 @@ def compute_circuit_pauli_expectations(
         )
         results: list[tuple[ScaledAmplitude | complex, ReductionInfo] | None] = [None] * len(normalized_observables)
         pending: list[tuple[int, complex, int, int, PhaseFunction]] = []
+        bp_identity_cache: tuple[ScaledComplex, ReductionInfo] | None = None
+        native_mps_approx_cache: dict[int, complex] | None | bool = False
         suffix_query_cache: dict[
             tuple[int, tuple[int, ...], tuple[int, ...]],
             tuple[EchelonCache, tuple[int, tuple[int, ...], tuple[int, ...], int] | None],
@@ -17327,6 +19857,32 @@ def compute_circuit_pauli_expectations(
             tuple[int, ...],
             tuple[int, tuple[int, ...], tuple[int, ...], int] | None,
         ] = {}
+
+        def native_mps_approx_result(
+            obs_idx: int,
+            *,
+            fallback_reason: str | None = None,
+        ) -> tuple[ScaledAmplitude | complex, ReductionInfo] | None:
+            nonlocal native_mps_approx_cache
+            if native_mps_approx_cache is False:
+                native_values = _native_mps_approx_pauli_expectations(
+                    spec,
+                    prepared_input,
+                    normalized_observables,
+                )
+                native_mps_approx_cache = (
+                    {idx: value for idx, value in enumerate(native_values)}
+                    if native_values is not None
+                    else None
+                )
+            if not isinstance(native_mps_approx_cache, dict) or obs_idx not in native_mps_approx_cache:
+                return None
+            candidate = native_mps_approx_cache[obs_idx]
+            info = _approx_pauli_expectation_info(spec, "native_mps_approx")
+            if fallback_reason is not None:
+                info["fallback_reason"] = fallback_reason  # type: ignore[typeddict-unknown-key]
+            amp = candidate if as_complex else ScaledAmplitude.from_tuple(_make_scaled_complex(candidate))
+            return amp, info
 
         if direct_template is not None:
             validation_observable = _build_direct_post_replay_validation_observable(normalized_observables)
@@ -17381,13 +19937,67 @@ def compute_circuit_pauli_expectations(
             state = _build_post_replay_state(base_state, observable_gates, inverse_gates)
 
             if state._arbitrary_phases:
-                amp, info = state.amplitude(
-                    prepared_input,
-                    as_complex=as_complex,
-                    allow_tensor_contraction=allow_tensor_contraction,
-                    extended_reductions=extended_reductions,
-                    solver_config=solver_config,
-                )
+                use_native_mps = allow_approximate and all(char in "IZ" for char in normalized_observables[obs_idx])
+                if use_native_mps:
+                    mps_result = native_mps_approx_result(obs_idx)
+                    if mps_result is not None:
+                        results[obs_idx] = mps_result
+                        continue
+
+                try:
+                    raw_amp, info = state._amplitude_internal(
+                        prepared_input,
+                        preserve_scale=True,
+                        allow_tensor_contraction=allow_tensor_contraction,
+                        extended_reductions=extended_reductions,
+                        allow_unbounded_bp_result=True,
+                    )
+                except RuntimeError:
+                    mps_result = native_mps_approx_result(obs_idx, fallback_reason="arbitrary_bp_unavailable") if allow_approximate else None
+                    if mps_result is None:
+                        raise
+                    results[obs_idx] = mps_result
+                    continue
+                assert isinstance(raw_amp, ScaledAmplitude)
+                if _arbitrary_bp_backend(info.get("phase3_backend")):
+                    amp_complex = None if raw_amp.log2_abs() > 1000.0 else _scaled_to_complex(raw_amp.as_tuple())
+                    if bp_identity_cache is None:
+                        identity_state = _build_post_replay_state(base_state, (), inverse_gates)
+                        identity_amp_raw, identity_info = identity_state._amplitude_internal(
+                            prepared_input,
+                            preserve_scale=True,
+                            allow_tensor_contraction=allow_tensor_contraction,
+                            extended_reductions=extended_reductions,
+                            allow_unbounded_bp_result=True,
+                        )
+                        assert isinstance(identity_amp_raw, ScaledAmplitude)
+                        bp_identity_cache = (identity_amp_raw.as_tuple(), identity_info)
+                    candidate = amp_complex
+                    identity_scaled, _identity_info = bp_identity_cache
+                    normalized = _scaled_complex_ratio_to_plain(raw_amp.as_tuple(), identity_scaled)
+                    if normalized is not None:
+                        candidate = normalized
+                        info["phase3_backend"] = "arbitrary_bethe_bp_normalized"
+                    if (
+                        candidate is None
+                        or not (math.isfinite(candidate.real) and math.isfinite(candidate.imag))
+                        or abs(candidate.real) > 1.0 + 1e-6
+                        or abs(candidate.imag) > 1e-6
+                    ):
+                        mps_result = native_mps_approx_result(obs_idx, fallback_reason="arbitrary_bp_invalid") if allow_approximate else None
+                        if mps_result is None:
+                            info["phase3_backend"] = "arbitrary_bethe_bp_invalid"
+                            info["bp_invalid_reason"] = "observable_estimate_out_of_bounds"  # type: ignore[typeddict-unknown-key]
+                            raise RuntimeError(
+                                "Unreliable arbitrary-angle BP observable estimate: normalized Pauli expectation "
+                                "is non-finite or outside [-1, 1]. Use an exact path or a fidelity-validated "
+                                "approximate backend."
+                            )
+                        results[obs_idx] = mps_result
+                        continue
+                    amp = candidate if as_complex else ScaledAmplitude.from_tuple(_make_scaled_complex(candidate))
+                else:
+                    amp = _scaled_to_complex(raw_amp.as_tuple()) if as_complex else raw_amp
                 results[obs_idx] = (amp, info)
                 continue
 
@@ -17468,6 +20078,7 @@ def analyze_amplitudes(
     *,
     allow_tensor_contraction: bool = True,
     extended_reductions: ExtendedReductionMode | str = "auto",
+    solver_config: SolverConfig | None = None,
 ) -> list[ReductionInfo]:
     """Return reduction metadata for multiple outputs without materializing amplitudes."""
     from .circuits import _circuit_global_phase_radians, normalize_circuit
@@ -17480,14 +20091,19 @@ def analyze_amplitudes(
         global_phase_radians=_circuit_global_phase_radians(spec),
         extended_reductions=extended_reductions,
     )
-    return _batch_query_state(
-        state,
-        output_list,
-        preserve_scale=False,
-        allow_tensor_contraction=allow_tensor_contraction,
-        extended_reductions=extended_reductions,
-        analyze_only=True,
-    )
+    _token = _SOLVER_CONFIG_VAR.set(solver_config) if solver_config is not None else None
+    try:
+        return _batch_query_state(
+            state,
+            output_list,
+            preserve_scale=True,
+            allow_tensor_contraction=allow_tensor_contraction,
+            extended_reductions=extended_reductions,
+            analyze_only=True,
+        )
+    finally:
+        if _token is not None:
+            _SOLVER_CONFIG_VAR.reset(_token)
 
 
 def analyze_circuit(
@@ -17497,6 +20113,7 @@ def analyze_circuit(
     *,
     allow_tensor_contraction: bool = True,
     extended_reductions: ExtendedReductionMode | str = "auto",
+    solver_config: SolverConfig | None = None,
 ) -> ReductionInfo:
     """
     Return reduction statistics for a single amplitude query.
@@ -17522,6 +20139,7 @@ def analyze_circuit(
         [output_bits],
         allow_tensor_contraction=allow_tensor_contraction,
         extended_reductions=extended_reductions,
+        solver_config=solver_config,
     )[0]
 
 
@@ -17569,8 +20187,8 @@ def compute_amplitude(
     By default this returns ``ScaledAmplitude``. Pass ``as_complex=True`` to
     request a native ``complex`` instead. Set
     ``allow_tensor_contraction=False`` to disable tensor-guided q3-free
-    planning hints. Phase 3 currently stays on the in-tree exact backends
-    either way.
+    planning hints. Approximate arbitrary-angle BP fallback is disabled unless
+    ``SolverConfig.allow_approximate`` is true.
     """
     state = build_state(n, gates, input_bits, extended_reductions=extended_reductions)
     return state.amplitude(

@@ -4,6 +4,7 @@ import cmath
 import sys
 from pathlib import Path
 import unittest
+import unittest.mock
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -518,6 +519,105 @@ class PhaseStructureOptimizerTests(unittest.TestCase):
         self.assertEqual(total, (1.0 + 0.0j, 4000))
         self.assertEqual(info["remaining"], 7)
         self.assertEqual(info["phase3_backend"], "treewidth_dp_peeled")
+
+    def test_phase3_backend_can_choose_treewidth_cutset_for_high_width_core(self):
+        q = PhaseFunction(
+            6,
+            level=3,
+            q1=[0] * 6,
+            q2={},
+            q3={
+                (0, 1, 2): 1,
+                (0, 2, 3): 1,
+                (0, 3, 4): 1,
+                (0, 4, 5): 1,
+                (1, 3, 5): 1,
+            },
+        )
+
+        with unittest.mock.patch.object(
+            engine,
+            "_find_q3_treewidth_cutset",
+            return_value=((0, 1), [0, 1, 2, 3], 10, 50),
+        ):
+            backend, score, separator = engine._choose_phase3_backend(
+                q,
+                cover=[0, 1, 2, 3, 4],
+                order=list(range(6)),
+                width=30,
+                structural_obstruction=5,
+                allow_tensor_contraction=False,
+                fully_peeled=False,
+            )
+
+        self.assertEqual(backend, "q3_treewidth_cutset")
+        self.assertIsNone(separator)
+        self.assertLess(score[1], engine._estimate_q3_cover_work(q, 5))
+
+    def test_phase3_treewidth_cutset_rejects_bad_assignment_width(self):
+        q = PhaseFunction(
+            4,
+            level=3,
+            q1=[0] * 4,
+            q2={},
+            q3={(0, 1, 2): 1},
+        )
+
+        with unittest.mock.patch.object(
+            engine,
+            "_phase3_residual_after_cutset",
+            return_value=(q, tuple(range(q.n))),
+        ), unittest.mock.patch.object(
+            engine,
+            "_phase3_treewidth_cutset_candidates",
+            side_effect=[(0,), ()],
+        ), unittest.mock.patch.object(
+            engine,
+            "_min_fill_cubic_order",
+            return_value=(list(range(q.n)), 1),
+        ), unittest.mock.patch.object(
+            engine,
+            "_finalize_phase3_treewidth_order",
+            return_value=(list(range(q.n)), 1),
+        ), unittest.mock.patch.object(
+            engine,
+            "_estimate_treewidth_dp_work",
+            return_value=1,
+        ), unittest.mock.patch.object(
+            engine,
+            "_phase3_cutset_worst_residual",
+            return_value=(list(range(q.n)), 19, 1),
+        ):
+            plan = engine._find_q3_treewidth_cutset(
+                q,
+                order=list(range(q.n)),
+                width=30,
+                fully_peeled=False,
+            )
+
+        self.assertIsNone(plan)
+
+    def test_phase3_treewidth_cutset_preserves_exact_sum(self):
+        q = PhaseFunction(
+            5,
+            level=3,
+            q1=[1, 2, 3, 0, 1],
+            q2={(0, 1): 1, (2, 3): 1},
+            q3={(0, 1, 2): 1, (0, 3, 4): 1},
+        )
+
+        total, info = engine._sum_via_q3_treewidth_cutset(
+            q,
+            (0,),
+            context=engine._ReductionContext(preserve_scale=True, allow_tensor_contraction=False),
+            structural_obstruction=1,
+        )
+
+        actual = engine._scaled_to_complex(total)
+        expected = _bruteforce_phase_sum(q)
+        self.assertAlmostEqual(abs(actual - expected), 0.0, places=12)
+        self.assertEqual(info["phase3_backend"], "q3_treewidth_cutset")
+        self.assertGreaterEqual(info["branched"], 1)
 
 
 if __name__ == "__main__":
