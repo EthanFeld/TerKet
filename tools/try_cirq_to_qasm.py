@@ -14,7 +14,7 @@ SRC_ROOT = REPO_ROOT / "src"
 if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
-from terket import compute_circuit_amplitude, compute_circuit_probability
+from terket import compute_circuit_amplitude
 from terket.circuit_spec import from_qiskit
 
 
@@ -128,7 +128,8 @@ def main() -> int:
     prob_info = None
     t5 = t4
     if args.mode == "amplitude_and_probability":
-        probability, prob_info = compute_circuit_probability(spec, zero_bits, zero_bits, as_float=True)
+        probability = float(abs(complex(amplitude)) ** 2)
+        prob_info = amp_info
         t5 = time.perf_counter()
 
     print(f"wrote_qasm={args.qasm_out}")

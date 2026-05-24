@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from .engine import (
+from .native import (
     _get_quimb_tensor_module,
     _load_schur_native_module,
     _quimb_import_reason,

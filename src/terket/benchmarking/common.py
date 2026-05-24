@@ -265,8 +265,12 @@ def write_rows(rows: Sequence[object], csv_path: Path) -> None:
         fieldnames = list(asdict(first).keys())
         records = [asdict(row) for row in rows]
     else:
-        fieldnames = list(first.keys())
         records = list(rows)
+        fieldnames: list[str] = []
+        for row in records:
+            for key in row.keys():
+                if key not in fieldnames:
+                    fieldnames.append(key)
 
     with csv_path.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=fieldnames)

@@ -4,8 +4,6 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import dataclass
-import hashlib
-import math
 from pathlib import Path
 import sys
 
@@ -30,7 +28,11 @@ from terket.benchmarking import (
     warm_up_terket,
     write_rows,
 )
-from terket.benchmarking.head_to_head_cases import resolve_cases as resolve_head_to_head_cases
+from terket.benchmarking.head_to_head_cases import (
+    AmplitudeQuery,
+    resolve_cases as resolve_head_to_head_cases,
+)
+from terket.benchmarking.mqt import bind_deterministic_parameters, hash_bits
 from terket.benchmarking.structured_cases import resolve_cases as resolve_structured_cases
 from terket.circuits import bits_to_big_endian_string
 
@@ -66,43 +68,15 @@ class MqtFairCase:
         return self.case
 
     def build_query(self):
-        circuit = _bind_deterministic_parameters(
+        circuit = bind_deterministic_parameters(
             get_benchmark_alg(self.benchmark, circuit_size=self.circuit_size, random_parameters=False),
             self.benchmark,
             self.circuit_size,
         )
         spec = normalize_circuit(circuit)
         input_bits = (0,) * spec.n_qubits
-        output_bits = _hash_bits(f"{self.benchmark}:{self.circuit_size}:output", spec.n_qubits)
-        return _SimpleAmplitudeQuery(circuit=spec, input_bits=input_bits, output_bits=output_bits)
-
-
-@dataclass(frozen=True, slots=True)
-class _SimpleAmplitudeQuery:
-    circuit: object
-    input_bits: tuple[int, ...]
-    output_bits: tuple[int, ...]
-
-
-def _hash_bits(label: str, width: int) -> tuple[int, ...]:
-    digest = hashlib.sha256(label.encode("utf-8")).digest()
-    bits = tuple((digest[idx % len(digest)] >> (idx % 8)) & 1 for idx in range(width))
-    if width and not any(bits):
-        bits = (1,) + bits[1:]
-    return bits
-
-
-def _bind_deterministic_parameters(circuit, benchmark: str, circuit_size: int):
-    if not circuit.parameters:
-        return circuit
-
-    assignments = {}
-    ordered = sorted(circuit.parameters, key=lambda param: param.name)
-    for idx, param in enumerate(ordered):
-        digest = hashlib.sha256(f"{benchmark}:{circuit_size}:{param.name}:{idx}".encode("utf-8")).digest()
-        bucket = int.from_bytes(digest[:8], byteorder="little", signed=False) % 256
-        assignments[param] = (2.0 * math.pi * bucket) / 256.0
-    return circuit.assign_parameters(assignments, inplace=False)
+        output_bits = hash_bits(f"{self.benchmark}:{self.circuit_size}:output", spec.n_qubits)
+        return AmplitudeQuery(circuit=spec, input_bits=input_bits, output_bits=output_bits)
 
 
 def resolve_fair_cases(case_names: list[str]):

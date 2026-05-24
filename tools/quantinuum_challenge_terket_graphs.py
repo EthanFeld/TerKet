@@ -18,9 +18,16 @@ from collections import Counter, defaultdict
 from fractions import Fraction
 
 
+_NON_GATE_METADATA_FIELDS = {"circuit_name", "family", "hardness", "qubits"}
+
+
 def _int_field(row: dict[str, str], key: str) -> int:
     value = row.get(key, "")
     return int(value) if value not in ("", None) else 0
+
+
+def _input_gate_count(row: dict[str, str]) -> int:
+    return sum(_int_field(row, key) for key in row if key not in _NON_GATE_METADATA_FIELDS)
 
 
 def _support_status(row: dict[str, str]) -> str:
@@ -136,24 +143,8 @@ def _load_pytket_json(path: Path):
             _append_basic_gate(gates, inner_type, args)
             continue
         args = [_qidx(arg, mapping) for arg in command.get("args", [])]
-        if gate_type == "H":
-            gates.append(("h", args[0]))
-        elif gate_type == "CX":
-            gates.append(("cnot", args[0], args[1]))
-        elif gate_type == "CnX" and len(args) == 2:
-            gates.append(("cnot", args[0], args[1]))
-        elif gate_type == "T":
-            gates.append(("pauli_expbox", ("Z",), (int(args[0]),), math.pi / 4.0))
-        elif gate_type == "Tdg":
-            gates.append(("pauli_expbox", ("Z",), (int(args[0]),), -math.pi / 4.0))
-        elif gate_type == "S":
-            gates.append(("s", args[0]))
-        elif gate_type == "Sdg":
-            gates.append(("sdg", args[0]))
-        elif gate_type == "X":
-            gates.append(("x", args[0]))
-        elif gate_type == "Z":
-            gates.append(("z", args[0]))
+        if gate_type in {"H", "CX", "CnX", "T", "Tdg", "S", "Sdg", "X", "Z"}:
+            _append_basic_gate(gates, gate_type, args)
         elif gate_type == "Rz":
             _append_rz(gates, args[0], _angle_radians(command))
         elif gate_type == "Rx":
@@ -172,6 +163,34 @@ def _load_pytket_json(path: Path):
             raise ValueError(f"Unsupported gate {gate_type!r}.")
 
     return make_circuit(len(qubits), gates, name=path.stem), counts
+
+
+def _blank_result(
+    row: dict[str, str],
+    *,
+    status: str,
+    profile_path: str = "",
+) -> dict[str, object]:
+    return {
+        "circuit_name": row["circuit_name"],
+        "family": row["family"],
+        "hardness": row["hardness"],
+        "status": status,
+        "qubits": _int_field(row, "qubits"),
+        "input_gates": _input_gate_count(row),
+        "terket_gates": "",
+        "import_s": "",
+        "analyze_s": "",
+        "initial_free": "",
+        "remaining_free": "",
+        "branches": "",
+        "cost_model_r": "",
+        "cubic_obstruction": "",
+        "gauss_obstruction": "",
+        "phase3_backend": "",
+        "is_zero": "",
+        "profile_path": profile_path,
+    }
 
 
 def _run_one(json_path: Path) -> dict[str, object]:
@@ -298,29 +317,7 @@ def _main(argv: list[str]) -> int:
         for row in selected:
             name = row["circuit_name"]
             if row["family"] in timed_out_families:
-                result = {
-                    "circuit_name": name,
-                    "family": row["family"],
-                    "hardness": row["hardness"],
-                    "status": "skipped_after_family_timeout",
-                    "qubits": _int_field(row, "qubits"),
-                    "input_gates": sum(
-                        _int_field(row, key)
-                        for key in row
-                        if key not in {"circuit_name", "family", "hardness", "qubits"}
-                    ),
-                    "terket_gates": "",
-                    "import_s": "",
-                    "analyze_s": "",
-                    "initial_free": "",
-                    "remaining_free": "",
-                    "branches": "",
-                    "cost_model_r": "",
-                    "cubic_obstruction": "",
-                    "gauss_obstruction": "",
-                    "phase3_backend": "",
-                    "is_zero": "",
-                }
+                result = _blank_result(row, status="skipped_after_family_timeout")
                 result_rows.append(result)
                 print(f"{name}: {result['status']}", flush=True)
                 continue
@@ -351,52 +348,18 @@ def _main(argv: list[str]) -> int:
                 result.update({"family": row["family"], "hardness": row["hardness"]})
                 result["profile_path"] = profile_path
             except subprocess.TimeoutExpired:
-                result = {
-                    "circuit_name": name,
-                    "family": row["family"],
-                    "hardness": row["hardness"],
-                    "status": f"timeout>{args.timeout_s:g}s",
-                    "qubits": _int_field(row, "qubits"),
-                    "input_gates": sum(_int_field(row, key) for key in row if key not in {"circuit_name", "family", "hardness", "qubits"}),
-                    "terket_gates": "",
-                    "import_s": "",
-                    "analyze_s": "",
-                    "initial_free": "",
-                    "remaining_free": "",
-                    "branches": "",
-                    "cost_model_r": "",
-                    "cubic_obstruction": "",
-                    "gauss_obstruction": "",
-                    "phase3_backend": "",
-                    "is_zero": "",
-                    "profile_path": profile_path,
-                }
+                result = _blank_result(
+                    row,
+                    status=f"timeout>{args.timeout_s:g}s",
+                    profile_path=profile_path,
+                )
                 timed_out_families.add(row["family"])
             except RuntimeError as exc:
-                result = {
-                    "circuit_name": name,
-                    "family": row["family"],
-                    "hardness": row["hardness"],
-                    "status": f"error:{str(exc).splitlines()[-1][:160]}",
-                    "qubits": _int_field(row, "qubits"),
-                    "input_gates": sum(
-                        _int_field(row, key)
-                        for key in row
-                        if key not in {"circuit_name", "family", "hardness", "qubits"}
-                    ),
-                    "terket_gates": "",
-                    "import_s": "",
-                    "analyze_s": "",
-                    "initial_free": "",
-                    "remaining_free": "",
-                    "branches": "",
-                    "cost_model_r": "",
-                    "cubic_obstruction": "",
-                    "gauss_obstruction": "",
-                    "phase3_backend": "",
-                    "is_zero": "",
-                    "profile_path": profile_path,
-                }
+                result = _blank_result(
+                    row,
+                    status=f"error:{str(exc).splitlines()[-1][:160]}",
+                    profile_path=profile_path,
+                )
             result_rows.append(result)
             print(f"{name}: {result['status']}", flush=True)
 

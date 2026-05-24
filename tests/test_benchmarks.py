@@ -19,9 +19,8 @@ PYTHON = sys.executable
 if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
-from terket import bits_to_big_endian_string, compute_circuit_amplitude, make_circuit
+from terket import bits_to_big_endian_string, compute_circuit_amplitude, from_qiskit, make_circuit
 from terket.benchmarking.head_to_head_cases import build_approximate_qft, build_approximate_qft_logical
-from terket.circuit_spec import from_qiskit
 
 
 def _dependencies_available(*modules: str) -> bool:

@@ -115,6 +115,11 @@ Interactive walkthrough: [notebooks/terket_demo.ipynb](TerKet/notebooks/terket_d
 
 High-level design and solver pipeline: [docs/design.md](TerKet/docs/design.md)
 
+## Maintenance
+
+Bloat-refactor guard commands and benchmark/native verification checklist:
+[docs/bloat_refactor_checklist.md](TerKet/docs/bloat_refactor_checklist.md)
+
 ## Repo Layout
 
 - `src/terket/`: package source, solver engine, case builders, native helpers

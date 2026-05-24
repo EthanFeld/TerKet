@@ -94,7 +94,10 @@ typedef struct {
     Py_ssize_t *bucket_table_indexes;
     int output_mode;
     Py_ssize_t output_slot;
-} NativeQ3FreePlanStep;
+} NativePlanStep;
+
+typedef NativePlanStep NativeQ3FreePlanStep;
+typedef NativePlanStep NativeLevel3PlanStep;
 
 typedef struct {
     Py_ssize_t nvars;
@@ -115,22 +118,6 @@ typedef struct {
     Py_ssize_t *slot_source_indexes;
     NativeQ3FreePlanStep *steps;
 } NativeQ3FreeTreewidthPlan;
-
-typedef struct {
-    Py_ssize_t var;
-    Py_ssize_t bucket_count;
-    Py_ssize_t union_arity;
-    Py_ssize_t var_pos;
-    uint64_t low_mask;
-    size_t reduced_table_size;
-    Py_ssize_t *bucket_slot_ids;
-    Py_ssize_t *bucket_arities;
-    Py_ssize_t *bucket_pos_offsets;
-    Py_ssize_t *bucket_positions;
-    Py_ssize_t *bucket_table_indexes;
-    int output_mode;
-    Py_ssize_t output_slot;
-} NativeLevel3PlanStep;
 
 enum {
     NATIVE_LEVEL3_SLOT_SOURCE_NONE = 0,

@@ -33,7 +33,7 @@ BENCHMARKS: dict[str, tuple[str, str]] = {
     ),
     "amplitude-post-elimination-tensor-rcs": (
         "benchmarks.targeted.rcs.amplitude_post_elimination_tensor_rcs",
-        "Probe tensor-network viability on post-elimination q3-free RCS residuals.",
+        "Probe post-elimination q3-free RCS residual planning and exact residual evaluation.",
     ),
     "rcs-import-strategy-probe": (
         "benchmarks.targeted.rcs.rcs_import_strategy_probe",

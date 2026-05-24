@@ -286,16 +286,46 @@ int compare_classification_triple_records(const void *left_ptr, const void *righ
     return 0;
 }
 
-
-int factor_contains_var(const NativeFactor *factor, Py_ssize_t var)
+static inline int scope_contains_var_impl(
+    const Py_ssize_t *scope,
+    Py_ssize_t arity,
+    Py_ssize_t var
+)
 {
     Py_ssize_t idx;
-    for (idx = 0; idx < factor->arity; ++idx) {
-        if (factor->scope[idx] == var) {
+    for (idx = 0; idx < arity; ++idx) {
+        if (scope[idx] == var) {
             return 1;
         }
     }
     return 0;
+}
+
+
+static inline int scopes_equal_impl(
+    int alive,
+    Py_ssize_t factor_arity,
+    const Py_ssize_t *factor_scope,
+    const Py_ssize_t *scope,
+    Py_ssize_t arity
+)
+{
+    Py_ssize_t idx;
+    if (!alive || factor_arity != arity) {
+        return 0;
+    }
+    for (idx = 0; idx < arity; ++idx) {
+        if (factor_scope[idx] != scope[idx]) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+
+int factor_contains_var(const NativeFactor *factor, Py_ssize_t var)
+{
+    return scope_contains_var_impl(factor->scope, factor->arity, var);
 }
 
 
@@ -407,31 +437,13 @@ int materialize_native_factor(NativeFactor *factor)
 
 int scopes_equal(const NativeFactor *factor, const Py_ssize_t *scope, Py_ssize_t arity)
 {
-    Py_ssize_t idx;
-    if (!factor->alive || factor->arity != arity) {
-        return 0;
-    }
-    for (idx = 0; idx < arity; ++idx) {
-        if (factor->scope[idx] != scope[idx]) {
-            return 0;
-        }
-    }
-    return 1;
+    return scopes_equal_impl(factor->alive, factor->arity, factor->scope, scope, arity);
 }
 
 
 int scaled_scopes_equal(const NativeScaledFactor *factor, const Py_ssize_t *scope, Py_ssize_t arity)
 {
-    Py_ssize_t idx;
-    if (!factor->alive || factor->arity != arity) {
-        return 0;
-    }
-    for (idx = 0; idx < arity; ++idx) {
-        if (factor->scope[idx] != scope[idx]) {
-            return 0;
-        }
-    }
-    return 1;
+    return scopes_equal_impl(factor->alive, factor->arity, factor->scope, scope, arity);
 }
 
 
@@ -477,32 +489,17 @@ void free_native_scaled_factor(NativeScaledFactor *factor)
 
 int plan_scope_contains_var(const NativePlanScopeFactor *factor, Py_ssize_t var)
 {
-    Py_ssize_t idx;
-    for (idx = 0; idx < factor->arity; ++idx) {
-        if (factor->scope[idx] == var) {
-            return 1;
-        }
-    }
-    return 0;
+    return scope_contains_var_impl(factor->scope, factor->arity, var);
 }
 
 
 int plan_scopes_equal(const NativePlanScopeFactor *factor, const Py_ssize_t *scope, Py_ssize_t arity)
 {
-    Py_ssize_t idx;
-    if (!factor->alive || factor->arity != arity) {
-        return 0;
-    }
-    for (idx = 0; idx < arity; ++idx) {
-        if (factor->scope[idx] != scope[idx]) {
-            return 0;
-        }
-    }
-    return 1;
+    return scopes_equal_impl(factor->alive, factor->arity, factor->scope, scope, arity);
 }
 
 
-static void free_q3_free_treewidth_plan_step(NativeQ3FreePlanStep *step)
+static void free_treewidth_plan_step(NativePlanStep *step)
 {
     if (step == NULL) {
         return;
@@ -512,49 +509,66 @@ static void free_q3_free_treewidth_plan_step(NativeQ3FreePlanStep *step)
     PyMem_Free(step->bucket_pos_offsets);
     PyMem_Free(step->bucket_positions);
     PyMem_Free(step->bucket_table_indexes);
-    step->bucket_slot_ids = NULL;
-    step->bucket_arities = NULL;
-    step->bucket_pos_offsets = NULL;
-    step->bucket_positions = NULL;
-    step->bucket_table_indexes = NULL;
-    step->bucket_count = 0;
-    step->union_arity = 0;
-    step->var_pos = -1;
-    step->output_slot = -1;
-    step->output_mode = 0;
+}
+
+
+static void free_treewidth_initial_tables(void **initial_tables, Py_ssize_t initial_slot_count)
+{
+    Py_ssize_t idx;
+    if (initial_tables == NULL) {
+        return;
+    }
+    for (idx = 0; idx < initial_slot_count; ++idx) {
+        PyMem_Free(initial_tables[idx]);
+    }
+}
+
+
+static void free_treewidth_plan_common(
+    Py_ssize_t initial_slot_count,
+    void **initial_tables,
+    Py_ssize_t step_count,
+    NativePlanStep *steps,
+    Py_ssize_t *slot_arities,
+    size_t *slot_table_sizes,
+    size_t *slot_workspace_offsets,
+    unsigned char *slot_source_kinds,
+    Py_ssize_t *slot_source_indexes
+)
+{
+    Py_ssize_t idx;
+    free_treewidth_initial_tables(initial_tables, initial_slot_count);
+    if (steps != NULL) {
+        for (idx = 0; idx < step_count; ++idx) {
+            free_treewidth_plan_step(&steps[idx]);
+        }
+    }
+    PyMem_Free(slot_arities);
+    PyMem_Free(slot_table_sizes);
+    PyMem_Free(slot_workspace_offsets);
+    PyMem_Free(initial_tables);
+    PyMem_Free(slot_source_kinds);
+    PyMem_Free(slot_source_indexes);
+    PyMem_Free(steps);
 }
 
 
 void free_q3_free_treewidth_plan(NativeQ3FreeTreewidthPlan *plan)
 {
-    Py_ssize_t idx;
     if (plan == NULL) {
         return;
     }
-    if (plan->initial_tables != NULL) {
-        for (idx = 0; idx < plan->initial_slot_count; ++idx) {
-            PyMem_Free(plan->initial_tables[idx]);
-        }
-    }
-    if (plan->steps != NULL) {
-        for (idx = 0; idx < plan->step_count; ++idx) {
-            free_q3_free_treewidth_plan_step(&plan->steps[idx]);
-        }
-    }
-    PyMem_Free(plan->slot_arities);
-    PyMem_Free(plan->slot_table_sizes);
-    PyMem_Free(plan->slot_workspace_offsets);
-    PyMem_Free(plan->initial_tables);
-    PyMem_Free(plan->slot_source_kinds);
-    PyMem_Free(plan->slot_source_indexes);
-    PyMem_Free(plan->steps);
-    plan->slot_arities = NULL;
-    plan->slot_table_sizes = NULL;
-    plan->slot_workspace_offsets = NULL;
-    plan->initial_tables = NULL;
-    plan->slot_source_kinds = NULL;
-    plan->slot_source_indexes = NULL;
-    plan->steps = NULL;
+    free_treewidth_plan_common(
+        plan->initial_slot_count,
+        (void **) plan->initial_tables,
+        plan->step_count,
+        plan->steps,
+        plan->slot_arities,
+        plan->slot_table_sizes,
+        plan->slot_workspace_offsets,
+        plan->slot_source_kinds,
+        plan->slot_source_indexes
+    );
     PyMem_Free(plan);
 }
 
@@ -573,67 +587,26 @@ void q3_free_treewidth_plan_capsule_destructor(PyObject *capsule)
 }
 
 
-static void free_level3_treewidth_plan_step(NativeLevel3PlanStep *step)
-{
-    if (step == NULL) {
-        return;
-    }
-    PyMem_Free(step->bucket_slot_ids);
-    PyMem_Free(step->bucket_arities);
-    PyMem_Free(step->bucket_pos_offsets);
-    PyMem_Free(step->bucket_positions);
-    PyMem_Free(step->bucket_table_indexes);
-    step->bucket_slot_ids = NULL;
-    step->bucket_arities = NULL;
-    step->bucket_pos_offsets = NULL;
-    step->bucket_positions = NULL;
-    step->bucket_table_indexes = NULL;
-    step->bucket_count = 0;
-    step->union_arity = 0;
-    step->var_pos = -1;
-    step->output_slot = -1;
-    step->output_mode = 0;
-}
-
-
 void free_level3_treewidth_plan(NativeLevel3TreewidthPlan *plan)
 {
-    Py_ssize_t idx;
     if (plan == NULL) {
         return;
     }
-    if (plan->initial_tables != NULL) {
-        for (idx = 0; idx < plan->initial_slot_count; ++idx) {
-            PyMem_Free(plan->initial_tables[idx]);
-        }
-    }
-    if (plan->steps != NULL) {
-        for (idx = 0; idx < plan->step_count; ++idx) {
-            free_level3_treewidth_plan_step(&plan->steps[idx]);
-        }
-    }
-    PyMem_Free(plan->slot_arities);
-    PyMem_Free(plan->slot_table_sizes);
-    PyMem_Free(plan->slot_workspace_offsets);
-    PyMem_Free(plan->initial_tables);
-    PyMem_Free(plan->slot_source_kinds);
-    PyMem_Free(plan->slot_source_indexes);
-    PyMem_Free(plan->steps);
+    free_treewidth_plan_common(
+        plan->initial_slot_count,
+        (void **) plan->initial_tables,
+        plan->step_count,
+        plan->steps,
+        plan->slot_arities,
+        plan->slot_table_sizes,
+        plan->slot_workspace_offsets,
+        plan->slot_source_kinds,
+        plan->slot_source_indexes
+    );
     PyMem_Free(plan->workspace);
     PyMem_Free(plan->merge_scratch);
     PyMem_Free(plan->slot_views);
     PyMem_Free(plan->slot_owned);
-    plan->slot_arities = NULL;
-    plan->slot_table_sizes = NULL;
-    plan->slot_workspace_offsets = NULL;
-    plan->initial_tables = NULL;
-    plan->slot_source_kinds = NULL;
-    plan->slot_source_indexes = NULL;
-    plan->steps = NULL;
-    plan->workspace = NULL;
-    plan->merge_scratch = NULL;
-    plan->slot_views = NULL;
-    plan->slot_owned = NULL;
     PyMem_Free(plan);
 }
 

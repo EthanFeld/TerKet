@@ -1,0 +1,208 @@
+from __future__ import annotations
+
+from ._engine_runtime_core import *
+
+
+_bind_extracted_forwarders(
+    "_q3free.plans",
+    "_q3_free_constraint_plan_key",
+    "_q3_free_edge_density",
+    "_q3_free_prefers_locality_preserving_cutset",
+    "_q3_free_prefers_reusable_cutset",
+    "_q3_free_prefers_one_shot_cutset",
+    "_q3_free_prefers_dense_one_shot_direct",
+    "_sum_q3_free_via_one_shot_cutset_scaled",
+    "_plan_q3_free_constraint_components",
+    "_build_q3_free_constraint_plan",
+    "_q3_free_constraint_rhs",
+)
+_bind_extracted_forwarders(
+    "_q3free.components",
+    "_evaluate_q3_free_component_plan_scaled",
+    "_evaluate_q3_free_component_plan_scaled_batch",
+)
+_bind_extracted_forwarders(
+    "_q3free.execution",
+    "_q3_free_execution_plan_cache_key",
+    "_q3_free_reusable_execution_plan_cache_key",
+    "_build_q3_free_reusable_execution_plan",
+    "_materialize_q3_free_execution_plan",
+    "_build_q3_free_execution_plan",
+    "_evaluate_q3_free_planned_components_scaled",
+    "_evaluate_q3_free_execution_plan_scaled",
+    "_q3_free_execution_plan_runtime_score",
+    "_q3_free_planned_components_runtime_score",
+    "_q3_free_runtime_score_is_good_baseline",
+    "_rewrite_q3_free_phase_to_normal_form",
+    "_optimize_q3_free_phase",
+    "_phase3_execution_plan_runtime_score",
+    "_phase3_runtime_score_is_good_baseline",
+    "_evaluate_q3_free_constraint_plan_scaled",
+    "_evaluate_q3_free_constraint_plan_scaled_batch",
+    call_local=True,
+)
+_bind_extracted_forwarders(
+    "_q3free.raw_constraints",
+    "_build_q3_free_raw_constraint_plan",
+    "_restrict_q3_free_component_plan",
+    "_restrict_q3_free_raw_constraint_plan",
+    "_evaluate_q3_free_raw_constraint_plan_scaled",
+    "_evaluate_q3_free_raw_constraint_plan_scaled_batch",
+    "_component_restriction",
+)
+_bind_extracted_forwarders(
+    "_q3free.exact",
+    "_sum_q3_free_direct_scaled",
+    "_sum_factorized_components_scaled",
+    "_bruteforce_q3_free_sum",
+    "_q3_free_spanning_data",
+    "_select_feedback_vertices",
+    "_forest_transfer_sum",
+    "_forest_postorder_components",
+    "_forest_transfer_sum_scaled",
+    "_forest_transfer_sum_scaled_batch",
+    "_dense_q2_matrix",
+    "_quadratic_residue_threshold",
+    "_quadratic_pair_correction",
+    "_phase_from_dense_q2",
+    "_swap_dense_q2_variables",
+    "_swap_dense_matrix_variables",
+    "_schur_complement_q3_free_sum_scaled_dense",
+    "_schur_complement_q3_free_sum_scaled",
+    "_schur_complement_q3_free_sum",
+    "_qubit_quadratic_tensor_obstruction_support",
+    "_qubit_quadratic_tensor_obstruction",
+    "_supports_exact_dense_schur",
+    "_sum_bl26_quadratic_tensor_component_scaled",
+    "_sum_bl26_quadratic_tensor_component",
+    "_sum_q3_free_via_gauss_reduction_scaled",
+    "_sum_q3_free_via_gauss_reduction",
+)
+_bind_extracted_forwarders(
+    "_q3free.fallbacks",
+    "_non_half_phase_q2_edge_masks",
+    "_refine_bad_q2_vertex_cover",
+    "_minimum_bad_q2_vertex_cover_uncached",
+    "_minimum_bad_q2_vertex_cover",
+    "_bad_q2_cover_dispatch_allowed",
+    "_sum_q3_free_via_bad_q2_cover_scaled",
+    "_gauss_obstruction",
+    "_sum_q3_free_via_nonquadratic_support_scaled",
+    "_sum_q3_free_via_nonquadratic_support",
+    "_cubic_order_width",
+)
+_bind_extracted_forwarders(
+    "_q3free.treewidth",
+    "_q3_free_series_reduction_core",
+    "_q3_free_treewidth_order",
+    "_sum_q3_free_component",
+    "_iter_q3_free_cheap_order_hints",
+    "_best_cheap_q3_free_order",
+    "_cheap_q3_free_work_surrogate",
+    "_native_rank_q3_free_cutset_extensions",
+    "_sum_q3_free_component_scaled",
+    "_gauss_sum_q3_free",
+    "_gauss_sum_q3_free_scaled",
+    "_fix_variables",
+    "_fix_variable",
+    "_interaction_graph",
+    "_connected_components_on_vertices",
+    "_pair_graph_degeneracy",
+    "_bfs_layers_on_vertices",
+    "_farthest_vertex_on_vertices",
+    "_min_fill_order_on_subgraph",
+    "_choose_pair_graph_layer_separator",
+    "_nested_dissection_pair_order_from_adjacency",
+    "_pair_graph_separator_order",
+    "_min_fill_cubic_order_uncached",
+    "_min_degree_cubic_order_uncached",
+    "_min_fill_cubic_order",
+    call_local=True,
+)
+_bind_extracted_forwarders(
+    "_factor_tables",
+    "_factor_table_multiply",
+    "_factor_table_multiply_scaled",
+    "_project_assignment_bits",
+    "_combine_factor",
+    "_combine_factor_scaled",
+    "_sum_acyclic_factor_tables_scaled",
+    "_sum_acyclic_factor_tables_scaled_batch",
+    "_factor_table_multiply_scaled_batch",
+    "_combine_factor_scaled_batch",
+    "_sum_factor_tables_scaled_batch",
+    "_sum_factor_tables_scaled",
+)
+_bind_extracted_forwarders(
+    "_q3free.native",
+    "_build_native_q3_free_treewidth_plan",
+    "_build_native_q3_free_treewidth_plan_cached",
+    "_q3_free_native_treewidth_component_plan",
+    "_sum_q3_free_treewidth_dp_scaled_batch",
+)
+_bind_extracted_forwarders(
+    "_q3free.cutset_support",
+    "_q3_free_component_plan_width_hint",
+    "_q3_free_component_plan_work_hint",
+    "_q3_free_cutset_plan_generic_penalty",
+    "_q3_free_component_plan_generic_penalty",
+    "_q3_free_tensor_slice_hint",
+    "_direct_order_guided_q3_free_cutset_plan",
+    "_candidate_q3_free_cutset_vertices",
+    "_order_guided_q3_free_cutset_vertices",
+    "_merge_q3_free_cutset_candidate_orders",
+    "_separator_ranked_q3_free_cutset_vertices",
+)
+_bind_extracted_forwarders(
+    "_q3free.cutset_residue",
+    "_build_q3_free_cutset_residue_data",
+    "_build_q3_free_residual_projection",
+    "_evaluate_q3_free_cutset_candidate",
+    call_local=True,
+)
+_bind_extracted_forwarders(
+    "_q3free.cutset",
+    "_finalize_q3_free_cutset_conditioning_plan",
+    "_attach_q3_free_cutset_runtime_cache",
+    "_build_q3_free_cutset_conditioning_plan_uncached",
+    "_q3_free_cutset_conditioning_plan",
+    "_q3_free_one_shot_cutset_conditioning_plan",
+)
+_bind_extracted_forwarders(
+    "_q3free.cutset_exec",
+    "_sum_q3_free_via_cutset_conditioning_scaled",
+    "_evaluate_q3_free_cutset_conditioning_plan_scaled_batch",
+    "_evaluate_q3_free_cutset_conditioning_plan_scaled",
+)
+_bind_extracted_forwarders(
+    "_phase3.order",
+    "_build_factor_scopes",
+    "_treewidth_order_width",
+    "_treewidth_order_scope_trace",
+    "_treewidth_order_scope_sets",
+    "_q3_free_treewidth_width_limit",
+    "_estimate_treewidth_dp_work",
+    "_move_order_entry",
+    "_refine_q3_free_treewidth_order_locally",
+    "_finalize_q3_free_treewidth_order",
+    "_refine_phase3_treewidth_order_locally",
+)
+_bind_extracted_forwarders(
+    "_q3free.factor_plans",
+    "_factor_scope_order",
+    "_estimate_factor_table_dp_cost",
+    "_factor_order_scope_sets",
+    "_factor_cutset_residual_scopes",
+    "_factor_cutset_candidates",
+    "_find_arbitrary_factor_cutset_plan",
+    "_factor_scope_degeneracy",
+)
+
+
+def _finalize_phase3_treewidth_order(*args, **kwargs):
+    module = importlib.import_module("terket._phase3.order")
+    module._sync_from_engine(sys.modules[__name__])
+    return module._LOCAL_IMPLS["_finalize_phase3_treewidth_order"](*args, **kwargs)
+
+
+__all__ = [name for name in globals() if not name.startswith("__")]

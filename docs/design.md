@@ -32,7 +32,7 @@ All public entrypoints normalize to this form first.
 
 ### `SchurState`
 
-Defined in [src/terket/engine.py](TerKet/src/terket/engine.py). This is the compiled state for one circuit and one input bitstring. It stores:
+Defined through [src/terket/state.py](TerKet/src/terket/state.py), with current implementation in [src/terket/_engine_impl.py](TerKet/src/terket/_engine_impl.py). This is the compiled state for one circuit and one input bitstring. It stores:
 
 - affine output map `eps, eps0`
 - symbolic phase kernel `q`
@@ -56,7 +56,7 @@ The amplitude problem becomes an exact sum of `omega^q(x)` over binary assignmen
 
 ### `ScaledAmplitude`
 
-Defined in [src/terket/engine.py](TerKet/src/terket/engine.py). Results are stored as:
+Defined through [src/terket/scaling.py](TerKet/src/terket/scaling.py), with current implementation in [src/terket/_engine_impl.py](TerKet/src/terket/_engine_impl.py). Results are stored as:
 
 `mantissa * 2 ** (half_pow2_exp / 2)`
 

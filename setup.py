@@ -67,9 +67,15 @@ if os.environ.get("TERKET_DISABLE_NATIVE") != "1":
             sources=[
                 "src/terket/_schur_native.c",
                 "src/terket/_schur_native_support.c",
-                "src/terket/_schur_native_algebra.c",
                 "src/terket/_schur_native_graph.c",
-                "src/terket/_schur_native_dp.c",
+                "src/terket/native_phase_eval.c",
+                "src/terket/native_constraint_elim.c",
+                "src/terket/native_affine_compose.c",
+                "src/terket/native_classification.c",
+                "src/terket/native_output_solve.c",
+                "src/terket/native_level3_dp.c",
+                "src/terket/native_phase_function_dp.c",
+                "src/terket/native_q3_free_dp.c",
             ],
             include_dirs=include_dirs,
         )

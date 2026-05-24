@@ -1,0 +1,17 @@
+{
+  "roots": [
+    "src",
+    "tests",
+    "benchmarks",
+    "tools",
+    "scripts"
+  ],
+  "extensions": [
+    ".py",
+    ".c",
+    ".h"
+  ],
+  "report_above": 300,
+  "fail_above": 1000,
+  "allow_over_fail": {}
+}

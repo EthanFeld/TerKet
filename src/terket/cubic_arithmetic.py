@@ -1,17 +1,4 @@
-"""
-Level-aware cubic phase arithmetic over binary variables for the TerKet engine.
-
-`PhaseFunction` stores a degree-3 phase polynomial with configurable dyadic
-precision:
-
-- `q0` in `R/Z`
-- `q1` coefficients in `Z_(2^L)`
-- `q2` coefficients in `Z_(2^(L-1))`
-- `q3` coefficients in `Z_(2^(L-2))`
-
-When `L = 3`, this reduces to the original Clifford+T `CubicFunction`
-representation with `Z8 / Z4 / Z2` coefficients.
-"""
+"""Level-aware cubic phase arithmetic over binary variables."""
 
 from __future__ import annotations
 
@@ -31,15 +18,7 @@ def _modulus_for_degree(level: int, degree: int) -> int:
 
 
 class PhaseFunction:
-    """
-    Degree-3 phase function on binary variables with configurable precision.
-
-    Storage layout:
-        q0: Fraction mod 1
-        q1: list[int mod 2^L], length n
-        q2: dict[(k, l)] -> int mod 2^(L-1) for k < l
-        q3: dict[(k, l, m)] -> int mod 2^(L-2) for k < l < m
-    """
+    """Degree-3 phase function on binary variables with dyadic precision."""
 
     __slots__ = (
         "n",
@@ -220,12 +199,7 @@ class PhaseFunction:
     # -- Composition ----------------------------------------------
 
     def compose(self, gamma: LinearMap) -> PhaseFunction:
-        """
-        Compose with a binary linear map ``gamma : Z2^p -> Z2^n``.
-
-        The result stays degree-3; only the coefficient rings depend on
-        ``self.level``.
-        """
+        """Compose with a binary linear map ``gamma : Z2^p -> Z2^n``."""
         n = self.n
         p = len(gamma[0]) if gamma else 0
         assert len(gamma) == n
