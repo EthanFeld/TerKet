@@ -1,3 +1,5 @@
+"""One-off probe for Cirq-to-QASM conversion behavior."""
+
 from __future__ import annotations
 
 import argparse

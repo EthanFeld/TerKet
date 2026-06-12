@@ -1,3 +1,5 @@
+"""Benchmark smoke tests and CLI guard coverage."""
+
 from __future__ import annotations
 
 import csv

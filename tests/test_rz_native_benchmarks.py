@@ -1,3 +1,5 @@
+"""Tests for RZ-native benchmark helper behavior."""
+
 from __future__ import annotations
 
 import cmath

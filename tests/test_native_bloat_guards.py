@@ -1,3 +1,5 @@
+"""Guard tests for native-source layout and build-matrix expectations."""
+
 from __future__ import annotations
 
 import os

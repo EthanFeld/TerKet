@@ -1,3 +1,5 @@
+"""Tests for batched Phase-3 treewidth execution behavior."""
+
 from __future__ import annotations
 
 import sys

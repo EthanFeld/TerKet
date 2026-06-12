@@ -1,4 +1,4 @@
-"""Recovered _q3free_clusters.py helpers from monolith worktree."""
+"""q3-free cluster planning helpers for reusable exact evaluation."""
 
 from __future__ import annotations
 

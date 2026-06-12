@@ -1,4 +1,4 @@
-"""Recovered _q3free_primitives.py helpers from monolith worktree."""
+"""q3-free primitive graph, residue, and unary-expansion helpers."""
 
 from __future__ import annotations
 
@@ -18,6 +18,7 @@ from typing import Any, Callable, Literal, Mapping, Sequence, overload
 
 import numpy as np
 
+from ..scaling import _omega_table
 from ..cubic_arithmetic import CubicFunction, PhaseFunction, detect_factorization
 from .._engine_runtime_core import _bootstrap_extracted_globals, _sync_extracted_globals
 from ..scaling import ScaledAmplitude, ScaledComplex

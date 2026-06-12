@@ -1,3 +1,5 @@
+"""Tests for public API and compatibility facade import surfaces."""
+
 from __future__ import annotations
 
 import os

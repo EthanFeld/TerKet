@@ -1,3 +1,5 @@
+"""Tests for native q3-free treewidth backend routing decisions."""
+
 from __future__ import annotations
 
 import sys

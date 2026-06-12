@@ -1,3 +1,5 @@
+"""Tests for q3-free one-shot slicing region construction behavior."""
+
 from __future__ import annotations
 
 import sys

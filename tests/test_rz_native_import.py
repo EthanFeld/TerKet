@@ -1,3 +1,5 @@
+"""Tests for exact dyadic RZ import behavior."""
+
 from __future__ import annotations
 
 import cmath

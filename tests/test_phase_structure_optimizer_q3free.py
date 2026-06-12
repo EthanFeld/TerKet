@@ -1,3 +1,5 @@
+"""Tests for phase-structure optimizer behavior on q3-free paths."""
+
 from __future__ import annotations
 
 import cmath

@@ -1,3 +1,5 @@
+"""Tests for cache registration, stats, and clearing behavior."""
+
 from __future__ import annotations
 
 import terket

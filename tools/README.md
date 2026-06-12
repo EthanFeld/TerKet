@@ -5,6 +5,7 @@ Tools are repo-maintenance scripts, not TerKet public API.
 | Tool | Purpose | Runtime Scale | Optional Deps |
 | --- | --- | --- | --- |
 | `report_file_sizes.py` | Report code-file line counts, enforce 1000-line cap allowlist, and print current 300+ line offenders. | Seconds. | None. |
+| `report_readability.py` | Report readability hotspots: large files/functions, missing module docstrings, and compatibility shim inventory. | Seconds. | None. |
 | `compare_bloat_baseline.py` | Compare benchmark CSVs for backend/output/runtime regressions. | Seconds. | None beyond benchmark CSV deps. |
 | `check_native_build_matrix.py` | Verify native-enabled and `TERKET_DISABLE_NATIVE=1` build modes. | Seconds to minutes; compiler-dependent. | C compiler, setuptools. |
 | `profile_rcs_old_vs_new.py` | Profile RCS import/solver behavior during refactors. | Minutes on larger cases. | Qiskit, profiling tooling. |
@@ -13,3 +14,7 @@ Tools are repo-maintenance scripts, not TerKet public API.
 | `try_cirq_to_qasm.py` | Temporary Cirq-to-QASM import probe. | Seconds to minutes. | Cirq, Qiskit. |
 
 Ignored local probes may exist in `tools/`; keep new durable benchmark logic under `benchmarks/` or `src/terket/benchmarking/`.
+
+Readability and size guard scripts are meant to ratchet current debt down over
+time, not bless current hotspots forever. Remove allowlist entries as modules
+shrink or gain headers.

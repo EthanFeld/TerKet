@@ -1,3 +1,5 @@
+"""Tests for native q3-free treewidth runtime execution."""
+
 from __future__ import annotations
 
 import sys

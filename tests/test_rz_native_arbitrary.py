@@ -1,3 +1,5 @@
+"""Tests for arbitrary-angle native and fallback behavior."""
+
 from __future__ import annotations
 
 import cmath

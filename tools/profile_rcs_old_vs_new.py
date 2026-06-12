@@ -1,3 +1,5 @@
+"""Profile old-vs-new RCS import and solver behavior during refactors."""
+
 import argparse
 import json
 import math

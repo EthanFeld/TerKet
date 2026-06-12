@@ -1,3 +1,5 @@
+"""Tests for native q3-free treewidth plan construction."""
+
 from __future__ import annotations
 
 import sys

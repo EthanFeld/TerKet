@@ -1,3 +1,5 @@
+"""Tests for q3-free normal-form rewrite helpers."""
+
 from __future__ import annotations
 
 from fractions import Fraction

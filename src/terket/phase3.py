@@ -1,4 +1,9 @@
-"""Grouped Phase-3 planning and residual-cubic execution helpers."""
+"""Focused internal facade for residual-cubic Phase-3 helpers.
+
+This is not stable public API. It groups Phase-3-owned backend selection and
+execution helpers without re-exposing q3-free storage ownership through
+compatibility barrels.
+"""
 
 from __future__ import annotations
 

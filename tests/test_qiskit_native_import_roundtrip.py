@@ -1,3 +1,5 @@
+"""Tests for Qiskit import/export round-trip behavior."""
+
 from __future__ import annotations
 
 from collections import Counter

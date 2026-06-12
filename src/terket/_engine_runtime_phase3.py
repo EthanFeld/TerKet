@@ -1,3 +1,5 @@
+"""Engine-runtime splice module for Phase-3 planning and execution exports."""
+
 from __future__ import annotations
 
 from ._engine_runtime_core import *
@@ -110,9 +112,7 @@ _bind_extracted_forwarders(
     "_minimum_q3_vertex_cover",
 )
 _bind_extracted_forwarders(
-    "_phase3.exec",
-    "_sum_via_q3_separator",
-    "_sum_via_q3_treewidth_cutset",
+    "_q3free.batch",
     "_as_int64_array",
     "_compact_unsigned_storage_dtype",
     "_compact_index_storage_array",
@@ -122,6 +122,11 @@ _bind_extracted_forwarders(
     "_branch_assignment_bits",
     "_q3_cover_branch_chunk_size",
     "_evaluate_q3_free_branch_template_batch",
+)
+_bind_extracted_forwarders(
+    "_phase3.exec",
+    "_sum_via_q3_separator",
+    "_sum_via_q3_treewidth_cutset",
     "_sum_via_q3_cover",
     "_sum_irreducible_cubic_core",
 )

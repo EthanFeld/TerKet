@@ -1,3 +1,5 @@
+"""Tests for post-elimination tensor RCS benchmark behavior."""
+
 from __future__ import annotations
 
 import sys

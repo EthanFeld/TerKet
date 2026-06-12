@@ -1,3 +1,5 @@
+"""Repo guard tests for bloat, readability, and private import surfaces."""
+
 from __future__ import annotations
 
 import importlib.util
@@ -8,6 +10,7 @@ import sys
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 TOOL_PATH = REPO_ROOT / "tools" / "report_file_sizes.py"
+READABILITY_TOOL_PATH = REPO_ROOT / "tools" / "report_readability.py"
 
 ALLOWED_ENGINE_IMPL_IMPORTERS = {
     "src/terket/__init__.py",
@@ -70,8 +73,10 @@ ALLOWED_OVER_REPORT_PATHS = {
     "src/terket/_phase3/select.py",
     "src/terket/_phase3/structure.py",
     "src/terket/_q3free/clusters.py",
+    "src/terket/_q3free/batch.py",
     "src/terket/_q3free/components.py",
-    "src/terket/_q3free/cutset.py",
+    "src/terket/_q3free/cutset_search.py",
+    "src/terket/_q3free/cutset_search_core.py",
     "src/terket/_q3free/cutset_residue.py",
     "src/terket/_q3free/cutset_support.py",
     "src/terket/_q3free/exact.py",
@@ -99,7 +104,6 @@ ALLOWED_OVER_REPORT_PATHS = {
     "src/terket/native_classification.c",
     "src/terket/native_constraint_elim.c",
     "src/terket/scaling.py",
-    "src/terket/state.py",
     "tests/test_phase3_treewidth_batch.py",
     "tests/test_phase_structure_optimizer_phase3.py",
     "tests/test_q3free_one_shot_slicing_heuristics.py",
@@ -109,6 +113,7 @@ ALLOWED_OVER_REPORT_PATHS = {
     "tests/test_q3free_treewidth_native_runtime.py",
     "tests/test_rz_native_arbitrary.py",
     "tests/test_rz_native_pauli.py",
+    "tools/report_readability.py",
     "tools/quantinuum_challenge_terket_graphs.py",
 }
 
@@ -132,6 +137,16 @@ def _load_report_module():
     spec = importlib.util.spec_from_file_location("terket_report_file_sizes", TOOL_PATH)
     if spec is None or spec.loader is None:
         raise AssertionError(f"Unable to load tool module from {TOOL_PATH}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def _load_readability_report_module():
+    spec = importlib.util.spec_from_file_location("terket_report_readability", READABILITY_TOOL_PATH)
+    if spec is None or spec.loader is None:
+        raise AssertionError(f"Unable to load tool module from {READABILITY_TOOL_PATH}")
     module = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)
@@ -178,6 +193,20 @@ def test_file_size_allowlist_matches_current_repo_state() -> None:
     summary = report.summarize_scan(report.scan_repo(REPO_ROOT, policy), policy)
     assert not summary.unexpected_over_fail
     assert not summary.stale_allowlist
+
+
+def test_readability_allowlist_matches_current_repo_state() -> None:
+    report = _load_readability_report_module()
+    policy = report.load_policy()
+    summary = report.summarize_scan(report.scan_repo(REPO_ROOT, policy), policy)
+    assert not summary.unexpected_over_fail_files
+    assert not summary.stale_allow_over_file
+    assert not summary.unexpected_over_fail_functions
+    assert not summary.stale_allow_over_function
+    assert not summary.unexpected_missing_module_docstrings
+    assert not summary.stale_allow_missing_module_docstring
+    assert not summary.unexpected_module_replace_shims
+    assert not summary.stale_allow_module_replace_shim
 
 
 def test_engine_impl_importers_are_frozen() -> None:

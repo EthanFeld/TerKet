@@ -1,3 +1,5 @@
+"""Engine-runtime splice module for state-construction compatibility exports."""
+
 from __future__ import annotations
 
 from ._engine_runtime_core import *

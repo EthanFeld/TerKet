@@ -1,9 +1,17 @@
-"""Grouped q3-free planning and exact summation entry points."""
+"""Focused internal facade for q3-free planning and exact summation.
+
+This is not stable public API. It groups q3-free-owned helpers so tests and
+benchmark code can import one domain surface without reaching through Phase-3
+execution modules or compatibility barrels.
+"""
 
 from __future__ import annotations
 
-from ._phase3.exec import _build_q3_free_branch_template, _evaluate_q3_free_branch_template_batch
-from ._q3free.batch import Q3FreeBranchTemplate
+from ._q3free.batch import (
+    Q3FreeBranchTemplate,
+    _build_q3_free_branch_template,
+    _evaluate_q3_free_branch_template_batch,
+)
 from ._q3free.cutset import _q3_free_cutset_conditioning_plan, _q3_free_one_shot_cutset_conditioning_plan
 from ._q3free.cutset_exec import _sum_q3_free_via_cutset_conditioning_scaled
 from ._q3free.cutset_residue import _build_q3_free_cutset_residue_data

@@ -1,3 +1,5 @@
+"""Compatibility barrel that rebuilds historical ``_engine_impl`` runtime surface."""
+
 from __future__ import annotations
 
 import importlib

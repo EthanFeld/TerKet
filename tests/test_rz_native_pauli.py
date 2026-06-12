@@ -1,3 +1,5 @@
+"""Tests for Pauli expectation behavior on native-enabled RZ paths."""
+
 from __future__ import annotations
 
 import cmath

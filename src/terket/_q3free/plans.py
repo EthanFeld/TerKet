@@ -1,4 +1,4 @@
-"""Extracted q3-free plan builders and heuristics."""
+"""q3-free plan builders, heuristics, and reusable constraint planning."""
 
 from __future__ import annotations
 
@@ -17,6 +17,7 @@ from typing import Any, Callable, Literal, Mapping, Sequence, overload
 
 import numpy as np
 
+from .batch import _compact_index_storage_array, _compact_residue_storage_array
 from ..cubic_arithmetic import CubicFunction, PhaseFunction, detect_factorization
 from .._engine_runtime_core import _bootstrap_extracted_globals, _sync_extracted_globals
 from ..scaling import ScaledAmplitude, ScaledComplex

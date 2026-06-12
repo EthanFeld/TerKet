@@ -1,3 +1,5 @@
+"""Engine-runtime splice module for q3-free planning and execution exports."""
+
 from __future__ import annotations
 
 from ._engine_runtime_core import *
@@ -161,10 +163,16 @@ _bind_extracted_forwarders(
     call_local=True,
 )
 _bind_extracted_forwarders(
-    "_q3free.cutset",
+    "_q3free.cutset_runtime",
     "_finalize_q3_free_cutset_conditioning_plan",
     "_attach_q3_free_cutset_runtime_cache",
+)
+_bind_extracted_forwarders(
+    "_q3free.cutset_search_core",
     "_build_q3_free_cutset_conditioning_plan_uncached",
+)
+_bind_extracted_forwarders(
+    "_q3free.cutset_search",
     "_q3_free_cutset_conditioning_plan",
     "_q3_free_one_shot_cutset_conditioning_plan",
 )

@@ -1,4 +1,4 @@
-"""Extracted q3-free cutset evaluators."""
+"""q3-free cutset evaluators for exact branch-conditioned sums."""
 
 from __future__ import annotations
 
@@ -17,6 +17,7 @@ from typing import Any, Callable, Literal, Mapping, Sequence, overload
 
 import numpy as np
 
+from .batch import _branch_assignment_bits, _phase_fraction_to_residue
 from ..cubic_arithmetic import CubicFunction, PhaseFunction, detect_factorization
 from .._engine_runtime_core import _bootstrap_extracted_globals, _sync_extracted_globals
 from ..scaling import ScaledAmplitude, ScaledComplex

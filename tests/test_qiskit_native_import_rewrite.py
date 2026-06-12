@@ -1,3 +1,5 @@
+"""Tests for Qiskit import rewrite behavior."""
+
 from __future__ import annotations
 
 from collections import Counter

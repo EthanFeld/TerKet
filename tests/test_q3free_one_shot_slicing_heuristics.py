@@ -1,3 +1,5 @@
+"""Tests for q3-free one-shot slicing heuristic selection behavior."""
+
 from __future__ import annotations
 
 import sys
