@@ -23,6 +23,7 @@ from ._reduction_elim import (
     _info,
 )
 from ._reduction_runtime import (
+    _apply_safe_high_precision_eliminations,
     _apply_exact_eliminations,
     _elim_decoupled_constraints_batch,
     _product_q1_sum,
@@ -51,6 +52,7 @@ __all__ = [
     "_aff_compose",
     "_aff_compose_python",
     "_apply_exact_eliminations",
+    "_apply_safe_high_precision_eliminations",
     "_build_classification_data",
     "_classify",
     "_classification_entry",

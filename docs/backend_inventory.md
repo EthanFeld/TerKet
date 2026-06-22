@@ -8,7 +8,6 @@ Classification:
 - `CORE EXACT`: required default exact path
 - `PERF EXACT`: exact specialization kept only if benchmark value holds
 - `PREPROCESS`: transform feeding another exact backend, not independent backend
-- `OPT-IN APPROX`: approximation gated by `SolverConfig.allow_approximate`
 - `REMOVED/DEAD`: code path removed or selector always false
 - `COMPAT`: metadata/import compatibility only
 
@@ -17,15 +16,11 @@ Classification:
 `phase3_backend` is overloaded. It reports:
 - q3-free labels: `q3_free`, `quadratic_tensor`
 - Phase-3 labels: `treewidth_dp`, `treewidth_dp_peeled`, `q3_cover`, `q3_separator`, `q3_treewidth_cutset`, `cubic_contraction`
-- approximate labels: `arbitrary_bethe_bp`, `arbitrary_factor_bethe_bp`, `arbitrary_sparse_parity_bethe_bp`, `*_heuristic`, `pauli_beam_approx`, `native_mps_approx`
 - branch aggregate label: `mixed`
 
 Target: keep compatibility, but later split metadata into:
 - `backend_family`
 - `backend_name`
-- `is_approximate`
-- `approx_backend`
-- `approx_validation`
 - `backend_mode`
 
 ## Q3-Free Backends
@@ -36,6 +31,8 @@ Target: keep compatibility, but later split metadata into:
 | product | `_product_q1_sum_scaled`, isolated vars, cutset `remaining_backend == "product"` | CORE EXACT | yes | tiny, useful | keep |
 | forest | `_forest_transfer_sum_scaled`, backend `"forest"` | CORE EXACT | yes | clear q2 forest path | keep |
 | treewidth | `_q3_free_treewidth_order`, `_sum_q3_free_treewidth_dp_scaled_batch`, backend `"treewidth"` | CORE EXACT | yes | main exact q3-free DP | keep one planner/evaluator |
+| neighborhood diversity | `_build_q3_free_neighborhood_plan`, `_evaluate_q3_free_neighborhood_plan_scaled`, backend `"neighborhood"` | CORE EXACT | yes | exact arbitrary-unary root phases over half-phase q2 twin classes; `O(n + t 2^t)` | keep |
+| neighborhood/treewidth composition | `_build_q3_free_neighborhood_treewidth_plan`, `_evaluate_q3_free_neighborhood_treewidth_plan_scaled`, backend `"neighborhood_treewidth"` | CORE EXACT | yes | compresses twin classes, then exact DP exponential in quotient treewidth | keep |
 | generic factor-table fallback | backend `"generic"`, `_evaluate_q3_free_component_plan_scaled`, recursive component fallback | CORE EXACT | yes | label hides many subpaths | keep one generic evaluator |
 | binary-phase quadratic plan | `_build_binary_phase_quadratic_plan`, `_evaluate_binary_phase_quadratic_plan_scaled_batch` | PERF EXACT | yes pending data | tucked inside generic plan | keep only if benchmark win |
 | half-phase unary expansion | `_sum_half_phase_q2_unary_expansion_*` | PERF EXACT | yes pending data | overlaps binary-phase plan/generic fallback | coalesce into q3-free factor evaluator |
@@ -75,19 +72,17 @@ Target: keep compatibility, but later split metadata into:
 | unary arbitrary factors exact | `_sum_q3_free_with_unary_arbitrary_phases_scaled` | CORE EXACT | yes | narrow useful fast path | keep exact path |
 | dense/general factor path sum exact | `solve_arbitrary_exact`, `_sum_with_arbitrary_phases_exact_scaled`, `_sum_factor_tables_scaled`, label `arbitrary_path_sum` | CORE EXACT | yes | exact arbitrary default | keep |
 | cutset arbitrary path sum exact | `_find_arbitrary_factor_cutset_plan`, `_sum_factor_tables_with_cutset_scaled`, label `arbitrary_path_sum_cutset` | PERF EXACT | yes | separate from generic factor table evaluator | keep as exact fallback mode |
-| Bethe/BP approximate | `solve_arbitrary_approx`, `_sum_pairwise_factor_graph_bethe_scaled`, `_sum_factor_graph_bethe_scaled`, labels `arbitrary_bethe_bp`, `arbitrary_factor_bethe_bp` | OPT-IN APPROX | yes, opt-in only | implementation still in `_engine_impl`, facade in `approx.py` | keep isolated from exact wrapper |
-| sparse parity Bethe/BP approximate | `solve_arbitrary_approx`, `_sum_factor_graph_with_sparse_parity_bethe_scaled`, label `arbitrary_sparse_parity_bethe_bp` | OPT-IN APPROX | yes, opt-in only | extra BP variant | keep in `approx.py`; compare to generic BP |
-| BP heuristic ensemble | `_sum_arbitrary_bp_heuristic_ensemble_scaled`, labels `*_heuristic` | OPT-IN APPROX | yes, opt-in only | experimental acceptance heuristics isolated behind opt-in wrapper | keep metadata-gated |
-| invalid BP labels | `*_invalid_scale`, `arbitrary_bethe_bp_invalid`, `arbitrary_bethe_bp_normalized` | COMPAT/OPT-IN APPROX | yes | status encoded in backend string | replace with structured fields later |
 
-## Pauli/Observable Approx Paths
+## Approximate Doubled-Sum Backend
+
+| Family | Current symbols/labels | Class | Keep now | Implementation |
+|---|---|---|---|---|
+| low-difference-weight doubled sum | `sum_doubled_phase`, `sum_coupled_doubled_phase`, `sum_doubled_factor_problem`, `compute_circuit_probability_doubled` | APPROX DYADIC / GENERAL FACTOR | yes | Streams sectors `d = x xor y`; supports Hamming, pair-factor-bound, and correlated general-bound ordering with rigorous omitted-tail certificates. Handles arbitrary local complex/zero factors and auxiliary averaging variables. Full cutoff routes through direct exact reduction when cheap; retained general-factor sectors feed exact native generic factor-table elimination. |
 
 | Family | Current symbols/labels | Class | Keep now | Bloat issue | Direction |
 |---|---|---|---|---|---|
 | exact replay Pauli expectation | `compute_circuit_pauli_expectations`, `_prepare_pauli_expectation_request`, `_build_pauli_expectation_base_state`, state replay | CORE EXACT | yes | now split into named phases; impl still in `_engine_impl` | keep exact facade in `pauli.py` |
 | direct post replay | `_DirectPostReplayTemplate`, `_select_pauli_direct_replay_template`, `_build_direct_post_replay_template` | PERF EXACT | yes pending data | specialized many-observable shortcut | benchmark many-observable cases |
-| Pauli beam approximate | `compute_circuit_pauli_expectations_approx`, `_compute_pauli_beam_approx_fast_path`, `_pauli_beam_approx_pauli_expectations`, label `pauli_beam_approx` | OPT-IN APPROX | yes, opt-in only | moved out of exact facade | exposed in `pauli_approx.py` and `approx.py` |
-| native MPS approximate | `compute_circuit_pauli_expectations_approx`, `_compute_native_mps_approx_pauli_expectations`, `_NativeApproxMPS`, label `native_mps_approx` | OPT-IN APPROX | yes, opt-in only | moved out of exact facade | exposed in `pauli_approx.py` and `approx.py` |
 
 ## Backend Labels To Preserve For Compatibility
 
@@ -103,14 +98,6 @@ Keep these labels stable until a metadata migration lands:
 - `cubic_contraction`
 - `arbitrary_path_sum`
 - `arbitrary_path_sum_cutset`
-- `arbitrary_bethe_bp`
-- `arbitrary_factor_bethe_bp`
-- `arbitrary_sparse_parity_bethe_bp`
-- `arbitrary_bethe_bp_heuristic`
-- `arbitrary_factor_bethe_bp_heuristic`
-- `arbitrary_sparse_parity_bethe_bp_heuristic`
-- `pauli_beam_approx`
-- `native_mps_approx`
 
 Removed/dead labels/functions not worth preserving in public docs:
 - `tensor_contraction`
@@ -127,8 +114,6 @@ Removed/dead labels/functions not worth preserving in public docs:
 2. Cutset exists as regular, one-shot, reusable execution, raw-constraint,
    and arbitrary-factor cutset. Evaluators should converge before deletion.
 3. Phase-3 still keeps removed tensor/hybrid compat stubs for benchmark harness imports.
-4. Approximate arbitrary/Pauli paths now expose `is_approximate`, `approx_backend`,
-   and `approx_validation`; backend-string compatibility remains.
 5. Native adapters are embedded in planner/evaluator code instead of wrapper
    modules.
 6. `mixed` loses branch-level backend detail; good for compatibility, weak for
@@ -157,8 +142,6 @@ Keep behind benchmark gate:
 
 Move/isolate, not delete:
 - arbitrary BP variants
-- Pauli beam approximate now isolated in `pauli_approx.py`
-- native MPS approximate now isolated in `pauli_approx.py`
 - native q3-free/Phase-3 adapters
 
 Delete/unexport candidates:

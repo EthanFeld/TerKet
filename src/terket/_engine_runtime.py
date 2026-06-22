@@ -17,7 +17,6 @@ _sys.modules[f"{__package__}._engine_impl"] = _core
 
 from . import _arbitrary_clusters as _arbitrary_clusters_owner
 from . import _pauli_api as _pauli_api_owner
-from . import _pauli_approx_runtime as _pauli_approx_runtime_owner
 from . import _reduction_support as _reduction_support_owner
 from . import _state_direct as _state_direct_owner
 from . import _state_runtime as _state_runtime_owner
@@ -34,7 +33,6 @@ from ._arbitrary_clusters import _HalfPhaseClusterSpec as _HalfPhaseClusterSpec
 from ._arbitrary_clusters import _HalfPhaseMediatorPlan as _HalfPhaseMediatorPlan
 from ._arbitrary_clusters import _HalfPhaseMediatorSpec as _HalfPhaseMediatorSpec
 from ._reduction_support import _ReductionContext as _ReductionContext
-from ._pauli_approx_runtime import _NativeApproxMPS as _NativeApproxMPS
 from ._pauli_api import _PauliExpectationRequest as _PauliExpectationRequest
 
 
@@ -53,7 +51,6 @@ _OWNER_MODULES = (
     _state_direct_owner,
     _arbitrary_clusters_owner,
     _reduction_support_owner,
-    _pauli_approx_runtime_owner,
     _pauli_api_owner,
 )
 

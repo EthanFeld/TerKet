@@ -19,11 +19,19 @@ from typing import Any, Callable, Literal, Mapping, Sequence, overload
 
 import numpy as np
 
+from .neighborhood import (
+    _sum_q3_free_via_neighborhood_composed_scaled,
+)
+from .approx_tensor import (
+    _clear_q3_free_approx_diagnostics,
+    _get_q3_free_approx_diagnostics,
+    _sum_q3_free_approx_tensor_scaled,
+)
 from ..cubic_arithmetic import CubicFunction, PhaseFunction, detect_factorization
 from .._engine_runtime_core import _bootstrap_extracted_globals, _sync_extracted_globals
 from ..scaling import ScaledAmplitude, ScaledComplex
 from ..spec import CircuitSpec, Gate
-from ..state import BitSequence, CircuitInput, EchelonCache, ExtendedReductionMode, ReducerInfo, ReductionInfo, SolverConfig
+from ..state import BitSequence, CircuitInput, EchelonCache, ExtendedReductionMode, ReducerInfo, ReductionInfo, SolverConfig, _get_solver_config
 
 _LOCAL_NAMES = {
     '_q3_free_series_reduction_core',
@@ -136,15 +144,16 @@ def _q3_free_treewidth_order(q, feedback_size, order_hint=None, max_degree=None)
 
     if order_hint is not None:
         hint_order = list(order_hint)
-        try:
-            width = _cubic_order_width(q, hint_order)
-        except ValueError:
-            width = width_limit + 1
-        if (
-            width <= min(_Q3_FREE_ORDER_HINT_MAX_WIDTH, width_limit)
-            and _q3_free_treewidth_candidate_is_viable(q, hint_order, width, feedback_size)
-        ):
-            return hint_order
+        if q.n <= _Q3_FREE_TREEWIDTH_HEURISTIC_MAX_ORDER_VARS:
+            try:
+                width = _cubic_order_width(q, hint_order)
+            except ValueError:
+                width = width_limit + 1
+            if (
+                width <= min(_Q3_FREE_ORDER_HINT_MAX_WIDTH, width_limit)
+                and _q3_free_treewidth_candidate_is_viable(q, hint_order, width, feedback_size)
+            ):
+                return hint_order
 
     adjacency = None
     degeneracy_lower_bound = None
@@ -196,6 +205,9 @@ def _q3_free_treewidth_order(q, feedback_size, order_hint=None, max_degree=None)
                 ):
                     return lifted_order
 
+    if q.n > _Q3_FREE_TREEWIDTH_HEURISTIC_MAX_ORDER_VARS:
+        return None
+
     if (
         not q.q3
         and q.n >= _Q3_FREE_CHEAP_ORDER_HINT_MIN_VARS
@@ -239,13 +251,14 @@ def _sum_q3_free_component(
     allow_tensor_contraction: bool = True,
 ):
     """Sum a connected q3-free component by exact backends on its q2 graph."""
-    return _scaled_to_complex(
-        _sum_q3_free_component_scaled(
-            q,
-            allow_schur_complement=allow_schur_complement,
-            allow_tensor_contraction=allow_tensor_contraction,
-        )
+    scaled_total = _sum_q3_free_component_scaled(
+        q,
+        allow_schur_complement=allow_schur_complement,
+        allow_tensor_contraction=allow_tensor_contraction,
     )
+    if scaled_total is None:
+        raise RuntimeError("No viable exact q3-free backend for component.")
+    return _scaled_to_complex(scaled_total)
 
 def _iter_q3_free_cheap_order_hints(
     n_vars: int,
@@ -259,7 +272,7 @@ def _iter_q3_free_cheap_order_hints(
     forward = list(range(int(n_vars)))
     reverse = list(range(int(n_vars) - 1, -1, -1))
     hints: list[list[int]] = [forward, reverse]
-    if q is not None:
+    if q is not None and q.n <= _Q3_FREE_TREEWIDTH_HEURISTIC_MAX_ORDER_VARS:
         separator_order = engine._pair_graph_separator_order(q)
         if separator_order is not None:
             order, _width = separator_order
@@ -281,6 +294,16 @@ def _best_cheap_q3_free_order(
     engine = importlib.import_module("terket._engine_impl")
     if _FORCE_ENGINE_BINDINGS_REFRESH:
         _sync_from_engine(engine)
+    if q.n > _Q3_FREE_TREEWIDTH_HEURISTIC_MAX_ORDER_VARS:
+        degrees = [0] * q.n
+        for left, right in q.q2:
+            degrees[int(left)] += 1
+            degrees[int(right)] += 1
+        for i, j, k in q.q3:
+            degrees[int(i)] += 2
+            degrees[int(j)] += 2
+            degrees[int(k)] += 2
+        return tuple(range(q.n)), max(1, max(degrees, default=0) + 1)
     candidate_orders: list[tuple[int, ...]] = []
     if order_hint is not None:
         hint_order = tuple(int(var) for var in order_hint)
@@ -352,6 +375,32 @@ def _sum_q3_free_component_scaled(
         return _make_scaled_complex(_bruteforce_q3_free_sum(q))
     if not q.q2:
         return _product_q1_sum_scaled(q.q1, level=q.level)
+    component_sets = detect_factorization(q)
+    if len(component_sets) > 1:
+        covered = set().union(*component_sets)
+        total = _make_scaled_complex(cmath.exp(2j * cmath.pi * float(q.q0)))
+        if len(covered) < q.n:
+            total = _scale_scaled_complex(total, 2 * (q.n - len(covered)))
+        for component in component_sets:
+            component_total = _sum_q3_free_component_scaled(
+                _component_restriction(q, component),
+                allow_schur_complement=allow_schur_complement,
+                allow_tensor_contraction=allow_tensor_contraction,
+            )
+            if component_total is None:
+                return None
+            total = _mul_scaled_complex(total, component_total)
+        return total
+    neighborhood_total = _sum_q3_free_via_neighborhood_composed_scaled(q)
+    if neighborhood_total is not None:
+        return neighborhood_total
+    if allow_tensor_contraction and _get_solver_config().approx_q3_free_tensor:
+        binary_total = _sum_binary_phase_quadratic_scaled(q)
+        if binary_total is not None:
+            return binary_total
+        approx_total = _sum_q3_free_approx_tensor_scaled(q)
+        if approx_total is not None:
+            return approx_total
     gauss_reduced_total = _sum_q3_free_via_gauss_reduction_scaled(q)
     if gauss_reduced_total is not None:
         return gauss_reduced_total
@@ -402,6 +451,12 @@ def _sum_q3_free_component_scaled(
     cutset_conditioned_total = None if prefer_cutset else _sum_q3_free_via_cutset_conditioning_scaled(q)
     if cutset_conditioned_total is not None:
         return cutset_conditioned_total
+    if allow_tensor_contraction and _get_solver_config().approx_q3_free_tensor:
+        approx_total = _sum_q3_free_approx_tensor_scaled(q)
+        if approx_total is not None:
+            return approx_total
+    if len(feedback_vars) > _Q3_FREE_FEEDBACK_FOREST_MAX_BRANCH_VARS:
+        return None
 
     fixed_pos = {var: idx for idx, var in enumerate(feedback_vars)}
     free_vars = [var for var in range(q.n) if var not in fixed_pos]
@@ -435,6 +490,7 @@ def _sum_q3_free_component_scaled(
         free_adjacency[b][a] = phase
 
     forest_memo = {}
+    forest_components = _forest_postorder_components(free_adjacency)
     total = _ZERO_SCALED
     omega_scaled = _omega_scaled_table(q.level)
     for mask in range(1 << len(feedback_vars)):
@@ -454,7 +510,12 @@ def _sum_q3_free_component_scaled(
         key = tuple(q1_shifted)
         forest_total = forest_memo.get(key)
         if forest_total is None:
-            forest_total = _forest_transfer_sum_scaled(q1_shifted, free_adjacency, level=q.level)
+            forest_total = _forest_transfer_sum_scaled(
+                q1_shifted,
+                free_adjacency,
+                level=q.level,
+                components=forest_components,
+            )
             forest_memo[key] = forest_total
         total = _add_scaled_complex(
             total,
@@ -473,6 +534,14 @@ def _gauss_sum_q3_free(q, *, allow_tensor_contraction: bool = True):
 def _gauss_sum_q3_free_scaled(q, *, allow_tensor_contraction: bool = True):
     """Scaled-complex companion to ``_gauss_sum_q3_free``."""
     assert not q.q3, "This function requires a q3-free kernel."
+    _clear_q3_free_approx_diagnostics()
+
+    neighborhood_total = _sum_q3_free_via_neighborhood_composed_scaled(q)
+    if neighborhood_total is not None:
+        return neighborhood_total, {
+            'phase_states': 0,
+            'phase_splits': 0,
+        }
 
     optimized_q, _changed = _optimize_q3_free_phase(
         q,
@@ -482,10 +551,15 @@ def _gauss_sum_q3_free_scaled(q, *, allow_tensor_contraction: bool = True):
         q=optimized_q,
         allow_tensor_contraction=allow_tensor_contraction,
     )
-    return _evaluate_q3_free_execution_plan_scaled(execution_plan), {
+    total = _evaluate_q3_free_execution_plan_scaled(execution_plan)
+    phase_info = {
         'phase_states': 0,
         'phase_splits': 0,
     }
+    approx_info = _get_q3_free_approx_diagnostics()
+    if approx_info is not None:
+        phase_info.update(approx_info)
+    return total, phase_info
 
 def _fix_variables(q, fixed_vars, fixed_values, context=None):
     """Fix multiple variables at once and restrict to the remaining free ones."""

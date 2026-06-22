@@ -21,6 +21,10 @@ import numpy as np
 
 from .cubic_arithmetic import CubicFunction, PhaseFunction, detect_factorization
 from ._engine_runtime_core import _bootstrap_extracted_globals, _sync_extracted_globals
+from ._reduction_high_precision import (
+    _apply_safe_high_precision_eliminations,
+    _elim_decoupled_constraints_batch,
+)
 from .scaling import ScaledAmplitude, ScaledComplex
 from .spec import CircuitSpec, Gate
 from .state import BitSequence, CircuitInput, EchelonCache, ExtendedReductionMode, ReducerInfo, ReductionInfo, SolverConfig
@@ -36,6 +40,7 @@ _LOCAL_NAMES = {
     '_pauli_string_gates',
     '_validate_pauli_observables',
     '_elim_decoupled_constraints_batch',
+    '_apply_safe_high_precision_eliminations',
     '_apply_exact_eliminations',
     '_product_q1_sum',
     '_product_q1_sum_scaled'
@@ -204,12 +209,39 @@ def _reduce_and_sum_scaled(q, context=None):
 
     allow_tensor_contraction = context.allow_tensor_contraction
 
-    # Above Clifford+T precision, exact parity substitutions can leave the
-    # current cubic representation, so solve q3-free kernels directly.
-    if q.level > 3 and not q.q3:
-        total, info = _sum_q3_free_exact_scaled(q, context=context)
+    # Level-1 phases do not satisfy the Clifford+T single-variable
+    # elimination identities. Generic factor elimination remains exact.
+    if q.level == 1:
+        total, info = _sum_irreducible_cubic_core(
+            q,
+            context=context,
+            allow_tensor_contraction=allow_tensor_contraction,
+        )
         context.reduce_cache[cache_key] = (total, dict(info))
         return total, info
+
+    # Above Clifford+T precision, general parity/Gauss substitutions can leave
+    # cubic form. First apply the safe low-arity subset, then use generic exact
+    # backends for the residual.
+    if q.level > 3:
+        reduced_q, scale_half_pow2, exact_info = _apply_safe_high_precision_eliminations(q)
+        if reduced_q is None:
+            total = _make_scaled_complex(0j)
+            info = _make_reducer_info(constraint=exact_info['constraint'])
+            context.reduce_cache[cache_key] = (total, dict(info))
+            return total, info
+        if reduced_q.q3:
+            total, info = _sum_irreducible_cubic_core(
+                reduced_q,
+                context=context,
+                allow_tensor_contraction=allow_tensor_contraction,
+            )
+        else:
+            total, info = _sum_q3_free_exact_scaled(reduced_q, context=context)
+        result = _scale_scaled_complex(total, scale_half_pow2)
+        info = _offset_reducer_info(info, constraint=exact_info['constraint'])
+        context.reduce_cache[cache_key] = (result, dict(info))
+        return result, info
 
     pre_exact_phase3 = _pre_exact_phase3_treewidth_escape(
         q,
@@ -720,6 +752,8 @@ def _apply_exact_eliminations(q, context=None):
         decoupled_constraints = []
         classification_data = _build_classification_data(q)
         prefer_cheap_actions = q.n >= _EXACT_ELIM_CHEAP_ACTION_MIN_VARS
+        can_batch_sparse_quadratics = int(q.level) == 3 and not q.q3
+        sparse_quadratics = []
         chosen_action = None
         chosen_quadratic = None
         chosen_parity = None
@@ -756,7 +790,9 @@ def _apply_exact_eliminations(q, context=None):
                     chosen_action = (tag, var, entry)
                 if chosen_quadratic is None:
                     chosen_quadratic = (tag, var, entry)
-                if not prefer_cheap_actions:
+                if can_batch_sparse_quadratics:
+                    sparse_quadratics.append(var)
+                elif not prefer_cheap_actions:
                     break
 
         if decoupled_constraints:
@@ -765,6 +801,18 @@ def _apply_exact_eliminations(q, context=None):
             nc += len(decoupled_constraints)
             changed = True
             continue
+
+        if len(sparse_quadratics) >= 8:
+            q, half_pow2, removed = _elim_sparse_dead_quadratics_batch(
+                q,
+                sparse_quadratics,
+                classification_data=classification_data,
+            )
+            if removed:
+                scale_half_pow2 += half_pow2
+                nq += len(removed)
+                changed = True
+                continue
 
         if prefer_cheap_actions:
             chosen_action = chosen_quadratic if chosen_quadratic is not None else chosen_parity

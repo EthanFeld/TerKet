@@ -18,6 +18,10 @@ from typing import Any, Callable, Literal, Mapping, Sequence, overload
 import numpy as np
 
 from .batch import _compact_index_storage_array, _compact_residue_storage_array
+from .neighborhood import (
+    _build_q3_free_neighborhood_plan,
+    _build_q3_free_neighborhood_treewidth_plan,
+)
 from ..cubic_arithmetic import CubicFunction, PhaseFunction, detect_factorization
 from .._engine_runtime_core import _bootstrap_extracted_globals, _sync_extracted_globals
 from ..scaling import ScaledAmplitude, ScaledComplex
@@ -243,6 +247,42 @@ def _plan_q3_free_constraint_components(
         variables = tuple(sorted(component))
         stored_variables = _compact_index_storage_array(variables, upper_bound=base_q.n)
         component_q = _component_restriction(base_q, variables)
+        neighborhood_plan = _build_q3_free_neighborhood_plan(component_q)
+        neighborhood_treewidth_plan = _build_q3_free_neighborhood_treewidth_plan(component_q)
+        if (
+            neighborhood_treewidth_plan is not None
+            and (
+                neighborhood_plan is None
+                or neighborhood_treewidth_plan.estimated_work < neighborhood_plan.estimated_work
+            )
+        ):
+            component_plans.append(
+                _Q3FreeConstraintComponentPlan(
+                    variables=stored_variables,
+                    level=component_q.level,
+                    q2=component_q.q2,
+                    backend="neighborhood_treewidth",
+                    neighborhood_treewidth_plan=neighborhood_treewidth_plan,
+                    quadratic_tensor_q2=_is_half_phase_q2(component_q),
+                    lambda_offset=lambda_offset,
+                    prefer_reusable_decomposition=prefer_reusable_decomposition,
+                )
+            )
+            continue
+        if neighborhood_plan is not None:
+            component_plans.append(
+                _Q3FreeConstraintComponentPlan(
+                    variables=stored_variables,
+                    level=component_q.level,
+                    q2=component_q.q2,
+                    backend="neighborhood",
+                    neighborhood_plan=neighborhood_plan,
+                    quadratic_tensor_q2=_is_half_phase_q2(component_q),
+                    lambda_offset=lambda_offset,
+                    prefer_reusable_decomposition=prefer_reusable_decomposition,
+                )
+            )
+            continue
         lambda_count = sum(1 for var in variables if var >= lambda_offset)
         adjacency, edges = _q3_free_graph(component_q)
         max_degree = max((len(neighbors) for neighbors in adjacency), default=0)
@@ -307,17 +347,35 @@ def _plan_q3_free_constraint_components(
                     )
                 )
                 continue
+            precomputed_total = _sum_q3_free_component_scaled(
+                component_q,
+                allow_tensor_contraction=allow_tensor_contraction,
+            )
+            if precomputed_total is not None:
+                component_plans.append(
+                    _Q3FreeConstraintComponentPlan(
+                        variables=stored_variables,
+                        level=component_q.level,
+                        q2=component_q.q2,
+                        backend="constant",
+                        precomputed_total=precomputed_total,
+                        mediator_plan=_build_half_phase_mediator_plan(component_q),
+                        quadratic_tensor_q2=_is_half_phase_q2(component_q),
+                        lambda_offset=lambda_offset,
+                    )
+                )
+                continue
             component_plans.append(
                 _Q3FreeConstraintComponentPlan(
                     variables=stored_variables,
                     level=component_q.level,
                     q2=component_q.q2,
-                    backend="constant",
-                    precomputed_total=_sum_q3_free_component_scaled(
-                        component_q,
-                        allow_tensor_contraction=allow_tensor_contraction,
-                    ),
+                    backend="generic",
+                    dense_q2=_dense_q2_matrix(component_q),
                     mediator_plan=_build_half_phase_mediator_plan(component_q),
+                    generic_mediator_plan=_build_generic_q2_mediator_plan(component_q),
+                    skip_dense_schur=not _supports_exact_dense_schur(component_q),
+                    direct_schur_ok=_supports_exact_dense_schur(component_q),
                     quadratic_tensor_q2=_is_half_phase_q2(component_q),
                     lambda_offset=lambda_offset,
                 )

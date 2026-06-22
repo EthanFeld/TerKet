@@ -78,6 +78,12 @@ This stage:
 
 The result is one small gate language and one exact phase convention for the engine.
 
+For explicitly approximate workloads, `snap_arbitrary_angles(...)` maps
+`rz_arbitrary` and `pauli_expbox` angles to the nearest requested dyadic level.
+It records phase count plus maximum/total angle error in circuit metadata and
+can reject snaps above per-angle `max_error` or cumulative `max_total_error`.
+Exact simulation remains the default.
+
 ## 2. Schur-State Compilation
 
 `build_state(...)` walks the normalized gate list and updates a `SchurState`.
@@ -449,6 +455,35 @@ How it works:
 - keep exact intermediate factor tables
 
 The effective width controls the cost.
+
+## 4a. `neighborhood`
+
+Used when:
+
+- every q2 edge is a half-phase/sign coupling
+- the pair graph has at most a bounded number `t` of twin classes
+
+How it works:
+
+- compress each clique or independent twin class into even/odd population sums
+- retain arbitrary root-of-unity unary phases exactly inside each class
+- enumerate only the `2^t` class parities
+
+Plan construction is polynomial; evaluation is `O(n + t 2^t)`. This catches
+dense low-rank families such as complete graphs with arbitrary dyadic unary
+phases, where treewidth is large.
+
+## 4b. `neighborhood_treewidth`
+
+This hybrid backend first compresses each true/false twin class to one parity
+variable, then runs exact factor-table treewidth DP on the quotient graph.
+Arbitrary dyadic/root-of-unity unary phases become two-entry even/odd class
+factors, while sign couplings become quotient edges.
+
+Runtime is polynomial in the original variable count and exponential in
+quotient treewidth, rather than in the number of twin classes. The planner
+compares its work estimate against full neighborhood enumeration and chooses
+the cheaper plan.
 
 ### Native treewidth support
 

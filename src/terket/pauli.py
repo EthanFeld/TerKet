@@ -9,24 +9,14 @@ from ._pauli_api import (
     compute_circuit_pauli_expectations,
 )
 from ._pauli_support import (
-    _pauli_code,
     _pauli_expbox_dyadic_snap_level,
-    _pauli_masks_from_sparse,
-    _pauli_masks_from_string,
-    _pauli_product_phase,
-    _pauli_product_phase_left_parts,
     apply_pauli_expbox_to_state,
 )
 from ._reduction_runtime import _pauli_string_gates, _validate_pauli_observables
 
 __all__ = [
     "_build_pauli_expectation_base_state",
-    "_pauli_code",
     "_pauli_expbox_dyadic_snap_level",
-    "_pauli_masks_from_sparse",
-    "_pauli_masks_from_string",
-    "_pauli_product_phase",
-    "_pauli_product_phase_left_parts",
     "_pauli_string_gates",
     "_prepare_pauli_expectation_request",
     "_select_pauli_direct_replay_template",

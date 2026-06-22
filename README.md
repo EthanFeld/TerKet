@@ -5,6 +5,7 @@ TerKet is exact strong-simulation toolkit for Clifford+T-style quantum circuits.
 ## What It Does
 
 - Computes exact amplitudes of circuits
+- Estimates output probabilities with a low-difference-weight doubled-sum backend
 
 ## Install
 
@@ -62,6 +63,9 @@ Main entrypoints:
 
 - `compute_circuit_amplitude(...)`
 - `compute_circuit_amplitude_scaled(...)`
+- `compute_circuit_probability_doubled(...)`
+- `DoubledFactorProblem(...)`
+- `sum_doubled_factor_problem(...)`
 - `analyze_circuit(...)`
 - `analyze_amplitudes(...)`
 - `make_circuit(...)`
@@ -114,6 +118,8 @@ Interactive walkthrough: [notebooks/terket_demo.ipynb](TerKet/notebooks/terket_d
 ## Design
 
 High-level design and solver pipeline: [docs/design.md](TerKet/docs/design.md)
+
+Doubled-sum approximation and coupled-contour API: [docs/doubled_sum_backend.md](TerKet/docs/doubled_sum_backend.md)
 
 ## Maintenance
 

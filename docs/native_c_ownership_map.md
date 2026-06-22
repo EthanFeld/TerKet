@@ -36,7 +36,7 @@ Native C is optional acceleration. Python remains source of truth for behavior.
    - Keeps direct q1/q2/q3 residue evaluation separate from elimination/build code.
 
 6. `src/terket/native_constraint_elim.c`
-   - Owns single/two-partner constraint elimination kernels.
+   - Owns single/two-partner constraint and sparse quadratic batch elimination kernels.
    - Owns shared packed-dict algebra helpers through `native_algebra_helpers.inc`.
 
 7. `src/terket/native_affine_compose.c`

@@ -17,6 +17,10 @@ from typing import Any, Callable, Literal, Mapping, Sequence, overload
 
 import numpy as np
 
+from .neighborhood import (
+    _build_q3_free_neighborhood_plan,
+    _build_q3_free_neighborhood_treewidth_plan,
+)
 from .batch import _compact_index_storage_array, _compact_residue_storage_array
 from ..cubic_arithmetic import CubicFunction, PhaseFunction, detect_factorization
 from .._engine_runtime_core import _bootstrap_extracted_globals, _sync_extracted_globals
@@ -164,6 +168,8 @@ def _restrict_q3_free_component_plan(
         q2=q2,
         q3={},
     )
+    neighborhood_plan = _build_q3_free_neighborhood_plan(restricted_q)
+    neighborhood_treewidth_plan = _build_q3_free_neighborhood_treewidth_plan(restricted_q)
     if component_plan.binary_phase_plan is not None:
         binary_phase_plan = _build_binary_phase_quadratic_plan(restricted_q)
         mediator_plan = _build_half_phase_mediator_plan(restricted_q)
@@ -182,6 +188,18 @@ def _restrict_q3_free_component_plan(
     native_treewidth_plan = None
 
     backend = component_plan.backend
+    if (
+        neighborhood_treewidth_plan is not None
+        and (
+            neighborhood_plan is None
+            or neighborhood_treewidth_plan.estimated_work < neighborhood_plan.estimated_work
+        )
+    ):
+        backend = "neighborhood_treewidth"
+    elif neighborhood_plan is not None:
+        backend = "neighborhood"
+    elif backend in {"neighborhood", "neighborhood_treewidth"}:
+        backend = "generic"
     direct_schur_ok = component_plan.direct_schur_ok
     dense_schur_ok = _supports_exact_dense_schur(restricted_q)
     if backend == "generic" and len(variables) > 1 and q2:
@@ -296,6 +314,8 @@ def _restrict_q3_free_component_plan(
         order=_compact_index_storage_array(order, upper_bound=len(variables)),
         dense_q2=dense_q2,
         binary_phase_plan=binary_phase_plan,
+        neighborhood_plan=neighborhood_plan,
+        neighborhood_treewidth_plan=neighborhood_treewidth_plan,
         mediator_plan=mediator_plan,
         generic_mediator_plan=generic_mediator_plan,
         cluster_plan=cluster_plan,

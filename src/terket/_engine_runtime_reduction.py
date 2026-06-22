@@ -48,6 +48,11 @@ _bind_extracted_forwarders(
 
 _bind_extracted_forwarders("_reduction_elim", "_aff_compose_python", "_aff_compose", "_info")
 
+_bind_extracted_forwarders(
+    "_reduction_runtime",
+    "_apply_safe_high_precision_eliminations",
+)
+
 # ==================================================================
 # Public API
 # ==================================================================

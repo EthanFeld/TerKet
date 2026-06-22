@@ -34,14 +34,20 @@ Use `import terket` for normal callers:
 - `from_qiskit`
 - `compute_circuit_amplitude`
 - `compute_circuit_amplitude_scaled`
+- `compute_circuit_probability_doubled`
+- `compute_circuit_pauli_expectation_probabilities_doubled`
+  - estimates squared Pauli expectations through observable-aware state replay;
+    it does not preserve expectation sign.
+- `DoubledFactorProblem`
 - `compute_amplitude`
 - `compute_amplitude_scaled`
 - `compute_amplitudes`
 - `analyze_circuit`
 - `analyze_amplitudes`
 - `compute_circuit_pauli_expectations`
-- `compute_circuit_pauli_expectations_approx`
 - `reduce_and_sum`
+- `sum_doubled_phase`
+- `sum_doubled_factor_problem`
 - `cache_stats`
 - `clear_caches`
 - bit-string helpers
@@ -79,9 +85,8 @@ These group private helpers by domain. They are not the public API:
 - `terket.phase3`
 - `terket.q3free`
 - `terket.arbitrary`
-- `terket.approx`
+- `terket.doubled`
 - `terket.pauli`
-- `terket.pauli_approx`
 - `terket.phase_function`
 - `terket.reduction`
 - `terket.scaling`

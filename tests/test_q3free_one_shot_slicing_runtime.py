@@ -22,6 +22,60 @@ from terket.cubic_arithmetic import PhaseFunction
 
 class Q3FreeOneShotSlicingRuntimeTests(unittest.TestCase):
 
+    def test_forest_transfer_batch_matches_scalar_rows(self):
+        adjacency = [
+            {1: 1},
+            {0: 1, 2: 3},
+            {1: 3, 3: 5},
+            {2: 5},
+        ]
+        q1_batch = np.asarray(
+            [
+                [0, 1, 2, 3],
+                [4, 5, 6, 7],
+                [7, 0, 3, 1],
+            ],
+            dtype=np.int64,
+        )
+
+        batch_totals = engine._forest_transfer_sum_scaled_batch(q1_batch, adjacency, level=4)
+        scalar_totals = [
+            engine._forest_transfer_sum_scaled(row.tolist(), adjacency, level=4)
+            for row in q1_batch
+        ]
+
+        self.assertEqual(batch_totals, scalar_totals)
+
+    def test_disconnected_q3_free_component_collapses_subcomponents(self):
+        q = PhaseFunction(
+            12,
+            level=4,
+            q1=[1, 2, 3, 4, 5, 6, 0, 0, 0, 0, 0, 0],
+            q2={
+                (0, 1): 3,
+                (1, 2): 5,
+                (3, 4): 8,
+                (4, 5): 8,
+            },
+            q3={},
+        )
+        left = PhaseFunction(3, level=4, q1=[1, 2, 3], q2={(0, 1): 3, (1, 2): 5})
+        right = PhaseFunction(3, level=4, q1=[4, 5, 6], q2={(0, 1): 8, (1, 2): 8})
+        expected = engine._scale_scaled_complex(
+            engine._mul_scaled_complex(
+                engine._sum_q3_free_component_scaled(left),
+                engine._sum_q3_free_component_scaled(right),
+            ),
+            12,
+        )
+
+        total = engine._sum_q3_free_component_scaled(q)
+
+        self.assertAlmostEqual(
+            engine._scaled_to_complex(total),
+            engine._scaled_to_complex(expected),
+        )
+
     def test_sum_q3_free_component_scaled_prefers_block_cut_tree_route_early(self):
         q = PhaseFunction(
             9,

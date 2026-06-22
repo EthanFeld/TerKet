@@ -363,7 +363,7 @@ def _forest_postorder_components(adjacency) -> tuple[tuple[int, tuple[tuple[int,
         components.append((root, tuple(postorder)))
     return tuple(components)
 
-def _forest_transfer_sum_scaled(q1, adjacency, level: int = 3):
+def _forest_transfer_sum_scaled(q1, adjacency, level: int = 3, components=None):
     """Scaled-complex companion to ``_forest_transfer_sum`` for tiny amplitudes."""
     n = len(q1)
     if n == 0:
@@ -377,7 +377,9 @@ def _forest_transfer_sum_scaled(q1, adjacency, level: int = 3):
     base = [_ZERO_SCALED] * n
     excited = [_ZERO_SCALED] * n
 
-    for root, postorder in _forest_postorder_components(adjacency):
+    if components is None:
+        components = _forest_postorder_components(adjacency)
+    for root, postorder in components:
         for node, parent in postorder:
             off_term = _ONE_SCALED
             on_term = omega_scaled[q1[node] % modulus]
@@ -407,6 +409,7 @@ def _forest_transfer_sum_scaled_batch(
     adjacency,
     *,
     level: int = 3,
+    components=None,
 ) -> list[ScaledComplex]:
     """Batch scaled transfer over one shared q2-forest."""
     if len(q1_batch) == 0:
@@ -422,74 +425,11 @@ def _forest_transfer_sum_scaled_batch(
             for row in batch
         ]
 
-    omega_scaled = _omega_scaled_table(level)
-    omega_values, omega_exponents = _scaled_table_to_arrays(omega_scaled)
-    modulus = 1 << level
-    total_values, total_exponents = _scaled_arrays_from_constant(_ONE_SCALED, (len(batch),))
-    base_values, base_exponents = _scaled_arrays_from_constant(_ZERO_SCALED, (len(batch), n))
-    excited_values, excited_exponents = _scaled_arrays_from_constant(_ZERO_SCALED, (len(batch), n))
-
-    for root, postorder in _forest_postorder_components(adjacency):
-        for node, parent in postorder:
-            off_values, off_exponents = _scaled_arrays_from_constant(_ONE_SCALED, (len(batch),))
-            residues = np.remainder(batch[:, node], modulus)
-            on_values = omega_values[residues]
-            on_exponents = omega_exponents[residues]
-            for child, shift in adjacency[node].items():
-                if child == parent:
-                    continue
-                child_total_values, child_total_exponents = _add_scaled_complex_arrays(
-                    base_values[:, child],
-                    base_exponents[:, child],
-                    excited_values[:, child],
-                    excited_exponents[:, child],
-                )
-                off_values, off_exponents = _mul_scaled_complex_arrays(
-                    off_values,
-                    off_exponents,
-                    child_total_values,
-                    child_total_exponents,
-                )
-
-                shifted_excited_values, shifted_excited_exponents = _mul_scaled_complex_arrays(
-                    omega_values[np.full(len(batch), shift % modulus, dtype=np.int64)],
-                    omega_exponents[np.full(len(batch), shift % modulus, dtype=np.int64)],
-                    excited_values[:, child],
-                    excited_exponents[:, child],
-                )
-                on_child_values, on_child_exponents = _add_scaled_complex_arrays(
-                    base_values[:, child],
-                    base_exponents[:, child],
-                    shifted_excited_values,
-                    shifted_excited_exponents,
-                )
-                on_values, on_exponents = _mul_scaled_complex_arrays(
-                    on_values,
-                    on_exponents,
-                    on_child_values,
-                    on_child_exponents,
-                )
-            base_values[:, node] = off_values
-            base_exponents[:, node] = off_exponents
-            excited_values[:, node] = on_values
-            excited_exponents[:, node] = on_exponents
-
-        component_values, component_exponents = _add_scaled_complex_arrays(
-            base_values[:, root],
-            base_exponents[:, root],
-            excited_values[:, root],
-            excited_exponents[:, root],
-        )
-        total_values, total_exponents = _mul_scaled_complex_arrays(
-            total_values,
-            total_exponents,
-            component_values,
-            component_exponents,
-        )
-
+    if components is None:
+        components = _forest_postorder_components(adjacency)
     return [
-        (complex(value), int(half_pow2_exp))
-        for value, half_pow2_exp in zip(total_values, total_exponents)
+        _forest_transfer_sum_scaled(row.tolist(), adjacency, level=level, components=components)
+        for row in batch
     ]
 
 def _dense_q2_matrix(q):
@@ -644,6 +584,8 @@ def _schur_complement_q3_free_sum_scaled_dense(
                 residual_phase,
                 allow_schur_complement=False,
             )
+            if residual_total is None:
+                return None
             constant = _scale_scaled_complex(
                 _make_scaled_complex(cmath.exp(2j * cmath.pi * float(q0))),
                 scale_half_pow2,

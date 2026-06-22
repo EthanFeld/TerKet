@@ -124,8 +124,7 @@ class NativeRZArbitraryTests(unittest.TestCase):
         actual, width, backend, metadata = engine._sum_with_arbitrary_phases_scaled(q, terms)
         self.assertLessEqual(width, 3)
         self.assertEqual(backend, "arbitrary_path_sum")
-        self.assertIs(metadata["is_approximate"], False)
-        self.assertEqual(metadata["approx_validation"], "exact")
+        self.assertEqual(metadata, {})
         actual_complex = engine._scaled_to_complex(actual)
         self.assertAlmostEqual(actual_complex.real, expected.real, places=12)
         self.assertAlmostEqual(actual_complex.imag, expected.imag, places=12)
@@ -228,86 +227,7 @@ class NativeRZArbitraryTests(unittest.TestCase):
             expected += weight
         self.assertAlmostEqual(abs(engine._scaled_to_complex(actual) - expected), 0.0, places=12)
 
-    def test_arbitrary_bethe_bp_is_exact_on_pairwise_tree(self):
-        q = PhaseFunction(
-            4,
-            level=3,
-            q1=[1, 2, 0, 3],
-            q2={(0, 1): 1, (1, 2): 2, (1, 3): 1},
-            q3={},
-        )
-        terms = (
-            engine._ArbitraryPhaseTerm(1 << 0, 0, math.pi / 7.0),
-            engine._ArbitraryPhaseTerm(1 << 3, 1, -0.25),
-        )
-        scalar, factors = engine._build_cubic_factors_scaled(q)
-        scalar = engine._mul_scaled_complex(
-            scalar,
-            engine._add_arbitrary_phase_factors_scaled(factors, terms),
-        )
-
-        actual, _width = engine._sum_pairwise_factor_graph_bethe_scaled(q.n, factors, scalar=scalar)
-
-        expected = 0j
-        for assignment in range(1 << q.n):
-            bits = tuple((assignment >> idx) & 1 for idx in range(q.n))
-            weight = cmath.exp(2j * math.pi * float(q.evaluate(bits)))
-            for term in terms:
-                if ((int(term.row_mask) & assignment).bit_count() & 1) ^ int(term.offset):
-                    weight *= cmath.exp(1j * float(term.angle))
-            expected += weight
-        self.assertAlmostEqual(abs(engine._scaled_to_complex(actual) - expected), 0.0, places=9)
-
-    def test_arbitrary_factor_bethe_bp_converges_on_factor_tree(self):
-        def table(scope_size: int, offset: float):
-            return [
-                engine._make_scaled_complex(cmath.exp(1j * (offset + 0.17 * assignment)))
-                for assignment in range(1 << scope_size)
-            ]
-
-        n_vars = 6
-        factors = {
-            (0, 1, 2): table(3, 0.11),
-            (2, 3, 4): table(3, -0.23),
-            (4, 5): table(2, 0.41),
-        }
-        scalar = engine._make_scaled_complex(0.7 + 0.2j)
-        actual, _width = engine._sum_factor_graph_bethe_scaled(n_vars, factors, scalar=scalar)
-
-        expected = 0j
-        for assignment in range(1 << n_vars):
-            weight = engine._scaled_to_complex(scalar)
-            for scope, factor_table in factors.items():
-                factor_assignment = 0
-                for pos, var in enumerate(scope):
-                    factor_assignment |= ((assignment >> var) & 1) << pos
-                weight *= engine._scaled_to_complex(factor_table[factor_assignment])
-            expected += weight
-
-        self.assertAlmostEqual(abs(engine._scaled_to_complex(actual) - expected), 0.0, places=10)
-
-    def test_sparse_parity_bethe_handles_wide_arbitrary_factor_without_dense_table(self):
-        n_vars = 9
-        q = PhaseFunction(n_vars, level=3, q1=[0] * n_vars, q2={}, q3={})
-        term = engine._ArbitraryPhaseTerm((1 << n_vars) - 1, 0, math.pi / 7.0)
-
-        with mock.patch.object(engine, "_MAX_ARBITRARY_PHASE_FACTOR_SCOPE", 8):
-            actual, width, backend, _metadata = engine._sum_with_arbitrary_phases_scaled(
-                q,
-                (term,),
-                allow_approximate=True,
-            )
-
-        phase = cmath.exp(1j * float(term.angle))
-        expected = (1 << (n_vars - 1)) * (1.0 + phase)
-        self.assertEqual(width, n_vars)
-        self.assertEqual(backend, "arbitrary_sparse_parity_bethe_bp")
-        self.assertIs(_metadata["is_approximate"], True)
-        self.assertEqual(_metadata["approx_backend"], backend)
-        self.assertEqual(_metadata["approx_validation"], "factor_graph_forest_exact")
-        self.assertAlmostEqual(abs(engine._scaled_to_complex(actual) - expected), 0.0, places=9)
-
-    def test_solve_arbitrary_exact_never_calls_bp_fallback(self):
+    def test_solve_arbitrary_exact_rejects_over_limit_without_cutset(self):
         q = PhaseFunction(
             3,
             level=3,
@@ -329,151 +249,9 @@ class NativeRZArbitraryTests(unittest.TestCase):
             engine,
             "_find_arbitrary_factor_cutset_plan",
             return_value=None,
-        ), mock.patch.object(
-            engine,
-            "_sum_pairwise_factor_graph_bethe_scaled",
-            side_effect=AssertionError("exact path must not call BP"),
         ):
             with self.assertRaisesRegex(RuntimeError, "Cannot compute amplitude directly"):
                 engine.solve_arbitrary_exact(q, terms)
-
-    def test_arbitrary_bethe_bp_heuristic_accepts_stable_loopy_ensemble(self):
-        q = PhaseFunction(
-            3,
-            level=3,
-            q1=[0, 0, 0],
-            q2={(0, 1): 1, (1, 2): 1, (0, 2): 1},
-            q3={},
-        )
-        terms = (engine._ArbitraryPhaseTerm(1 << 0, 0, math.pi / 7.0),)
-
-        def stable_bp(*_args, **kwargs):
-            self.assertFalse(kwargs["require_forest"])
-            return engine._make_scaled_complex(0.25 + 0.0j), 3
-
-        with mock.patch.object(
-            engine,
-            "_factor_scope_order",
-            return_value=([0, 1, 2], 99),
-        ), mock.patch.object(
-            engine,
-            "_estimate_factor_table_dp_cost",
-            return_value=(engine._MAX_ARBITRARY_PATH_SUM_WORK + 1, 1 << 20),
-        ), mock.patch.object(
-            engine,
-            "_sum_pairwise_factor_graph_bethe_scaled",
-            side_effect=stable_bp,
-        ):
-            actual, width, backend, metadata = engine._sum_with_arbitrary_phases_scaled(
-                q,
-                terms,
-                allow_approximate=True,
-            )
-
-        self.assertEqual(width, 3)
-        self.assertEqual(backend, "arbitrary_bethe_bp_heuristic")
-        self.assertIs(metadata["is_approximate"], True)
-        self.assertEqual(metadata["approx_backend"], backend)
-        self.assertEqual(metadata["approx_validation"], "loopy_ensemble_thresholds")
-        self.assertEqual(metadata["bp_heuristic_ensemble_size"], len(engine._ARBITRARY_BP_HEURISTIC_SCHEDULES))
-        self.assertAlmostEqual(abs(engine._scaled_to_complex(actual) - 0.25), 0.0, places=12)
-
-    def test_arbitrary_bethe_bp_heuristic_rejects_unstable_loopy_ensemble(self):
-        q = PhaseFunction(
-            3,
-            level=3,
-            q1=[0, 0, 0],
-            q2={(0, 1): 1, (1, 2): 1, (0, 2): 1},
-            q3={},
-        )
-        terms = (engine._ArbitraryPhaseTerm(1 << 0, 0, math.pi / 7.0),)
-        values = iter((
-            engine._make_scaled_complex(0.25 + 0.0j),
-            engine._make_scaled_complex(0.001 + 0.0j),
-            engine._make_scaled_complex(0.25j),
-        ))
-
-        with mock.patch.object(
-            engine,
-            "_factor_scope_order",
-            return_value=([0, 1, 2], 99),
-        ), mock.patch.object(
-            engine,
-            "_estimate_factor_table_dp_cost",
-            return_value=(engine._MAX_ARBITRARY_PATH_SUM_WORK + 1, 1 << 20),
-        ), mock.patch.object(
-            engine,
-            "_sum_pairwise_factor_graph_bethe_scaled",
-            side_effect=lambda *_args, **_kwargs: (next(values), 3),
-        ):
-            with self.assertRaisesRegex(RuntimeError, "Cannot compute amplitude directly"):
-                engine._sum_with_arbitrary_phases_scaled(q, terms, allow_approximate=True)
-
-    def test_arbitrary_bp_direct_amplitude_rejects_impossible_scale(self):
-        info = engine._info(1, 0, 0, 0, 1, phase3_backend="arbitrary_bethe_bp")
-
-        with self.assertRaisesRegex(RuntimeError, "implied output probability"):
-            engine._raise_if_invalid_arbitrary_bp_amplitude(info, (1.0 + 0.0j, 20))
-
-    def test_analyze_arbitrary_bp_marks_invalid_scale_without_raising(self):
-        spec = make_circuit(1, [("h", 0), ("rz_arbitrary", 0, 0.37), ("h", 0)])
-
-        def fake_sum(_q, _terms, *, allow_approximate=False, **_kwargs):
-            return (1.0 + 0.0j, 20), 1, "arbitrary_bethe_bp", {}
-
-        with mock.patch.object(engine, "_sum_with_arbitrary_phases_scaled", side_effect=fake_sum):
-            [info] = engine.analyze_amplitudes(
-                spec,
-                [0],
-                [[0]],
-                allow_tensor_contraction=True,
-                solver_config=engine.SolverConfig(allow_approximate=True),
-            )
-
-        self.assertEqual(info["phase3_backend"], "arbitrary_bethe_bp_invalid_scale")
-        self.assertEqual(info["bp_invalid_reason"], "implied_probability_exceeds_one")
-        self.assertGreater(info["bp_log2_probability"], 0.0)
-
-    def test_invalid_bp_public_amplitude_rejects_instead_of_retrying(self):
-        spec = make_circuit(1, [("h", 0), ("rz_arbitrary", 0, 0.37), ("h", 0)])
-
-        def fake_sum(_q, _terms, *, allow_approximate=False, **_kwargs):
-            return (1.0 + 0.0j, 20), 1, "arbitrary_bethe_bp", {}
-
-        with mock.patch.object(engine, "_sum_with_arbitrary_phases_scaled", side_effect=fake_sum):
-            with self.assertRaisesRegex(RuntimeError, "implied output probability"):
-                compute_circuit_amplitude(
-                    spec,
-                    [0],
-                    [0],
-                    as_complex=True,
-                    allow_tensor_contraction=True,
-                    solver_config=engine.SolverConfig(allow_approximate=True),
-                )
-
-    def test_arbitrary_bp_requires_solver_config_opt_in(self):
-        spec = make_circuit(1, [("h", 0), ("rz_arbitrary", 0, 0.37), ("h", 0)])
-        seen: list[bool] = []
-
-        def fake_sum(_q, _terms, *, allow_approximate=False):
-            seen.append(bool(allow_approximate))
-            return engine._ONE_SCALED, 0, "arbitrary_path_sum", {}
-
-        with mock.patch.object(engine, "_sum_with_arbitrary_phases_scaled", side_effect=fake_sum):
-            compute_circuit_amplitude(spec, [0], [0], as_complex=True, allow_tensor_contraction=True)
-        self.assertEqual(seen, [False])
-
-        seen.clear()
-        with mock.patch.object(engine, "_sum_with_arbitrary_phases_scaled", side_effect=fake_sum):
-            compute_circuit_amplitude(
-                spec,
-                [0],
-                [0],
-                as_complex=True,
-                allow_tensor_contraction=True,
-                solver_config=engine.SolverConfig(allow_approximate=True),
-            )
-        self.assertEqual(seen, [True])
 
     def test_arbitrary_rz_pauli_expectation_not_forced_to_one(self):
         target = 0.6

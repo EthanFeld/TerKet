@@ -18,6 +18,14 @@ from .native import (
     _schur_native,
 )
 from .pauli import compute_circuit_pauli_expectations
+from .doubled import (
+    DoubledFactorProblem,
+    DoubledSumResult,
+    compute_circuit_probability_doubled,
+    compute_circuit_pauli_expectation_probabilities_doubled,
+    sum_doubled_factor_problem,
+    sum_doubled_phase,
+)
 from .reduction import reduce_and_sum
 from .scaling import ScaledAmplitude
 from .state import (
@@ -35,6 +43,8 @@ __all__ = [
     "BitSequence",
     "CircuitInput",
     "ExtendedReductionMode",
+    "DoubledFactorProblem",
+    "DoubledSumResult",
     "ReducerInfo",
     "ReductionInfo",
     "ScaledAmplitude",
@@ -52,6 +62,10 @@ __all__ = [
     "compute_amplitudes",
     "compute_circuit_amplitude",
     "compute_circuit_amplitude_scaled",
+    "compute_circuit_probability_doubled",
+    "compute_circuit_pauli_expectation_probabilities_doubled",
     "compute_circuit_pauli_expectations",
     "reduce_and_sum",
+    "sum_doubled_phase",
+    "sum_doubled_factor_problem",
 ]

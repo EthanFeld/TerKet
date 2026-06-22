@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import contextvars
 from dataclasses import dataclass
-from typing import Any, Literal, Protocol, Sequence, TypedDict
+from typing import Any, Literal, NotRequired, Protocol, Sequence, TypedDict
 
 from .spec import CircuitSpec, Gate
 
@@ -36,6 +36,25 @@ class ReducerInfo(TypedDict):
     phase_states: int
     phase_splits: int
     phase3_backend: str | None
+    approx_q3_free_method: NotRequired[str]
+    approx_q3_free_reliable: NotRequired[bool]
+    approx_q3_free_rejection_reason: NotRequired[str]
+    approx_q3_free_repeats: NotRequired[int]
+    approx_q3_free_level: NotRequired[int]
+    approx_q3_free_samples: NotRequired[int]
+    approx_q3_free_log2_abs: NotRequired[float]
+    approx_q3_free_error_log2_abs: NotRequired[float]
+    approx_q3_free_rel_stderr: NotRequired[float]
+    approx_q3_free_log2_spread: NotRequired[float]
+    approx_q3_free_bound_violation_log2: NotRequired[float]
+    approx_q3_free_mps_bond: NotRequired[int]
+    approx_q3_free_mps_order: NotRequired[str]
+    approx_q3_free_mps_route_swaps: NotRequired[int]
+    approx_q3_free_mps_width: NotRequired[int]
+    approx_q3_free_mps_peak_active: NotRequired[int]
+    approx_q3_free_mps_peak_bond: NotRequired[int]
+    approx_q3_free_mps_discarded_rss: NotRequired[float]
+    approx_q3_free_mps_max_discarded: NotRequired[float]
 
 
 class ReductionInfo(TypedDict):
@@ -56,6 +75,25 @@ class ReductionInfo(TypedDict):
     phase_splits: int
     phase3_backend: str | None
     is_zero: bool
+    approx_q3_free_method: NotRequired[str]
+    approx_q3_free_reliable: NotRequired[bool]
+    approx_q3_free_rejection_reason: NotRequired[str]
+    approx_q3_free_repeats: NotRequired[int]
+    approx_q3_free_level: NotRequired[int]
+    approx_q3_free_samples: NotRequired[int]
+    approx_q3_free_log2_abs: NotRequired[float]
+    approx_q3_free_error_log2_abs: NotRequired[float]
+    approx_q3_free_rel_stderr: NotRequired[float]
+    approx_q3_free_log2_spread: NotRequired[float]
+    approx_q3_free_bound_violation_log2: NotRequired[float]
+    approx_q3_free_mps_bond: NotRequired[int]
+    approx_q3_free_mps_order: NotRequired[str]
+    approx_q3_free_mps_route_swaps: NotRequired[int]
+    approx_q3_free_mps_width: NotRequired[int]
+    approx_q3_free_mps_peak_active: NotRequired[int]
+    approx_q3_free_mps_peak_bond: NotRequired[int]
+    approx_q3_free_mps_discarded_rss: NotRequired[float]
+    approx_q3_free_mps_max_discarded: NotRequired[float]
 
 
 _DEFAULT_CUTSET_MAX_SIZE = 6
@@ -71,9 +109,35 @@ _DEFAULT_TENSOR_HINT_MAX_REPEATS = 4
 _DEFAULT_TENSOR_HINT_MAX_TIME = 2.0
 _DEFAULT_TENSOR_HINT_MIN_VARS = 128
 _DEFAULT_TENSOR_HINT_MAX_VARS = 384
-_DEFAULT_BP_HEURISTIC_MAX_LOG2_ABS_SPREAD = 2.0
-_DEFAULT_BP_HEURISTIC_MAX_PHASE_SPREAD = 0.5
-_DEFAULT_BP_HEURISTIC_BOUND_LOG2_TOL = 1e-6
+_DEFAULT_APPROX_Q3_FREE_TENSOR = False
+_DEFAULT_APPROX_TENSOR_MAX_BOND = 64
+_DEFAULT_APPROX_TENSOR_CUTOFF = 1e-10
+_DEFAULT_APPROX_TENSOR_OPTIMIZE = "greedy"
+_DEFAULT_APPROX_TENSOR_MAX_VARS = 100_000
+_DEFAULT_APPROX_TENSOR_MAX_DEGREE = 16
+_DEFAULT_APPROX_TENSOR_METHOD = "residue_forest"
+_DEFAULT_APPROX_TENSOR_BP_MAX_ITERS = 30
+_DEFAULT_APPROX_TENSOR_BP_TOL = 1e-8
+_DEFAULT_APPROX_TENSOR_BP_DAMPING = 0.25
+_DEFAULT_APPROX_TENSOR_RESIDUE_SAMPLES = 4096
+_DEFAULT_APPROX_TENSOR_RESIDUE_BATCH = 256
+_DEFAULT_APPROX_TENSOR_RESIDUE_SEED = 0
+_DEFAULT_APPROX_TENSOR_RESIDUE_LEVEL = 16
+_DEFAULT_APPROX_TENSOR_RESIDUE_FOREST_SAMPLES = 32
+_DEFAULT_APPROX_TENSOR_RESIDUE_SAMPLE_MODE = "unified"
+_DEFAULT_APPROX_TENSOR_RESIDUE_STRATIFIED_VARS = 0
+_DEFAULT_APPROX_TENSOR_RELIABILITY_REPEATS = 3
+_DEFAULT_APPROX_TENSOR_RELIABILITY_SEED_STRIDE = 104729
+_DEFAULT_APPROX_TENSOR_RELIABILITY_MAX_LOG2_SPREAD = 8.0
+_DEFAULT_APPROX_TENSOR_RELIABILITY_MAX_REL_STDERR = 1.0
+_DEFAULT_APPROX_TENSOR_RELIABILITY_MIN_LOG2_ABS_FOR_REL = -40.0
+_DEFAULT_APPROX_TENSOR_RELIABILITY_REJECT = True
+_DEFAULT_APPROX_TENSOR_AMPLITUDE_BOUND_SLACK_LOG2 = 1e-9
+_DEFAULT_APPROX_TENSOR_RAISE_ON_UNRELIABLE = True
+_DEFAULT_APPROX_TENSOR_MPS_FALLBACK = True
+_DEFAULT_APPROX_TENSOR_MPS_MAX_BOND = 16
+_DEFAULT_APPROX_TENSOR_MPS_MAX_REL_CHANGE = 0.25
+_DEFAULT_APPROX_TENSOR_MPS_MAX_DISCARDED = 0.15
 
 
 @dataclass(frozen=True, slots=True)
@@ -93,10 +157,37 @@ class SolverConfig:
     tensor_hint_max_time: float = _DEFAULT_TENSOR_HINT_MAX_TIME
     tensor_hint_min_vars: int = _DEFAULT_TENSOR_HINT_MIN_VARS
     tensor_hint_max_vars: int = _DEFAULT_TENSOR_HINT_MAX_VARS
-    allow_approximate: bool = False
-    bp_heuristic_max_log2_abs_spread: float = _DEFAULT_BP_HEURISTIC_MAX_LOG2_ABS_SPREAD
-    bp_heuristic_max_phase_spread: float = _DEFAULT_BP_HEURISTIC_MAX_PHASE_SPREAD
-    bp_heuristic_bound_log2_tol: float = _DEFAULT_BP_HEURISTIC_BOUND_LOG2_TOL
+    approx_q3_free_tensor: bool = _DEFAULT_APPROX_Q3_FREE_TENSOR
+    approx_tensor_max_bond: int = _DEFAULT_APPROX_TENSOR_MAX_BOND
+    approx_tensor_cutoff: float = _DEFAULT_APPROX_TENSOR_CUTOFF
+    approx_tensor_optimize: str = _DEFAULT_APPROX_TENSOR_OPTIMIZE
+    approx_tensor_max_vars: int = _DEFAULT_APPROX_TENSOR_MAX_VARS
+    approx_tensor_max_degree: int = _DEFAULT_APPROX_TENSOR_MAX_DEGREE
+    approx_tensor_method: str = _DEFAULT_APPROX_TENSOR_METHOD
+    approx_tensor_bp_max_iters: int = _DEFAULT_APPROX_TENSOR_BP_MAX_ITERS
+    approx_tensor_bp_tol: float = _DEFAULT_APPROX_TENSOR_BP_TOL
+    approx_tensor_bp_damping: float = _DEFAULT_APPROX_TENSOR_BP_DAMPING
+    approx_tensor_residue_samples: int = _DEFAULT_APPROX_TENSOR_RESIDUE_SAMPLES
+    approx_tensor_residue_batch: int = _DEFAULT_APPROX_TENSOR_RESIDUE_BATCH
+    approx_tensor_residue_seed: int = _DEFAULT_APPROX_TENSOR_RESIDUE_SEED
+    approx_tensor_residue_level: int = _DEFAULT_APPROX_TENSOR_RESIDUE_LEVEL
+    approx_tensor_residue_forest_samples: int = _DEFAULT_APPROX_TENSOR_RESIDUE_FOREST_SAMPLES
+    approx_tensor_residue_sample_mode: str = _DEFAULT_APPROX_TENSOR_RESIDUE_SAMPLE_MODE
+    approx_tensor_residue_stratified_vars: int = _DEFAULT_APPROX_TENSOR_RESIDUE_STRATIFIED_VARS
+    approx_tensor_reliability_repeats: int = _DEFAULT_APPROX_TENSOR_RELIABILITY_REPEATS
+    approx_tensor_reliability_seed_stride: int = _DEFAULT_APPROX_TENSOR_RELIABILITY_SEED_STRIDE
+    approx_tensor_reliability_max_log2_spread: float = _DEFAULT_APPROX_TENSOR_RELIABILITY_MAX_LOG2_SPREAD
+    approx_tensor_reliability_max_rel_stderr: float = _DEFAULT_APPROX_TENSOR_RELIABILITY_MAX_REL_STDERR
+    approx_tensor_reliability_min_log2_abs_for_rel: float = (
+        _DEFAULT_APPROX_TENSOR_RELIABILITY_MIN_LOG2_ABS_FOR_REL
+    )
+    approx_tensor_reliability_reject: bool = _DEFAULT_APPROX_TENSOR_RELIABILITY_REJECT
+    approx_tensor_amplitude_bound_slack_log2: float = _DEFAULT_APPROX_TENSOR_AMPLITUDE_BOUND_SLACK_LOG2
+    approx_tensor_raise_on_unreliable: bool = _DEFAULT_APPROX_TENSOR_RAISE_ON_UNRELIABLE
+    approx_tensor_mps_fallback: bool = _DEFAULT_APPROX_TENSOR_MPS_FALLBACK
+    approx_tensor_mps_max_bond: int = _DEFAULT_APPROX_TENSOR_MPS_MAX_BOND
+    approx_tensor_mps_max_rel_change: float = _DEFAULT_APPROX_TENSOR_MPS_MAX_REL_CHANGE
+    approx_tensor_mps_max_discarded: float = _DEFAULT_APPROX_TENSOR_MPS_MAX_DISCARDED
 
 
 _DEFAULT_SOLVER_CONFIG = SolverConfig()

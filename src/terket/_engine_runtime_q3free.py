@@ -6,6 +6,25 @@ from ._engine_runtime_core import *
 
 
 _bind_extracted_forwarders(
+    "_q3free.neighborhood",
+    "_build_q3_free_neighborhood_plan",
+    "_build_q3_free_neighborhood_treewidth_plan",
+    "_evaluate_q3_free_neighborhood_plan_scaled",
+    "_evaluate_q3_free_neighborhood_plan_scaled_batch",
+    "_evaluate_q3_free_neighborhood_treewidth_plan_scaled",
+    "_evaluate_q3_free_neighborhood_treewidth_plan_scaled_batch",
+    "_sum_q3_free_via_neighborhood_composed_scaled",
+    "_sum_q3_free_via_neighborhood_scaled",
+    "_sum_q3_free_via_neighborhood_treewidth_scaled",
+)
+_bind_extracted_forwarders(
+    "_q3free.approx_tensor",
+    "_q3_free_partition_tensor_network",
+    "_sum_q3_free_approx_tensor_scaled",
+    "_clear_q3_free_approx_diagnostics",
+    "_get_q3_free_approx_diagnostics",
+)
+_bind_extracted_forwarders(
     "_q3free.plans",
     "_q3_free_constraint_plan_key",
     "_q3_free_edge_density",

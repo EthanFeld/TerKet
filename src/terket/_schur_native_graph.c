@@ -282,6 +282,67 @@ error:
 }
 
 
+static int degree_heap_less(Py_ssize_t left, Py_ssize_t right, const Py_ssize_t *degrees)
+{
+    return degrees[left] < degrees[right] || (degrees[left] == degrees[right] && left < right);
+}
+
+
+static void degree_heap_swap(Py_ssize_t *heap, Py_ssize_t *positions, Py_ssize_t left, Py_ssize_t right)
+{
+    Py_ssize_t tmp = heap[left];
+    heap[left] = heap[right];
+    heap[right] = tmp;
+    positions[heap[left]] = left;
+    positions[heap[right]] = right;
+}
+
+
+static void degree_heap_sift_up(
+    Py_ssize_t *heap,
+    Py_ssize_t *positions,
+    const Py_ssize_t *degrees,
+    Py_ssize_t pos
+)
+{
+    while (pos > 0) {
+        Py_ssize_t parent = (pos - 1) / 2;
+        if (!degree_heap_less(heap[pos], heap[parent], degrees)) {
+            break;
+        }
+        degree_heap_swap(heap, positions, pos, parent);
+        pos = parent;
+    }
+}
+
+
+static void degree_heap_sift_down(
+    Py_ssize_t *heap,
+    Py_ssize_t *positions,
+    const Py_ssize_t *degrees,
+    Py_ssize_t heap_size,
+    Py_ssize_t pos
+)
+{
+    while (1) {
+        Py_ssize_t left = (2 * pos) + 1;
+        Py_ssize_t right = left + 1;
+        Py_ssize_t best = pos;
+        if (left < heap_size && degree_heap_less(heap[left], heap[best], degrees)) {
+            best = left;
+        }
+        if (right < heap_size && degree_heap_less(heap[right], heap[best], degrees)) {
+            best = right;
+        }
+        if (best == pos) {
+            break;
+        }
+        degree_heap_swap(heap, positions, pos, best);
+        pos = best;
+    }
+}
+
+
 PyObject *min_degree_cubic_order_native(PyObject *self, PyObject *args)
 {
     Py_ssize_t nvars;
@@ -292,10 +353,13 @@ PyObject *min_degree_cubic_order_native(PyObject *self, PyObject *args)
     uint64_t *remaining = NULL;
     uint64_t *best_neighbors = NULL;
     uint64_t *work = NULL;
+    Py_ssize_t *degrees = NULL;
+    Py_ssize_t *heap = NULL;
+    Py_ssize_t *positions = NULL;
     PyObject *order = NULL;
     PyObject *width_obj = NULL;
     Py_ssize_t order_idx = 0;
-    Py_ssize_t remaining_count;
+    Py_ssize_t heap_size;
     Py_ssize_t max_scope = 1;
 
     (void) self;
@@ -317,57 +381,47 @@ PyObject *min_degree_cubic_order_native(PyObject *self, PyObject *args)
     remaining = PyMem_Calloc((size_t) nwords, sizeof(uint64_t));
     best_neighbors = PyMem_Calloc((size_t) nwords, sizeof(uint64_t));
     work = PyMem_Calloc((size_t) nwords, sizeof(uint64_t));
-    if (adjacency == NULL || remaining == NULL || best_neighbors == NULL || work == NULL) {
+    degrees = PyMem_Malloc((size_t) nvars * sizeof(Py_ssize_t));
+    heap = PyMem_Malloc((size_t) nvars * sizeof(Py_ssize_t));
+    positions = PyMem_Malloc((size_t) nvars * sizeof(Py_ssize_t));
+    if (
+        adjacency == NULL || remaining == NULL || best_neighbors == NULL || work == NULL ||
+        degrees == NULL || heap == NULL || positions == NULL
+    ) {
         PyErr_NoMemory();
         goto error;
     }
 
     initialize_remaining_set(remaining, nvars);
-    remaining_count = nvars;
+    heap_size = nvars;
+
+    {
+        Py_ssize_t var;
+        for (var = 0; var < nvars; ++var) {
+            degrees[var] = bitset_count(adjacency + ((size_t) var * (size_t) nwords), nwords);
+            heap[var] = var;
+            positions[var] = var;
+        }
+        for (var = nvars / 2; var > 0; --var) {
+            degree_heap_sift_down(heap, positions, degrees, heap_size, var - 1);
+        }
+    }
 
     order = PyList_New(nvars);
     if (order == NULL) {
         goto error;
     }
 
-    while (remaining_count > 0) {
-        Py_ssize_t best_var = -1;
-        Py_ssize_t best_degree = 0;
-        int has_best = 0;
-        Py_ssize_t word_idx;
-
-        for (word_idx = 0; word_idx < nwords; ++word_idx) {
-            uint64_t word = remaining[word_idx];
-            while (word != 0) {
-                Py_ssize_t var = (word_idx << 6) + lowest_bit_index(word);
-                Py_ssize_t degree;
-                Py_ssize_t inner_word;
-
-                word &= word - 1;
-                if (var >= nvars) {
-                    continue;
-                }
-
-                degree = 0;
-                for (inner_word = 0; inner_word < nwords; ++inner_word) {
-                    uint64_t neighbors_word = adjacency[((size_t) var * (size_t) nwords) + (size_t) inner_word] & remaining[inner_word];
-                    degree += popcount_u64(neighbors_word);
-                }
-
-                if (!has_best || degree < best_degree || (degree == best_degree && var < best_var)) {
-                    has_best = 1;
-                    best_var = var;
-                    best_degree = degree;
-                    for (inner_word = 0; inner_word < nwords; ++inner_word) {
-                        best_neighbors[inner_word] = adjacency[((size_t) var * (size_t) nwords) + (size_t) inner_word] & remaining[inner_word];
-                    }
-                }
-            }
-        }
-
-        if (best_var < 0) {
-            PyErr_SetString(PyExc_RuntimeError, "Failed to find an elimination variable.");
-            goto error;
+    while (heap_size > 0) {
+        Py_ssize_t best_var = heap[0];
+        Py_ssize_t best_degree = degrees[best_var];
+        Py_ssize_t scan_word;
+        copy_remaining_neighbors(adjacency, remaining, nwords, best_var, best_neighbors);
+        degree_heap_swap(heap, positions, 0, heap_size - 1);
+        --heap_size;
+        positions[best_var] = -1;
+        if (heap_size > 0) {
+            degree_heap_sift_down(heap, positions, degrees, heap_size, 0);
         }
 
         {
@@ -386,7 +440,36 @@ PyObject *min_degree_cubic_order_native(PyObject *self, PyObject *args)
             }
 
             eliminate_var_from_graph(adjacency, remaining, best_neighbors, work, nwords, best_var);
-            --remaining_count;
+        }
+
+        for (scan_word = 0; scan_word < nwords; ++scan_word) {
+            uint64_t word = best_neighbors[scan_word];
+            while (word != 0) {
+                Py_ssize_t neighbor = (scan_word << 6) + lowest_bit_index(word);
+                Py_ssize_t inner_word;
+                Py_ssize_t new_degree = 0;
+                Py_ssize_t heap_pos;
+                word &= word - 1;
+                if (neighbor >= nvars || positions[neighbor] < 0) {
+                    continue;
+                }
+                for (inner_word = 0; inner_word < nwords; ++inner_word) {
+                    new_degree += popcount_u64(
+                        adjacency[((size_t) neighbor * (size_t) nwords) + (size_t) inner_word]
+                        & remaining[inner_word]
+                    );
+                }
+                degrees[neighbor] = new_degree;
+                heap_pos = positions[neighbor];
+                degree_heap_sift_up(heap, positions, degrees, heap_pos);
+                degree_heap_sift_down(
+                    heap,
+                    positions,
+                    degrees,
+                    heap_size,
+                    positions[neighbor]
+                );
+            }
         }
     }
 
@@ -399,6 +482,9 @@ PyObject *min_degree_cubic_order_native(PyObject *self, PyObject *args)
     PyMem_Free(remaining);
     PyMem_Free(best_neighbors);
     PyMem_Free(work);
+    PyMem_Free(degrees);
+    PyMem_Free(heap);
+    PyMem_Free(positions);
 
     {
         PyObject *result = PyTuple_Pack(2, order, width_obj);
@@ -412,6 +498,9 @@ error:
     PyMem_Free(remaining);
     PyMem_Free(best_neighbors);
     PyMem_Free(work);
+    PyMem_Free(degrees);
+    PyMem_Free(heap);
+    PyMem_Free(positions);
     Py_XDECREF(order);
     Py_XDECREF(width_obj);
     return NULL;

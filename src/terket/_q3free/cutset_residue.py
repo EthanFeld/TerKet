@@ -237,16 +237,21 @@ def _initial_cutset_candidate_order(
         local_hint = [remaining_index[var] for var in remaining_order_hint if var in remaining_index]
         if len(local_hint) == remaining_q.n:
             local_hint_order = tuple(int(var) for var in local_hint)
+    use_large_residual_surrogate = (
+        use_one_shot_surrogate
+        or remaining_q.n > _Q3_FREE_TREEWIDTH_HEURISTIC_MAX_ORDER_VARS
+    )
     if local_hint_order is not None:
         candidate_order = local_hint_order
         width = _cubic_order_width(remaining_q, candidate_order)
-    elif use_one_shot_surrogate:
+        use_large_residual_surrogate = False
+    elif use_large_residual_surrogate:
         candidate_order, width = _best_cheap_q3_free_order(remaining_q)
     else:
         candidate_order, width = _min_fill_cubic_order(remaining_q)
     work = (
         _cheap_q3_free_work_surrogate(remaining_q, width)
-        if use_one_shot_surrogate
+        if use_large_residual_surrogate
         else _estimate_treewidth_dp_work(remaining_q, candidate_order)
     )
     return tuple(int(var) for var in candidate_order), int(width), max(1, int(work)), local_hint_order
@@ -269,15 +274,18 @@ def _resolve_viable_treewidth_order(
     reduced_depth, reduced_chords = _q3_free_spanning_data(remaining_adjacency, remaining_edges)
     reduced_feedback = _select_feedback_vertices(remaining_q.n, reduced_chords, reduced_depth)
     skip_exact_treewidth_search = (
-        use_one_shot_surrogate
-        and allow_generic_remaining
-        and width > max(
-            _q3_free_treewidth_width_limit() + 4,
-            (
-                int(target_remaining_width) + 8
-                if target_remaining_width is not None
-                else _q3_free_treewidth_width_limit() + 4
-            ),
+        remaining_q.n > _Q3_FREE_TREEWIDTH_HEURISTIC_MAX_ORDER_VARS
+        or (
+            use_one_shot_surrogate
+            and allow_generic_remaining
+            and width > max(
+                _q3_free_treewidth_width_limit() + 4,
+                (
+                    int(target_remaining_width) + 8
+                    if target_remaining_width is not None
+                    else _q3_free_treewidth_width_limit() + 4
+                ),
+            )
         )
     )
     viable_order = None if skip_exact_treewidth_search else _q3_free_treewidth_order(
@@ -287,6 +295,8 @@ def _resolve_viable_treewidth_order(
         max_degree=remaining_max_degree,
     )
     if viable_order is not None or local_hint_order is None or use_one_shot_surrogate:
+        return viable_order, candidate_order, width, work
+    if remaining_q.n > _Q3_FREE_TREEWIDTH_HEURISTIC_MAX_ORDER_VARS:
         return viable_order, candidate_order, width, work
 
     candidate_order, width = _min_fill_cubic_order(remaining_q)

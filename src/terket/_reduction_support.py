@@ -385,7 +385,7 @@ def _phase_function_from_parts(n, *, level, q0, q1, q2, q3):
     phase.level = level
     phase.mod_q1 = 1 << phase.level
     phase.mod_q2 = max(1, 1 << (phase.level - 1))
-    phase.mod_q3 = max(1, 1 << (phase.level - 2))
+    phase.mod_q3 = 1 << max(0, phase.level - 2)
     if not isinstance(q0, Fraction):
         q0 = Fraction(q0)
     phase.q0 = q0

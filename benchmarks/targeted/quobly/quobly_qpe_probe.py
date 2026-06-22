@@ -1,3 +1,5 @@
+"""Probe Quobly and TerKet performance on QPE benchmark circuits."""
+
 from __future__ import annotations
 
 import argparse

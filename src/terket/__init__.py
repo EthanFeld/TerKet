@@ -12,6 +12,7 @@ from .spec import (
     lift_exact_dyadic_precision,
     make_circuit,
     normalize_circuit,
+    snap_arbitrary_angles,
 )
 from .cache import cache_stats, clear_caches
 from ._engine_impl import (
@@ -30,6 +31,8 @@ from .state import SolverConfig
 __all__ = [
     "CircuitSpec",
     "CubicFunction",
+    "DoubledFactorProblem",
+    "DoubledSumResult",
     "PhaseFunction",
     "ScaledAmplitude",
     "SchurState",
@@ -47,23 +50,35 @@ __all__ = [
     "compute_amplitude_scaled",
     "compute_circuit_amplitude",
     "compute_circuit_amplitude_scaled",
+    "compute_circuit_probability_doubled",
+    "compute_circuit_pauli_expectation_probabilities_doubled",
     "compute_circuit_pauli_expectations",
-    "compute_circuit_pauli_expectations_approx",
     "from_qiskit",
     "lift_exact_dyadic_precision",
     "make_circuit",
     "normalize_circuit",
+    "snap_arbitrary_angles",
     "reduce_and_sum",
+    "sum_doubled_phase",
+    "sum_doubled_factor_problem",
 ]
 
 
 _LAZY_EXPORTS = {
+    "DoubledFactorProblem": (".doubled", "DoubledFactorProblem"),
+    "DoubledSumResult": (".doubled", "DoubledSumResult"),
     "SchurState": (".state", "SchurState"),
     "build_state": (".state", "build_state"),
+    "compute_circuit_probability_doubled": (".doubled", "compute_circuit_probability_doubled"),
+    "compute_circuit_pauli_expectation_probabilities_doubled": (
+        ".doubled",
+        "compute_circuit_pauli_expectation_probabilities_doubled",
+    ),
     "compute_circuit_pauli_expectations": (".pauli", "compute_circuit_pauli_expectations"),
-    "compute_circuit_pauli_expectations_approx": (".pauli_approx", "compute_circuit_pauli_expectations_approx"),
     "from_qiskit": (".circuits", "from_qiskit"),
     "reduce_and_sum": (".reduction", "reduce_and_sum"),
+    "sum_doubled_phase": (".doubled", "sum_doubled_phase"),
+    "sum_doubled_factor_problem": (".doubled", "sum_doubled_factor_problem"),
 }
 
 

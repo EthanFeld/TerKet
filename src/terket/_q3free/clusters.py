@@ -88,6 +88,12 @@ def _build_q2_adjacency(q: PhaseFunction) -> list[set[int]]:
             adjacency[right].add(left)
     return adjacency
 
+def _region_cluster_core_order_is_bounded(n_core_vars: int, n_factor_scopes: int) -> bool:
+    return (
+        n_core_vars <= _Q3_FREE_REGION_CLUSTER_MAX_CORE_ORDER_VARS
+        and n_factor_scopes <= _Q3_FREE_REGION_CLUSTER_MAX_CORE_ORDER_FACTORS
+    )
+
 def _build_selected_boundary_region_plan(
     q: PhaseFunction,
     *,
@@ -229,6 +235,9 @@ def _build_selected_boundary_region_plan(
         )
 
     width_limit = _q3_free_treewidth_width_limit()
+    if not _region_cluster_core_order_is_bounded(len(core_vars), len(factor_scopes)):
+        return None
+
     degeneracy_lower_bound = _factor_scope_degeneracy(len(core_vars), factor_scopes)
     if degeneracy_lower_bound > width_limit:
         return None
@@ -744,6 +753,10 @@ def _build_block_cut_tree_region_plan(q) -> _HalfPhaseClusterPlan | None:
         )
 
     width_limit = _q3_free_treewidth_width_limit()
+    if not _region_cluster_core_order_is_bounded(len(core_vars), len(factor_scopes)):
+        _STRUCTURE_Q3_FREE_BLOCK_CUT_PLAN_CACHE[cache_key] = None
+        return None
+
     degeneracy_lower_bound = _factor_scope_degeneracy(len(core_vars), factor_scopes)
     if degeneracy_lower_bound > width_limit:
         _STRUCTURE_Q3_FREE_BLOCK_CUT_PLAN_CACHE[cache_key] = None

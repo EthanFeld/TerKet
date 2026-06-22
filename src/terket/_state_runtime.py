@@ -6,6 +6,7 @@ from dataclasses import dataclass
 import importlib
 import sys
 
+from ._approx_reliability import _copy_approx_reducer_info, _validate_approx_amplitude_reliability
 from ._engine_runtime_core import _bootstrap_extracted_globals, _sync_extracted_globals
 
 _LOCAL_NAMES = {
@@ -668,7 +669,6 @@ class SchurState:
         preserve_scale: bool = False,
         allow_tensor_contraction: bool = True,
         extended_reductions: ExtendedReductionMode | str = "auto",
-        allow_unbounded_bp_result: bool = False,
     ) -> tuple[ScaledAmplitude | complex, ReductionInfo]:
         if _FORCE_ENGINE_BINDINGS_REFRESH:
             _sync_from_engine(importlib.import_module("terket._engine_impl"))
@@ -709,7 +709,6 @@ class SchurState:
             result, max_scope, arbitrary_backend, arbitrary_metadata = _sum_with_arbitrary_phases_scaled(
                 q_free,
                 arbitrary_terms,
-                allow_approximate=bool(_get_solver_config().allow_approximate),
             )
             structural_obstruction = (
                 0
@@ -753,25 +752,13 @@ class SchurState:
             cost_model_r=elim_info.get('cost_r', elim_info['remaining']),
             phase3_backend=elim_info.get('phase3_backend'),
         )
-        for key in (
-            "is_approximate",
-            "approx_backend",
-            "approx_validation",
-            "bp_heuristic_ensemble_size",
-            "bp_heuristic_log2_abs_spread",
-            "bp_heuristic_phase_spread",
-            "bp_heuristic_max_log2_probability",
-        ):
-            if key in elim_info:
-                info[key] = elim_info[key]  # type: ignore[typeddict-unknown-key]
-        if _arbitrary_bp_backend(info.get("phase3_backend")):
-            log2_probability = _scaled_probability_log2(scaled_amp)
-            info["bp_log2_probability"] = log2_probability  # type: ignore[typeddict-unknown-key]
-            if log2_probability > _ARBITRARY_BP_DIRECT_PROB_LOG2_TOL:
-                if allow_unbounded_bp_result:
-                    _mark_invalid_arbitrary_bp_info(info, scaled_amp)
-                else:
-                    _raise_if_invalid_arbitrary_bp_amplitude(info, scaled_amp)
+        _copy_approx_reducer_info(info, elim_info)
+        from ._q3free.approx_guard import _get_q3_free_approx_diagnostics
+
+        approx_info = _get_q3_free_approx_diagnostics()
+        if approx_info is not None:
+            _copy_approx_reducer_info(info, approx_info)
+        _validate_approx_amplitude_reliability(scaled_amp, info)
         amp = ScaledAmplitude.from_tuple(scaled_amp) if preserve_scale else _scaled_to_complex(scaled_amp)
         return amp, info
 

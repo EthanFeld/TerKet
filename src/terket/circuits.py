@@ -23,6 +23,7 @@ from .spec import (
     lift_exact_dyadic_precision,
     make_circuit,
     normalize_circuit,
+    snap_arbitrary_angles,
 )
 
 __all__ = [
@@ -42,6 +43,7 @@ __all__ = [
     "lift_exact_dyadic_precision",
     "make_circuit",
     "normalize_circuit",
+    "snap_arbitrary_angles",
     "parse_openqasm2",
     "to_qiskit",
 ]

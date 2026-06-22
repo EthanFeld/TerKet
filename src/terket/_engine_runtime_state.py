@@ -29,27 +29,9 @@ _bind_extracted_forwarders(
     "_sum_factor_tables_with_cutset_scaled",
 )
 _bind_extracted_forwarders(
-    "_arbitrary_bp",
-    "_arbitrary_bp_backend",
-    "_arbitrary_exact_metadata",
-    "_arbitrary_approx_metadata",
-    "_mark_invalid_arbitrary_bp_info",
-    "_raise_if_invalid_arbitrary_bp_amplitude",
-    "_sum_pairwise_factor_graph_bethe_scaled",
-    "_sum_factor_graph_bethe_scaled",
-    "_sum_factor_graph_with_sparse_parity_bethe_scaled",
-)
-_bind_extracted_forwarders(
     "_arbitrary_runtime",
-    "_factor_graph_is_forest",
-    "_scaled_log2_abs",
-    "_scaled_phase",
-    "_phase_distance",
-    "_arbitrary_bp_heuristic_candidate",
-    "_sum_arbitrary_bp_heuristic_ensemble_scaled",
     "_arbitrary_factor_graph_for_state_output",
     "solve_arbitrary_exact",
-    "solve_arbitrary_approx",
     "_sum_with_arbitrary_phases_scaled",
 )
 _bind_extracted_forwarders(
@@ -59,7 +41,6 @@ _bind_extracted_forwarders(
 )
 
 _sum_with_arbitrary_phases_exact_scaled = solve_arbitrary_exact
-_sum_with_arbitrary_phases_approx_scaled = solve_arbitrary_approx
 
 # ==================================================================
 # Schur-state construction and output constraint solving

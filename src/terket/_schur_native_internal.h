@@ -201,6 +201,7 @@ PyObject *clear_support_cache_native(PyObject *self, PyObject *ignored);
 PyObject *evaluate_q_mask_terms_native(PyObject *self, PyObject *args);
 PyObject *elim_single_partner_constraint_terms_native(PyObject *self, PyObject *args);
 PyObject *elim_two_partner_constraint_terms_native(PyObject *self, PyObject *args);
+PyObject *elim_sparse_quadratics_batch_terms_native(PyObject *self, PyObject *args);
 PyObject *aff_compose_terms_native(PyObject *self, PyObject *args);
 PyObject *build_classification_data_native(PyObject *self, PyObject *args);
 PyObject *classification_structure_key_native(PyObject *self, PyObject *args);

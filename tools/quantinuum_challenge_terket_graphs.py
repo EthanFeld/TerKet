@@ -193,12 +193,24 @@ def _blank_result(
     }
 
 
-def _run_one(json_path: Path) -> dict[str, object]:
-    from terket import analyze_amplitudes
-    from terket.engine import SolverConfig
+def _run_one(
+    json_path: Path,
+    *,
+    snap_dyadic_level: int | None = None,
+    snap_max_error: float | None = None,
+    snap_max_total_error: float | None = None,
+) -> dict[str, object]:
+    from terket import analyze_amplitudes, snap_arbitrary_angles
 
     start = time.perf_counter()
     spec, counts = _load_pytket_json(json_path)
+    if snap_dyadic_level is not None:
+        spec = snap_arbitrary_angles(
+            spec,
+            max_level=snap_dyadic_level,
+            max_error=snap_max_error,
+            max_total_error=snap_max_total_error,
+        )
     import_s = time.perf_counter() - start
     start = time.perf_counter()
     info = analyze_amplitudes(
@@ -206,7 +218,6 @@ def _run_one(json_path: Path) -> dict[str, object]:
         [0] * spec.n_qubits,
         [[0] * spec.n_qubits],
         allow_tensor_contraction=True,
-        solver_config=SolverConfig(allow_approximate=True),
     )[0]
     analyze_s = time.perf_counter() - start
     return {
@@ -225,18 +236,37 @@ def _run_one(json_path: Path) -> dict[str, object]:
         "gauss_obstruction": info["gauss_obstruction"],
         "phase3_backend": info["phase3_backend"] or "",
         "is_zero": info["is_zero"],
+        "approximation_phase_count": spec.metadata.get("approximation_phase_count", 0),
+        "approximation_max_angle_error": spec.metadata.get("approximation_max_angle_error", 0.0),
     }
 
 
 def _child_main(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("json_path", type=Path)
+    parser.add_argument("--snap-dyadic-level", type=int, default=None)
+    parser.add_argument("--snap-max-error", type=float, default=None)
+    parser.add_argument("--snap-max-total-error", type=float, default=None)
+    args = parser.parse_args(argv)
     profile_path = os.environ.get("TERKET_PROFILE_PATH")
     if profile_path:
         profiler = cProfile.Profile()
-        result = profiler.runcall(_run_one, Path(argv[0]))
+        result = profiler.runcall(
+            _run_one,
+            args.json_path,
+            snap_dyadic_level=args.snap_dyadic_level,
+            snap_max_error=args.snap_max_error,
+            snap_max_total_error=args.snap_max_total_error,
+        )
         Path(profile_path).parent.mkdir(parents=True, exist_ok=True)
         profiler.dump_stats(profile_path)
     else:
-        result = _run_one(Path(argv[0]))
+        result = _run_one(
+            args.json_path,
+            snap_dyadic_level=args.snap_dyadic_level,
+            snap_max_error=args.snap_max_error,
+            snap_max_total_error=args.snap_max_total_error,
+        )
     print(json.dumps(result), flush=True)
     return 0
 
@@ -248,6 +278,23 @@ def _write_csv(path: Path, rows: list[dict[str, object]]) -> None:
         writer = csv.DictWriter(handle, fieldnames=fields)
         writer.writeheader()
         writer.writerows(rows)
+
+
+def _child_command(
+    json_path: Path,
+    *,
+    snap_dyadic_level: int | None,
+    snap_max_error: float | None,
+    snap_max_total_error: float | None,
+) -> list[str]:
+    command = [sys.executable, str(Path(__file__).resolve()), "--child", str(json_path)]
+    if snap_dyadic_level is not None:
+        command.extend(("--snap-dyadic-level", str(snap_dyadic_level)))
+    if snap_max_error is not None:
+        command.extend(("--snap-max-error", str(snap_max_error)))
+    if snap_max_total_error is not None:
+        command.extend(("--snap-max-total-error", str(snap_max_total_error)))
+    return command
 
 
 def _svg_bar(path: Path, title: str, labels: list[str], series, *, ylabel: str = "") -> None:
@@ -297,6 +344,9 @@ def _main(argv: list[str]) -> int:
     parser.add_argument("--out-dir", type=Path, default=Path("results/tn_sim_challenge"))
     parser.add_argument("--timeout-s", type=float, default=30.0)
     parser.add_argument("--profile-dir", type=Path, default=None)
+    parser.add_argument("--snap-dyadic-level", type=int, default=None)
+    parser.add_argument("--snap-max-error", type=float, default=None)
+    parser.add_argument("--snap-max-total-error", type=float, default=None)
     args = parser.parse_args(argv)
 
     args.out_dir.mkdir(parents=True, exist_ok=True)
@@ -336,7 +386,12 @@ def _main(argv: list[str]) -> int:
                 env["TERKET_PROFILE_PATH"] = profile_path
             try:
                 proc = subprocess.run(
-                    [sys.executable, str(Path(__file__).resolve()), "--child", str(json_path)],
+                    _child_command(
+                        json_path,
+                        snap_dyadic_level=args.snap_dyadic_level,
+                        snap_max_error=args.snap_max_error,
+                        snap_max_total_error=args.snap_max_total_error,
+                    ),
                     text=True,
                     capture_output=True,
                     timeout=args.timeout_s,
@@ -367,6 +422,7 @@ def _main(argv: list[str]) -> int:
         "circuit_name", "family", "hardness", "status", "qubits", "input_gates", "terket_gates",
         "import_s", "analyze_s", "initial_free", "remaining_free", "branches", "cost_model_r",
         "cubic_obstruction", "gauss_obstruction", "phase3_backend", "is_zero", "profile_path",
+        "approximation_phase_count", "approximation_max_angle_error",
     ]
     normalized_rows = [{field: row.get(field, "") for field in fields} for row in result_rows]
     _write_csv(args.out_dir / "terket_qec_exact_results.csv", normalized_rows)

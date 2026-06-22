@@ -22,6 +22,7 @@ import numpy as np
 
 from .cubic_arithmetic import CubicFunction, PhaseFunction, detect_factorization
 from ._engine_runtime_core import _bootstrap_extracted_globals, _sync_extracted_globals
+from ._approx_reliability import _copy_approx_reducer_info, _validate_approx_amplitude_reliability
 from .interop.rewrite import _rewrite_gate_sequence
 from .scaling import ScaledAmplitude, ScaledComplex
 from .spec import CircuitSpec, Gate
@@ -401,7 +402,6 @@ def _batch_query_state(
                 preserve_scale=True if analyze_only else preserve_scale,
                 allow_tensor_contraction=allow_tensor_contraction,
                 extended_reductions=extended_reductions,
-                allow_unbounded_bp_result=analyze_only,
             )
             results.append(info if analyze_only else (amplitude, info))
         return results
@@ -536,6 +536,12 @@ def _batch_query_state(
                 cost_model_r=elim_info.get('cost_r', elim_info['remaining']),
                 phase3_backend=elim_info.get('phase3_backend'),
             )
+            _copy_approx_reducer_info(info, elim_info)
+            from ._q3free.approx_guard import _get_q3_free_approx_diagnostics
+
+            approx_info = _get_q3_free_approx_diagnostics()
+            if approx_info is not None:
+                _copy_approx_reducer_info(info, approx_info)
             if analyze_only:
                 results[result_idx] = info
                 continue
@@ -544,6 +550,7 @@ def _batch_query_state(
                 complex(state.scalar) * reduced_total[0],
                 reduced_total[1] + state.scalar_half_pow2,
             )
+            _validate_approx_amplitude_reliability(scaled_amp, info)
             amp = ScaledAmplitude.from_tuple(scaled_amp) if preserve_scale else _scaled_to_complex(scaled_amp)
             results[result_idx] = (amp, info)
 
@@ -667,9 +674,5 @@ def compute_amplitudes(
     finally:
         _reset_solver_config(_token)
 
-
-_NATIVE_MPS_APPROX_DEFAULT_BOND = 1
-_PAULI_BEAM_APPROX_DEFAULT_TERMS = 16
-_PAULI_BEAM_APPROX_LARGE_TERMS = 4096
 
 _LOCAL_IMPLS = {name: globals()[name] for name in _LOCAL_NAMES if name in globals()}

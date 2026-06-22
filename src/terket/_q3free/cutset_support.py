@@ -68,6 +68,12 @@ def _q3_free_component_plan_width_hint(component_plan: _Q3FreeConstraintComponen
         return 0
     if component_plan.backend == "forest":
         return 1 if len(component_plan.variables) else 0
+    if component_plan.backend == "neighborhood":
+        assert component_plan.neighborhood_plan is not None
+        return len(component_plan.neighborhood_plan.classes)
+    if component_plan.backend == "neighborhood_treewidth":
+        assert component_plan.neighborhood_treewidth_plan is not None
+        return component_plan.neighborhood_treewidth_plan.width
     if component_plan.backend == "treewidth" and component_plan.order is not None:
         dummy_q = _phase_function_from_parts(
             len(component_plan.variables),
@@ -96,6 +102,12 @@ def _q3_free_component_plan_work_hint(component_plan: _Q3FreeConstraintComponent
         return 1
     if component_plan.backend == "forest":
         return max(1, len(component_plan.variables))
+    if component_plan.backend == "neighborhood":
+        assert component_plan.neighborhood_plan is not None
+        return component_plan.neighborhood_plan.estimated_work
+    if component_plan.backend == "neighborhood_treewidth":
+        assert component_plan.neighborhood_treewidth_plan is not None
+        return component_plan.neighborhood_treewidth_plan.estimated_work
     if component_plan.backend == "treewidth" and component_plan.order is not None:
         dummy_q = _phase_function_from_parts(
             len(component_plan.variables),

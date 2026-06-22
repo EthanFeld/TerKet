@@ -10,6 +10,8 @@ from unittest import mock
 
 import terket
 from terket import engine
+from terket import _reduction_classify as reduction_classify
+from terket.cubic_arithmetic import PhaseFunction
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -41,6 +43,7 @@ EXPECTED_NATIVE_METHODS = {
     "clear_support_cache",
     "cubic_order_width",
     "elim_single_partner_constraint_terms",
+    "elim_sparse_quadratics_batch_terms",
     "elim_two_partner_constraint_terms",
     "evaluate_q_mask_terms",
     "min_degree_cubic_order",
@@ -56,6 +59,7 @@ EXPECTED_NATIVE_METHODS = {
     "sum_q3_free_treewidth_batch_scaled",
     "sum_q3_free_treewidth_preplanned_batch_scaled",
     "sum_q3_free_treewidth_preplanned_batch_scaled_array",
+    "sum_residue_forest_batch_scaled_array",
     "sum_scaled_factor_treewidth_preplanned",
     "sum_treewidth_dp_level3",
     "support_from_mask",
@@ -79,6 +83,57 @@ def test_native_module_method_set_is_stable() -> None:
     methods = set(re.findall(r'NATIVE_METHOD\(\s*"([^"]+)"', module_text))
     methods.update(re.findall(r'^\s*\{\s*\n\s*"([^"]+)"', module_text, flags=re.MULTILINE))
     assert methods == EXPECTED_NATIVE_METHODS
+
+
+@unittest.skipIf(
+    engine._schur_native is None
+    or not hasattr(engine._schur_native, "elim_sparse_quadratics_batch_terms"),
+    "native sparse quadratic batch unavailable",
+)
+def test_native_sparse_quadratic_batch_matches_python_fallback() -> None:
+    q = PhaseFunction(
+        9,
+        level=3,
+        q1=[2, 2, 6, 2, 6, 2, 2, 6, 2],
+        q2={(idx, idx + 1): 2 for idx in range(8)},
+        q3={},
+    )
+    candidates = tuple(range(q.n))
+
+    native_q, native_scale, native_removed = reduction_classify._elim_sparse_dead_quadratics_batch(
+        q,
+        candidates,
+    )
+    with mock.patch.object(reduction_classify, "_native_symbol", return_value=None):
+        python_q, python_scale, python_removed = reduction_classify._elim_sparse_dead_quadratics_batch(
+            q,
+            candidates,
+        )
+
+    assert native_scale == python_scale
+    assert native_removed == python_removed
+    assert native_q.q0 == python_q.q0
+    assert native_q.q1 == python_q.q1
+    assert native_q.q2 == python_q.q2
+
+
+@unittest.skipIf(engine._schur_native is None, "native accelerator unavailable")
+def test_native_min_degree_heap_preserves_fill_updated_order() -> None:
+    q2 = {
+        (0, 1): 1,
+        (0, 2): 1,
+        (1, 3): 1,
+        (2, 3): 1,
+        (3, 4): 1,
+        (4, 5): 1,
+        (4, 6): 1,
+    }
+    q3 = {(1, 2, 5): 1}
+
+    order, width = engine._schur_native.min_degree_cubic_order(7, q2, q3)
+
+    assert order == [6, 0, 4, 1, 2, 3, 5]
+    assert width == 4
 
 
 def test_native_ownership_map_lists_current_c_files() -> None:

@@ -28,6 +28,28 @@ class _BinaryPhaseQuadraticPlan:
 
 
 @dataclass(frozen=True, slots=True)
+class _Q3FreeNeighborhoodPlan:
+    """Reusable exact plan for a bounded-neighborhood-diversity q2 graph."""
+
+    classes: tuple[tuple[int, ...], ...]
+    clique_classes: tuple[bool, ...]
+    cross_masks: tuple[int, ...]
+    estimated_work: int
+
+
+@dataclass(frozen=True, slots=True)
+class _Q3FreeNeighborhoodTreewidthPlan:
+    """Twin-class quotient evaluated by exact factor-table treewidth DP."""
+
+    classes: tuple[tuple[int, ...], ...]
+    clique_classes: tuple[bool, ...]
+    cross_masks: tuple[int, ...]
+    order: tuple[int, ...]
+    width: int
+    estimated_work: int
+
+
+@dataclass(frozen=True, slots=True)
 class _Q3FreeCutsetConditioningPlan:
     """Reusable exact cutset-conditioned treewidth plan for a q3-free kernel."""
 
@@ -76,12 +98,14 @@ class _Q3FreeConstraintComponentPlan:
     variables: tuple[int, ...]
     level: int
     q2: dict[tuple[int, int], int]
-    backend: Literal["constant", "forest", "treewidth", "generic"]
+    backend: Literal["constant", "forest", "neighborhood", "neighborhood_treewidth", "treewidth", "generic"]
     adjacency: tuple[tuple[tuple[int, int], ...], ...] = ()
     order: tuple[int, ...] = ()
     dense_q2: np.ndarray | None = None
     precomputed_total: ScaledComplex | None = None
     binary_phase_plan: _BinaryPhaseQuadraticPlan | None = None
+    neighborhood_plan: _Q3FreeNeighborhoodPlan | None = None
+    neighborhood_treewidth_plan: _Q3FreeNeighborhoodTreewidthPlan | None = None
     mediator_plan: _HalfPhaseMediatorPlan | None = None
     generic_mediator_plan: _GenericQ2MediatorPlan | None = None
     cluster_plan: _HalfPhaseClusterPlan | None = None

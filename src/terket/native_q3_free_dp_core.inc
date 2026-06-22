@@ -1567,43 +1567,125 @@ static PyObject *evaluate_q3_free_treewidth_plan_batch_buffer(
         return results;
     }
 
-    for (row_idx = 0; row_idx < batch_size; ++row_idx) {
-        const long long *row_ptr = ((const long long *) view.buf) + (row_idx * row_stride_elems);
-        PyObject *row_result = NULL;
-        NativeScaledComplex scalar;
-        if (plan->level == 3) {
-            unsigned char *q1_row = PyMem_Malloc((size_t) (plan->nvars > 0 ? plan->nvars : 1) * sizeof(unsigned char));
-            Py_ssize_t idx;
-            if (q1_row == NULL) {
-                PyBuffer_Release(&view);
-                Py_DECREF(results);
-                PyErr_NoMemory();
-                return NULL;
-            }
-            for (idx = 0; idx < plan->nvars; ++idx) {
-                q1_row[idx] = (unsigned char) (row_ptr[idx] & 7LL);
-            }
-            if (evaluate_q3_free_treewidth_plan_row_level3(plan, q1_row, &scalar) < 0) {
-                PyMem_Free(q1_row);
-                PyBuffer_Release(&view);
-                Py_DECREF(results);
-                return NULL;
-            }
-            PyMem_Free(q1_row);
-        } else {
-            if (evaluate_q3_free_treewidth_plan_row_generic(plan, row_ptr, &scalar) < 0) {
-                PyBuffer_Release(&view);
-                Py_DECREF(results);
-                return NULL;
-            }
-        }
-        row_result = make_q3_free_treewidth_row_result(scalar, plan->max_scope);
-        if (row_result == NULL) {
+    if (plan->level == 3) {
+        size_t row_bytes = (size_t) (plan->nvars > 0 ? plan->nvars : 1) * sizeof(unsigned char);
+        unsigned char *q1_row0 = PyMem_Malloc(row_bytes);
+        unsigned char *q1_row1 = PyMem_Malloc(row_bytes);
+        if (q1_row0 == NULL || q1_row1 == NULL) {
+            PyMem_Free(q1_row0);
+            PyMem_Free(q1_row1);
             PyBuffer_Release(&view);
             Py_DECREF(results);
+            PyErr_NoMemory();
             return NULL;
         }
-        PyList_SET_ITEM(results, row_idx, row_result);
+        for (row_idx = 0; row_idx < batch_size; row_idx += 2) {
+            const long long *row_ptr0 = ((const long long *) view.buf) + (row_idx * row_stride_elems);
+            const long long *row_ptr1 = row_ptr0 + row_stride_elems;
+            NativeScaledComplex scalar0;
+            NativeScaledComplex scalar1;
+            PyObject *row_result0;
+            PyObject *row_result1 = NULL;
+            Py_ssize_t idx;
+            int has_pair = row_idx + 1 < batch_size;
+            int use_pair = has_pair;
+            Py_ssize_t differences = 0;
+            for (idx = 0; idx < plan->nvars; ++idx) {
+                q1_row0[idx] = (unsigned char) (row_ptr0[idx] & 7LL);
+                if (has_pair) {
+                    q1_row1[idx] = (unsigned char) (row_ptr1[idx] & 7LL);
+                    if (q1_row0[idx] != q1_row1[idx]) {
+                        differences += 1;
+                    }
+                }
+            }
+            if (differences * 2 > plan->nvars) {
+                use_pair = 0;
+            }
+            if (
+                (use_pair && evaluate_q3_free_treewidth_plan_pair_level3(plan, q1_row0, q1_row1, &scalar0, &scalar1) < 0)
+                || (!has_pair && evaluate_q3_free_treewidth_plan_row_level3(plan, q1_row0, &scalar0) < 0)
+                || (has_pair && !use_pair && (
+                    evaluate_q3_free_treewidth_plan_row_level3(plan, q1_row0, &scalar0) < 0
+                    || evaluate_q3_free_treewidth_plan_row_level3(plan, q1_row1, &scalar1) < 0
+                ))
+            ) {
+                PyMem_Free(q1_row0);
+                PyMem_Free(q1_row1);
+                PyBuffer_Release(&view);
+                Py_DECREF(results);
+                return NULL;
+            }
+            row_result0 = make_q3_free_treewidth_row_result(scalar0, plan->max_scope);
+            if (has_pair) {
+                row_result1 = make_q3_free_treewidth_row_result(scalar1, plan->max_scope);
+            }
+            if (row_result0 == NULL || (has_pair && row_result1 == NULL)) {
+                Py_XDECREF(row_result0);
+                Py_XDECREF(row_result1);
+                PyMem_Free(q1_row0);
+                PyMem_Free(q1_row1);
+                PyBuffer_Release(&view);
+                Py_DECREF(results);
+                return NULL;
+            }
+            PyList_SET_ITEM(results, row_idx, row_result0);
+            if (has_pair) {
+                PyList_SET_ITEM(results, row_idx + 1, row_result1);
+            }
+        }
+        PyMem_Free(q1_row0);
+        PyMem_Free(q1_row1);
+    } else {
+        for (row_idx = 0; row_idx < batch_size; row_idx += 2) {
+            const long long *q1_row0 = ((const long long *) view.buf) + (row_idx * row_stride_elems);
+            const long long *q1_row1 = q1_row0 + row_stride_elems;
+            NativeScaledComplex scalar0;
+            NativeScaledComplex scalar1;
+            PyObject *row_result0;
+            PyObject *row_result1 = NULL;
+            int has_pair = row_idx + 1 < batch_size;
+            int use_pair = has_pair;
+            if (has_pair) {
+                Py_ssize_t idx;
+                Py_ssize_t differences = 0;
+                for (idx = 0; idx < plan->nvars; ++idx) {
+                    if (q1_row0[idx] != q1_row1[idx]) {
+                        differences += 1;
+                    }
+                }
+                if (differences * 2 > plan->nvars) {
+                    use_pair = 0;
+                }
+            }
+            if (
+                (use_pair && evaluate_q3_free_treewidth_plan_pair_generic(plan, q1_row0, q1_row1, &scalar0, &scalar1) < 0)
+                || (!has_pair && evaluate_q3_free_treewidth_plan_row_generic(plan, q1_row0, &scalar0) < 0)
+                || (has_pair && !use_pair && (
+                    evaluate_q3_free_treewidth_plan_row_generic(plan, q1_row0, &scalar0) < 0
+                    || evaluate_q3_free_treewidth_plan_row_generic(plan, q1_row1, &scalar1) < 0
+                ))
+            ) {
+                PyBuffer_Release(&view);
+                Py_DECREF(results);
+                return NULL;
+            }
+            row_result0 = make_q3_free_treewidth_row_result(scalar0, plan->max_scope);
+            if (has_pair) {
+                row_result1 = make_q3_free_treewidth_row_result(scalar1, plan->max_scope);
+            }
+            if (row_result0 == NULL || (has_pair && row_result1 == NULL)) {
+                Py_XDECREF(row_result0);
+                Py_XDECREF(row_result1);
+                PyBuffer_Release(&view);
+                Py_DECREF(results);
+                return NULL;
+            }
+            PyList_SET_ITEM(results, row_idx, row_result0);
+            if (has_pair) {
+                PyList_SET_ITEM(results, row_idx + 1, row_result1);
+            }
+        }
     }
 
     PyBuffer_Release(&view);
@@ -1831,6 +1913,130 @@ error:
     Py_XDECREF(results);
     Py_XDECREF(batch_seq);
     return NULL;
+}
+
+PyObject *sum_residue_forest_batch_scaled_array_native(PyObject *self, PyObject *args)
+{
+    int level;
+    PyObject *q1_batch_obj;
+    PyObject *parent_obj;
+    PyObject *phase_obj;
+    PyObject *postorder_obj;
+    PyObject *parent_seq = NULL;
+    PyObject *phase_seq = NULL;
+    PyObject *postorder_seq = NULL;
+    PyObject *results = NULL;
+    Py_buffer view;
+    Py_ssize_t *parent = NULL;
+    long long *parent_phase = NULL;
+    Py_ssize_t *postorder = NULL;
+    NativeScaledComplex *accum0 = NULL;
+    NativeScaledComplex *accum1 = NULL;
+    Py_ssize_t nvars;
+    Py_ssize_t batch_size;
+    Py_ssize_t row_stride;
+    Py_ssize_t idx;
+    long long modulus;
+
+    (void) self;
+    memset(&view, 0, sizeof(Py_buffer));
+    if (!PyArg_ParseTuple(args, "iOOOO", &level, &q1_batch_obj, &parent_obj, &phase_obj, &postorder_obj)) {
+        return NULL;
+    }
+    if (level < 1 || level > 62) {
+        PyErr_SetString(PyExc_ValueError, "level must be between 1 and 62.");
+        return NULL;
+    }
+    modulus = 1LL << level;
+    parent_seq = PySequence_Fast(parent_obj, "parent must be a sequence.");
+    phase_seq = PySequence_Fast(phase_obj, "parent_phase must be a sequence.");
+    postorder_seq = PySequence_Fast(postorder_obj, "postorder must be a sequence.");
+    if (parent_seq == NULL || phase_seq == NULL || postorder_seq == NULL) {
+        goto cleanup;
+    }
+    nvars = PySequence_Fast_GET_SIZE(parent_seq);
+    if (PySequence_Fast_GET_SIZE(phase_seq) != nvars || PySequence_Fast_GET_SIZE(postorder_seq) != nvars) {
+        PyErr_SetString(PyExc_ValueError, "forest arrays must have equal length.");
+        goto cleanup;
+    }
+    if (validate_q3_free_q1_batch_buffer(q1_batch_obj, nvars, &view) < 0) {
+        goto cleanup;
+    }
+    batch_size = view.shape[0];
+    row_stride = view.strides[0] / (Py_ssize_t) sizeof(long long);
+    parent = PyMem_Malloc((size_t) (nvars > 0 ? nvars : 1) * sizeof(Py_ssize_t));
+    parent_phase = PyMem_Malloc((size_t) (nvars > 0 ? nvars : 1) * sizeof(long long));
+    postorder = PyMem_Malloc((size_t) (nvars > 0 ? nvars : 1) * sizeof(Py_ssize_t));
+    accum0 = PyMem_Malloc((size_t) (nvars > 0 ? nvars : 1) * sizeof(NativeScaledComplex));
+    accum1 = PyMem_Malloc((size_t) (nvars > 0 ? nvars : 1) * sizeof(NativeScaledComplex));
+    if (parent == NULL || parent_phase == NULL || postorder == NULL || accum0 == NULL || accum1 == NULL) {
+        PyErr_NoMemory();
+        goto cleanup;
+    }
+    for (idx = 0; idx < nvars; ++idx) {
+        parent[idx] = PyLong_AsSsize_t(PySequence_Fast_GET_ITEM(parent_seq, idx));
+        parent_phase[idx] = PyLong_AsLongLong(PySequence_Fast_GET_ITEM(phase_seq, idx));
+        postorder[idx] = PyLong_AsSsize_t(PySequence_Fast_GET_ITEM(postorder_seq, idx));
+        if (PyErr_Occurred()) {
+            goto cleanup;
+        }
+        if (parent[idx] < -1 || parent[idx] >= nvars || postorder[idx] < 0 || postorder[idx] >= nvars) {
+            PyErr_SetString(PyExc_ValueError, "invalid forest parent or postorder index.");
+            goto cleanup;
+        }
+    }
+    results = PyList_New(batch_size);
+    if (results == NULL) {
+        goto cleanup;
+    }
+    for (idx = 0; idx < batch_size; ++idx) {
+        const long long *q1_row = ((const long long *) view.buf) + idx * row_stride;
+        NativeScaledComplex scalar = scaled_complex_make(1.0, 0.0, 0);
+        Py_ssize_t var_idx;
+        PyObject *row_result;
+        for (var_idx = 0; var_idx < nvars; ++var_idx) {
+            accum0[var_idx] = scaled_complex_make(1.0, 0.0, 0);
+            accum1[var_idx] = scaled_complex_make(1.0, 0.0, 0);
+        }
+        for (var_idx = 0; var_idx < nvars; ++var_idx) {
+            Py_ssize_t node = postorder[var_idx];
+            Py_ssize_t parent_node = parent[node];
+            NativeComplex unary_value = omega_dyadic_value(q1_row[node], modulus);
+            NativeScaledComplex unary = scaled_complex_make(unary_value.real, unary_value.imag, 0);
+            NativeScaledComplex off_term = accum0[node];
+            NativeScaledComplex on_term = mul_scaled_complex(accum1[node], unary);
+            NativeScaledComplex message0 = add_scaled_complex(off_term, on_term);
+            if (parent_node < 0) {
+                scalar = mul_scaled_complex(scalar, message0);
+            } else {
+                NativeComplex edge_value = omega_dyadic_value(parent_phase[node], modulus);
+                NativeScaledComplex edge = scaled_complex_make(edge_value.real, edge_value.imag, 0);
+                NativeScaledComplex message1 = add_scaled_complex(off_term, mul_scaled_complex(on_term, edge));
+                accum0[parent_node] = mul_scaled_complex(accum0[parent_node], message0);
+                accum1[parent_node] = mul_scaled_complex(accum1[parent_node], message1);
+            }
+        }
+        row_result = make_q3_free_treewidth_row_result(scalar, nvars > 0 ? 1 : 0);
+        if (row_result == NULL) {
+            Py_CLEAR(results);
+            goto cleanup;
+        }
+        PyList_SET_ITEM(results, idx, row_result);
+    }
+
+cleanup:
+    if (view.obj != NULL) {
+        PyBuffer_Release(&view);
+    }
+    PyMem_Free(parent);
+    PyMem_Free(parent_phase);
+    PyMem_Free(postorder);
+    PyMem_Free(accum0);
+    PyMem_Free(accum1);
+    Py_XDECREF(parent_seq);
+    Py_XDECREF(phase_seq);
+    Py_XDECREF(postorder_seq);
+    return results;
 }
 
 PyObject *build_q3_free_treewidth_plan_native(PyObject *self, PyObject *args)

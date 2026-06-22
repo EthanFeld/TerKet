@@ -1,5 +1,7 @@
 #include "_schur_native_internal.h"
 
+PyObject *sum_residue_forest_batch_scaled_array_native(PyObject *self, PyObject *args);
+
 #define NATIVE_METHOD(name, func, flags, doc) \
     {name, (PyCFunction) func, flags, PyDoc_STR(doc)}
 
@@ -14,6 +16,7 @@ static PyMethodDef module_methods[] = {
     NATIVE_METHOD("solve_output_shift_masks_u64", solve_output_shift_masks_u64_native, METH_VARARGS, "Solve a batch of 64-bit output shift masks."),
     NATIVE_METHOD("elim_single_partner_constraint_terms", elim_single_partner_constraint_terms_native, METH_VARARGS, "Eliminate one parity partner."),
     NATIVE_METHOD("elim_two_partner_constraint_terms", elim_two_partner_constraint_terms_native, METH_VARARGS, "Eliminate a two-partner parity constraint."),
+    NATIVE_METHOD("elim_sparse_quadratics_batch_terms", elim_sparse_quadratics_batch_terms_native, METH_VARARGS, "Batch-eliminate sparse level-3 quadratic pivots."),
     NATIVE_METHOD("clear_support_cache", clear_support_cache_native, METH_NOARGS, "Clear the native support cache."),
     NATIVE_METHOD("min_fill_cubic_order", min_fill_cubic_order_native, METH_VARARGS, "Return a min-fill order and width."),
     NATIVE_METHOD("min_degree_cubic_order", min_degree_cubic_order_native, METH_VARARGS, "Return a min-degree order and width."),
@@ -31,6 +34,7 @@ static PyMethodDef module_methods[] = {
     NATIVE_METHOD("build_q3_free_treewidth_plan", build_q3_free_treewidth_plan_native, METH_VARARGS, "Build a reusable q3-free plan."),
     NATIVE_METHOD("sum_q3_free_treewidth_preplanned_batch_scaled", sum_q3_free_treewidth_preplanned_batch_scaled_native, METH_VARARGS, "Evaluate a batch of q3-free kernels with a plan."),
     NATIVE_METHOD("sum_q3_free_treewidth_preplanned_batch_scaled_array", sum_q3_free_treewidth_preplanned_batch_scaled_array_native, METH_VARARGS, "Evaluate a contiguous q1 batch with a q3-free plan."),
+    NATIVE_METHOD("sum_residue_forest_batch_scaled_array", sum_residue_forest_batch_scaled_array_native, METH_VARARGS, "Evaluate arbitrary-residue forest rows."),
     NATIVE_METHOD("q3_free_treewidth_dp_work", q3_free_treewidth_dp_work_native, METH_VARARGS, "Estimate q3-free work for an order."),
     NATIVE_METHOD("sum_q3_free_treewidth_batch_scaled", sum_q3_free_treewidth_batch_scaled_native, METH_VARARGS, "Sum a q3-free batch by treewidth DP."),
     {NULL, NULL, 0, NULL},

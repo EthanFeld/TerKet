@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import importlib
-import math
 from typing import Literal, Sequence, overload
 
 from ._engine_runtime_core import _configure_extracted_module
@@ -16,9 +15,6 @@ from .state import BitSequence, CircuitInput, EchelonCache, ExtendedReductionMod
 _LOCAL_NAMES = {
     '_prepare_pauli_expectation_request',
     '_pauli_expectation_result',
-    '_compute_pauli_beam_approx_fast_path',
-    '_compute_native_mps_approx_pauli_expectations',
-    'compute_circuit_pauli_expectations_approx',
     '_build_pauli_expectation_base_state',
     '_select_pauli_direct_replay_template',
     'compute_circuit_pauli_expectations',
@@ -88,66 +84,6 @@ def _zero_pauli_expectation_result(*, as_complex: bool) -> tuple[ScaledAmplitude
     return _pauli_expectation_result(0j, _info(0, 0, 0, 0, 0, zero=True), as_complex=as_complex)
 
 
-def _compute_pauli_beam_approx_fast_path(
-    request: _PauliExpectationRequest,
-    *,
-    as_complex: bool,
-    max_terms: int | None = None,
-) -> list[tuple[ScaledAmplitude | complex, ReductionInfo]] | None:
-    native_values = _pauli_beam_approx_pauli_expectations(
-        request.spec,
-        request.input_bits,
-        request.observables,
-        max_terms=max_terms,
-    )
-    if native_values is None:
-        return None
-    info = _approx_pauli_expectation_info(request.spec, "pauli_beam_approx")
-    if max_terms is not None:
-        info["pauli_beam_max_terms"] = max(1, int(max_terms))  # type: ignore[typeddict-unknown-key]
-    return [_pauli_expectation_result(value, info, as_complex=as_complex) for value in native_values]
-
-
-def _compute_native_mps_approx_pauli_expectations(
-    request: _PauliExpectationRequest,
-    *,
-    as_complex: bool,
-    max_bond: int | None = None,
-) -> list[tuple[ScaledAmplitude | complex, ReductionInfo]] | None:
-    native_values = _native_mps_approx_pauli_expectations(
-        request.spec,
-        request.input_bits,
-        request.observables,
-        max_bond=max_bond,
-    )
-    if native_values is None:
-        return None
-    info = _approx_pauli_expectation_info(request.spec, "native_mps_approx")
-    if max_bond is not None:
-        info["mps_max_bond"] = max(1, int(max_bond))  # type: ignore[typeddict-unknown-key]
-    return [_pauli_expectation_result(value, info, as_complex=as_complex) for value in native_values]
-
-
-def compute_circuit_pauli_expectations_approx(
-    circuit: CircuitInput,
-    observables: Sequence[str],
-    *,
-    input_bits: BitSequence | None = None,
-    as_complex: bool = False,
-    backend: str = "pauli_beam",
-    max_terms: int | None = None,
-    max_bond: int | None = None,
-) -> list[tuple[ScaledAmplitude | complex, ReductionInfo]] | None:
-    """Opt-in Pauli observable approximation entrypoint."""
-    _refresh_engine_bindings()
-    request = _prepare_pauli_expectation_request(circuit, observables, input_bits)
-    if backend in {"pauli_beam", "pauli_beam_approx"}:
-        return _compute_pauli_beam_approx_fast_path(request, as_complex=as_complex, max_terms=max_terms)
-    if backend in {"native_mps", "native_mps_approx"}:
-        return _compute_native_mps_approx_pauli_expectations(request, as_complex=as_complex, max_bond=max_bond)
-    raise ValueError(f"Unsupported approximate Pauli backend {backend!r}.")
-
-
 def _build_pauli_expectation_base_state(
     request: _PauliExpectationRequest,
     *,
@@ -213,19 +149,8 @@ def compute_circuit_pauli_expectations(
     """
     _refresh_engine_bindings()
     request = _prepare_pauli_expectation_request(circuit, observables, input_bits)
-    spec = request.spec
     prepared_input = request.input_bits
     normalized_observables = request.observables
-
-    _token = _set_solver_config(solver_config)
-    try:
-        allow_approximate = bool(_get_solver_config().allow_approximate)
-        if allow_approximate and any(str(gate[0]) == "pauli_expbox" for gate in request.spec.gates):
-            approximate = _compute_pauli_beam_approx_fast_path(request, as_complex=as_complex)
-            if approximate is not None:
-                return approximate
-    finally:
-        _reset_solver_config(_token)
 
     observable_gate_sets = request.observable_gate_sets
     inverse_gates = request.inverse_gates
@@ -234,7 +159,6 @@ def compute_circuit_pauli_expectations(
 
     _token = _set_solver_config(solver_config)
     try:
-        allow_approximate = bool(_get_solver_config().allow_approximate)
         context = _ReductionContext(
             preserve_scale=not as_complex,
             allow_tensor_contraction=allow_tensor_contraction,
@@ -242,8 +166,6 @@ def compute_circuit_pauli_expectations(
         )
         results: list[tuple[ScaledAmplitude | complex, ReductionInfo] | None] = [None] * len(normalized_observables)
         pending: list[tuple[int, complex, int, int, PhaseFunction]] = []
-        bp_identity_cache: tuple[ScaledComplex, ReductionInfo] | None = None
-        native_mps_approx_cache: dict[int, complex] | None | bool = False
         suffix_query_cache: dict[
             tuple[int, tuple[int, ...], tuple[int, ...]],
             tuple[EchelonCache, tuple[int, tuple[int, ...], tuple[int, ...], int] | None],
@@ -253,31 +175,6 @@ def compute_circuit_pauli_expectations(
             tuple[int, ...],
             tuple[int, tuple[int, ...], tuple[int, ...], int] | None,
         ] = {}
-
-        def native_mps_approx_result(
-            obs_idx: int,
-            *,
-            fallback_reason: str | None = None,
-        ) -> tuple[ScaledAmplitude | complex, ReductionInfo] | None:
-            nonlocal native_mps_approx_cache
-            if native_mps_approx_cache is False:
-                native_values = _native_mps_approx_pauli_expectations(
-                    spec,
-                    prepared_input,
-                    normalized_observables,
-                )
-                native_mps_approx_cache = (
-                    {idx: value for idx, value in enumerate(native_values)}
-                    if native_values is not None
-                    else None
-                )
-            if not isinstance(native_mps_approx_cache, dict) or obs_idx not in native_mps_approx_cache:
-                return None
-            candidate = native_mps_approx_cache[obs_idx]
-            info = _approx_pauli_expectation_info(spec, "native_mps_approx")
-            if fallback_reason is not None:
-                info["fallback_reason"] = fallback_reason  # type: ignore[typeddict-unknown-key]
-            return _pauli_expectation_result(candidate, info, as_complex=as_complex)
 
         for obs_idx, (observable, observable_gates) in enumerate(zip(normalized_observables, observable_gate_sets)):
             if direct_template is not None:
@@ -309,67 +206,14 @@ def compute_circuit_pauli_expectations(
             state = _build_post_replay_state(base_state, observable_gates, inverse_gates)
 
             if state._arbitrary_phases:
-                use_native_mps = allow_approximate and all(char in "IZ" for char in normalized_observables[obs_idx])
-                if use_native_mps:
-                    mps_result = native_mps_approx_result(obs_idx)
-                    if mps_result is not None:
-                        results[obs_idx] = mps_result
-                        continue
-
-                try:
-                    raw_amp, info = state._amplitude_internal(
-                        prepared_input,
-                        preserve_scale=True,
-                        allow_tensor_contraction=allow_tensor_contraction,
-                        extended_reductions=extended_reductions,
-                        allow_unbounded_bp_result=True,
-                    )
-                except RuntimeError:
-                    mps_result = native_mps_approx_result(obs_idx, fallback_reason="arbitrary_bp_unavailable") if allow_approximate else None
-                    if mps_result is None:
-                        raise
-                    results[obs_idx] = mps_result
-                    continue
+                raw_amp, info = state._amplitude_internal(
+                    prepared_input,
+                    preserve_scale=True,
+                    allow_tensor_contraction=allow_tensor_contraction,
+                    extended_reductions=extended_reductions,
+                )
                 assert isinstance(raw_amp, ScaledAmplitude)
-                if _arbitrary_bp_backend(info.get("phase3_backend")):
-                    amp_complex = None if raw_amp.log2_abs() > 1000.0 else _scaled_to_complex(raw_amp.as_tuple())
-                    if bp_identity_cache is None:
-                        identity_state = _build_post_replay_state(base_state, (), inverse_gates)
-                        identity_amp_raw, identity_info = identity_state._amplitude_internal(
-                            prepared_input,
-                            preserve_scale=True,
-                            allow_tensor_contraction=allow_tensor_contraction,
-                            extended_reductions=extended_reductions,
-                            allow_unbounded_bp_result=True,
-                        )
-                        assert isinstance(identity_amp_raw, ScaledAmplitude)
-                        bp_identity_cache = (identity_amp_raw.as_tuple(), identity_info)
-                    candidate = amp_complex
-                    identity_scaled, _identity_info = bp_identity_cache
-                    normalized = _scaled_complex_ratio_to_plain(raw_amp.as_tuple(), identity_scaled)
-                    if normalized is not None:
-                        candidate = normalized
-                        info["phase3_backend"] = "arbitrary_bethe_bp_normalized"
-                    if (
-                        candidate is None
-                        or not (math.isfinite(candidate.real) and math.isfinite(candidate.imag))
-                        or abs(candidate.real) > 1.0 + 1e-6
-                        or abs(candidate.imag) > 1e-6
-                    ):
-                        mps_result = native_mps_approx_result(obs_idx, fallback_reason="arbitrary_bp_invalid") if allow_approximate else None
-                        if mps_result is None:
-                            info["phase3_backend"] = "arbitrary_bethe_bp_invalid"
-                            info["bp_invalid_reason"] = "observable_estimate_out_of_bounds"  # type: ignore[typeddict-unknown-key]
-                            raise RuntimeError(
-                                "Unreliable arbitrary-angle BP observable estimate: normalized Pauli expectation "
-                                "is non-finite or outside [-1, 1]. Use an exact path or a fidelity-validated "
-                                "approximate backend."
-                            )
-                        results[obs_idx] = mps_result
-                        continue
-                    amp = candidate if as_complex else ScaledAmplitude.from_tuple(_make_scaled_complex(candidate))
-                else:
-                    amp = _scaled_to_complex(raw_amp.as_tuple()) if as_complex else raw_amp
+                amp = _scaled_to_complex(raw_amp.as_tuple()) if as_complex else raw_amp
                 results[obs_idx] = (amp, info)
                 continue
 
@@ -538,8 +382,7 @@ def compute_amplitude(
     By default this returns ``ScaledAmplitude``. Pass ``as_complex=True`` to
     request a native ``complex`` instead. Set
     ``allow_tensor_contraction=False`` to disable tensor-guided q3-free
-    planning hints. Approximate arbitrary-angle BP fallback is disabled unless
-    ``SolverConfig.allow_approximate`` is true.
+    planning hints.
     """
     _refresh_engine_bindings()
     state = build_state(n, gates, input_bits, extended_reductions=extended_reductions)

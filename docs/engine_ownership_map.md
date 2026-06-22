@@ -15,12 +15,12 @@ backend deletion, or performance tradeoffs.
 | 1-53 | imports | shared deps | keep local per module | high circular risk if copied blindly |
 | 55-97 | native load + core aliases | `_schur_native`, `BitSequence`, `ScaledComplex` | `native.py`, `state.py`, `scaling.py` | load order, optional native import |
 | 100-145 | protocol/info types | `SupportsQiskitCircuit`, `ReducerInfo`, `ReductionInfo` | `state.py`, `reduction.py` | low |
-| 147-340 | global knobs | backend thresholds, rewrite thresholds, Pauli approx defaults | split by owner module | high: constants drive perf selection |
+| 147-340 | global knobs | backend and rewrite thresholds | split by owner module | high: constants drive perf selection |
 | 341-443 | solver config/env | `SolverConfig`, default config, env helpers | `state.py` or `config.py` later | medium: contextvars/default config |
 | 449-613 | optional deps/native/mask helpers | quimb import, native flags, row/mask primitives, rewrite gates | `native.py`, `state.py`, `reduction.py` | medium: helpers shared widely |
 | 616-980 | metadata/cache/plan dataclasses/scaled amp | `_ReductionContext`, `_BoundedMemoCache`, q3-free plans, arbitrary plans, `ScaledAmplitude` | `cache.py`, `scaling.py`, `q3free.py`, `arbitrary.py`, `reduction.py` | high: plan classes cross backend borders |
 | 981-1120 | affine/output solve primitives | affine bit/phase mutation, echelon cache, output solve | `state.py`, `reduction.py` | medium: native output solver coupling |
-| 1121-2489 | arbitrary phases | arbitrary term coalesce, unary factor tables, cutset factor tables, BP heuristics | `arbitrary.py`, later `approx.py` | high: exact/approx mixed |
+| 1121-2489 | arbitrary phases | arbitrary term coalesce, unary factor tables, cutset factor tables | `arbitrary.py` | high: exact factor paths |
 | 2492-3385 | `SchurState` | symbolic state, gate application methods, pending arbitrary phases | `state.py` | high: central object, many call sites |
 | 3386-4246 | reducer loop + early helpers | pre-exact Phase-3 escape, reducer recursion, batch reduce, Pauli prep, exact eliminations, omega/product sums | `reduction.py`, `phase3.py`, `pauli.py`, `scaling.py` | high: main semantics |
 | 4247-7057 | q3-free primitives/preprocessors | scaled arithmetic arrays, binary/half-phase checks, mediators, clusters, factor cutsets, cluster eval | `q3free.py`, `scaling.py`, `arbitrary.py` | very high: backend selection + perf |
@@ -30,7 +30,7 @@ backend deletion, or performance tradeoffs.
 | 14354-17464 | Phase-3 planning/execution | treewidth order, structure opt, separator/cutset, backend choice, native plans, tensor stubs, q3 cover | `phase3.py` | very high: backend bloat target |
 | 17465-18539 | classification/eliminations/affine compose | BL26 classify, quadratic elim, constraint elim, affine compose, reducer info | `reduction.py` | high: exact semantics |
 | 18540-19091 | public amplitude API | `affine_compose`, `reduce_and_sum`, `build_state`, gate replay, batch query, amplitude APIs | public facades + `state.py` | medium: API compat |
-| 19092-20073 | Pauli expectations/approx | PauliExpBox controls, Pauli masks/products, beam approx, native MPS approx, expectation API | `pauli.py`, later `pauli_approx.py` | high: exact/approx mixed |
+| 19092-20073 | Pauli expectations | PauliExpBox controls and exact expectation API | `pauli.py` | high: central observable path |
 | 20074-20220 | analysis/compat wrappers | `analyze_*`, old `compute_amplitude*` overloads | public facades | low-medium: public API compat |
 
 ## Domain Owners
@@ -60,10 +60,10 @@ backend deletion, or performance tradeoffs.
 : cubic residual planning, treewidth DP, q3 separator/cover, cubic/tensor/native residual backends.
 
 `arbitrary.py`
-: arbitrary-angle exact factor paths; BP/heuristic approximate code moves later to `approx.py`.
+: arbitrary-angle exact factor paths.
 
 `pauli.py`
-: PauliExpBox lowering, exact expectation flow, approximate Pauli beam/native MPS moves later behind opt-in module.
+: PauliExpBox lowering and exact expectation flow.
 
 `interop/`
 : QASM/Qiskit import/export and rewrite; engine should import only normalized `CircuitSpec`/`Gate`.
@@ -74,7 +74,7 @@ backend deletion, or performance tradeoffs.
 2. Extract config/types: `SolverConfig`, typed dicts, `BitSequence`, `CircuitInput`.
 3. Extract output solve primitives: `EchelonCache`, echelon cache prep, RHS solve.
 4. Extract `SchurState` only after scaling/native/output solve are stable.
-5. Extract exact arbitrary factor-table code before approximate BP code.
+5. Keep arbitrary factor-table code isolated behind its exact facade.
 6. Extract q3-free plan classes before q3-free evaluators.
 7. Extract q3-free shared factor-table math before treewidth/cutset backends.
 8. Extract Phase-3 order/factor-table helpers before backend selector.

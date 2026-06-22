@@ -17,11 +17,18 @@ from typing import Any, Callable, Literal, Mapping, Sequence, overload
 
 import numpy as np
 
+from .neighborhood import (
+    _evaluate_q3_free_neighborhood_plan_scaled,
+    _evaluate_q3_free_neighborhood_plan_scaled_batch,
+    _evaluate_q3_free_neighborhood_treewidth_plan_scaled,
+    _evaluate_q3_free_neighborhood_treewidth_plan_scaled_batch,
+)
+from .approx_tensor import _sum_q3_free_approx_tensor_scaled
 from ..cubic_arithmetic import CubicFunction, PhaseFunction, detect_factorization
 from .._engine_runtime_core import _bootstrap_extracted_globals, _sync_extracted_globals
 from ..scaling import ScaledAmplitude, ScaledComplex
 from ..spec import CircuitSpec, Gate
-from ..state import BitSequence, CircuitInput, EchelonCache, ExtendedReductionMode, ReducerInfo, ReductionInfo, SolverConfig
+from ..state import BitSequence, CircuitInput, EchelonCache, ExtendedReductionMode, ReducerInfo, ReductionInfo, SolverConfig, _get_solver_config
 
 _LOCAL_NAMES = {
     '_evaluate_q3_free_component_plan_scaled',
@@ -81,6 +88,20 @@ def _evaluate_q3_free_component_plan_scaled(
     if component_plan.backend == "forest":
         adjacency = [dict(neighbors) for neighbors in component_plan.adjacency]
         return _forest_transfer_sum_scaled(list(q1_local), adjacency, level=level)
+    if component_plan.backend == "neighborhood":
+        assert component_plan.neighborhood_plan is not None
+        return _evaluate_q3_free_neighborhood_plan_scaled(
+            component_plan.neighborhood_plan,
+            q1_local,
+            level=level,
+        )
+    if component_plan.backend == "neighborhood_treewidth":
+        assert component_plan.neighborhood_treewidth_plan is not None
+        return _evaluate_q3_free_neighborhood_treewidth_plan_scaled(
+            component_plan.neighborhood_treewidth_plan,
+            q1_local,
+            level=level,
+        )
     if component_plan.backend == "treewidth":
         component_q = _phase_function_from_parts(
             len(component_plan.variables),
@@ -174,7 +195,14 @@ def _evaluate_q3_free_component_plan_scaled(
             q2=component_plan.q2,
             q3={},
         )
-    return _sum_q3_free_component_scaled(component_q)
+    component_total = _sum_q3_free_component_scaled(component_q)
+    if component_total is None:
+        if _get_solver_config().approx_q3_free_tensor:
+            component_total = _sum_q3_free_approx_tensor_scaled(component_q)
+        if component_total is not None:
+            return component_total
+        raise RuntimeError("No viable exact q3-free backend for component.")
+    return component_total
 
 def _evaluate_q3_free_component_plan_scaled_batch(
     component_plan: _Q3FreeConstraintComponentPlan,
@@ -217,6 +245,20 @@ def _evaluate_q3_free_component_plan_scaled_batch(
         return _forest_transfer_sum_scaled_batch(
             np.asarray(q1_local_batch, dtype=np.int64),
             adjacency,
+            level=level,
+        )
+    if component_plan.backend == "neighborhood":
+        assert component_plan.neighborhood_plan is not None
+        return _evaluate_q3_free_neighborhood_plan_scaled_batch(
+            component_plan.neighborhood_plan,
+            q1_local_batch,
+            level=level,
+        )
+    if component_plan.backend == "neighborhood_treewidth":
+        assert component_plan.neighborhood_treewidth_plan is not None
+        return _evaluate_q3_free_neighborhood_treewidth_plan_scaled_batch(
+            component_plan.neighborhood_treewidth_plan,
+            q1_local_batch,
             level=level,
         )
     if component_plan.backend == "treewidth":

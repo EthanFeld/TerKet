@@ -112,6 +112,43 @@ class Q3FreeTreewidthNativePlanTests(unittest.TestCase):
 
         self.assertEqual(list_rows, array_rows)
 
+    def test_native_preplanned_array_batch_pairs_match_scalar_rows(self):
+        q2 = {(idx, idx + 1): 1 for idx in range(7)}
+        order = list(range(8))
+        for level in (3, 5):
+            native_plan = engine._build_native_q3_free_treewidth_plan(
+                n_vars=8,
+                level=level,
+                q2=q2,
+                order=order,
+            )
+            self.assertIsNotNone(native_plan)
+            modulus = 1 << level
+            q1_batch = np.asarray(
+                [
+                    [0, 1, 2, 3, 4, 5, 6, 7],
+                    [0, 1, 2, 3, 4, 5, 6, 0],
+                    [7, 6, 5, 4, 3, 2, 1, 0],
+                    [1, 6, 3, 4, 5, 2, 7, 0],
+                    [1, 6, 3, 4, 5, 2, 7, 1],
+                ],
+                dtype=np.int64,
+            ) % modulus
+
+            batch_rows = engine._schur_native.sum_q3_free_treewidth_preplanned_batch_scaled_array(
+                native_plan,
+                q1_batch,
+            )
+            scalar_rows = [
+                engine._schur_native.sum_q3_free_treewidth_preplanned_batch_scaled_array(
+                    native_plan,
+                    q1_batch[row_idx : row_idx + 1],
+                )[0]
+                for row_idx in range(len(q1_batch))
+            ]
+
+            self.assertEqual(batch_rows, scalar_rows)
+
     def test_native_fixed_factor_treewidth_plan_matches_generic_factor_sum(self):
         q = engine._phase_function_from_parts(
             5,

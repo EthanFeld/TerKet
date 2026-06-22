@@ -20,6 +20,8 @@ def test_public_import_surface_stays_small() -> None:
     expected = {
         "CircuitSpec",
         "CubicFunction",
+        "DoubledFactorProblem",
+        "DoubledSumResult",
         "PhaseFunction",
         "ScaledAmplitude",
         "SchurState",
@@ -37,13 +39,17 @@ def test_public_import_surface_stays_small() -> None:
         "compute_amplitude_scaled",
         "compute_circuit_amplitude",
         "compute_circuit_amplitude_scaled",
+        "compute_circuit_probability_doubled",
+        "compute_circuit_pauli_expectation_probabilities_doubled",
         "compute_circuit_pauli_expectations",
-        "compute_circuit_pauli_expectations_approx",
         "from_qiskit",
         "lift_exact_dyadic_precision",
         "make_circuit",
         "normalize_circuit",
         "reduce_and_sum",
+        "snap_arbitrary_angles",
+        "sum_doubled_phase",
+        "sum_doubled_factor_problem",
     }
     assert set(terket.__all__) == expected
 

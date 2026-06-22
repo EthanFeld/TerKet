@@ -10,16 +10,14 @@ Scope: Step 5 and q3-free Step 6 guardrails.
 2. Keep one generic exact evaluator per backend family, plus small adapters.
 3. Keep performance specializations only after benchmark proof:
    >= 10% median win or avoids > 2x memory.
-4. Approximate paths stay behind `SolverConfig.allow_approximate`.
-5. Approximate results need explicit approximation metadata.
-6. Backend selection must have:
+4. Backend selection must have:
    - candidate builder
    - viability predicate
    - score/comparator
    - stable compatibility label
-7. One-shot/reusable variants must converge on shared plan/evaluator objects.
-8. Factor-table math should live in one evaluator path, reused by adapters.
-9. Native exact adapters win over Python implementations whenever a native plan
+5. One-shot/reusable variants must converge on shared plan/evaluator objects.
+6. Factor-table math should live in one evaluator path, reused by adapters.
+7. Native exact adapters win over Python implementations whenever a native plan
    can be built for the same exact treewidth problem.
 
 ## Q3-Free Shape

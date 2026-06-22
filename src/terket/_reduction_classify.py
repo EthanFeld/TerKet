@@ -47,7 +47,7 @@ del _INITIAL_ENGINE
 
 def _classification_data_python(q):
     mod_q2 = max(1, 1 << (q.level - 1))
-    mod_q3 = max(1, 1 << (q.level - 2))
+    mod_q3 = 1 << max(0, q.level - 2)
     odd_bilinear = [False] * q.n
     parity_partners = [[] for _ in range(q.n)]
     cubic_incidence = [False] * q.n
@@ -303,6 +303,30 @@ def _incident_quadratic_couplings(q, k: int):
             if residue:
                 yield left, residue
 
+def _elim_sparse_quadratics_batch_native(q, candidates):
+    native_batch = _native_symbol("elim_sparse_quadratics_batch_terms")
+    if native_batch is None or not _native_level3_enabled(q):
+        return None
+    q0_residue = (q.q0.numerator * (q.mod_q1 // q.q0.denominator)) % q.mod_q1
+    new_q0_residue, new_q1, new_q2, removed = native_batch(
+        q0_residue,
+        q.q1,
+        q.q2,
+        tuple(candidates),
+    )
+    return (
+        _phase_function_from_parts_mutable(
+            len(new_q1),
+            level=q.level,
+            q0=_fraction_from_residue(q.level, new_q0_residue),
+            q1=new_q1,
+            q2=new_q2,
+            q3={},
+        ),
+        len(removed),
+        tuple(int(var) for var in removed),
+    )
+
 def _elim_sparse_dead_quadratics_batch(q, candidates, *, classification_data=None):
     """Batch-eliminate sparse dead quadratic pivots with one q2 compaction.
 
@@ -313,6 +337,9 @@ def _elim_sparse_dead_quadratics_batch(q, candidates, *, classification_data=Non
     """
     if int(q.level) != 3 or q.q3:
         return q, 0, ()
+    native_result = _elim_sparse_quadratics_batch_native(q, candidates)
+    if native_result is not None:
+        return native_result
     if classification_data is None:
         classification_data = _build_classification_data(q)
     _cubic_incidence, odd_bilinear, _parity_partners = classification_data
@@ -355,6 +382,11 @@ def _elim_sparse_dead_quadratics_batch(q, candidates, *, classification_data=Non
         if len(coupled) > 2:
             continue
         c = (q1[var] // threshold) % 4
+        # An earlier pivot in this batch may change an adjacent candidate's
+        # linear residue. Only apply the Gauss rule if it is still quadratic
+        # in the incrementally updated kernel.
+        if c not in (1, 3):
+            continue
         const_phase = Fraction(1, 8) if c % 4 == 1 else Fraction(7, 8)
         sign = -1 if c % 4 == 1 else +1
         q0 = (q0 + const_phase) % 1
